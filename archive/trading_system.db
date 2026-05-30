@@ -1,0 +1,20 @@
+{
+  "users": {
+    "admin": {
+      "password_hash": "6565bbe5ebb567d703f8a697531c1846:65279bbd60d55a186af95596223398e344ae8d9393b0efce8a98d486c1c5556f",
+      "email": "admin@local",
+      "role": "admin",
+      "created": "2026-05-03T19:01:37.598707",
+      "active": true
+    },
+    "trader": {
+      "password_hash": "c201d622876780ff575a963be2e93b9f:9d5de7917449f85a0c5a0e6740cd3ca184035c82516ec465a0de0ece80217ced",
+      "email": "trader@local",
+      "role": "trader",
+      "created": "2026-05-03T19:01:37.746310",
+      "active": true
+    }
+  },
+  "devices": {},
+  "payments": {}
+}

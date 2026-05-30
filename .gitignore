@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-wheel-metadata/
+
+# Distribution / packaging
+build/
+dist/
+release/
+*.egg-info/
+*.egg
+*.whl
+
+# Logs
+*.log
+server.log
+
+# Environment files
+.env
+.env.*
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+*.iml
+.idea/

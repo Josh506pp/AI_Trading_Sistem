@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  trading-web:
+    build: .
+    ports:
+      - '8080:8080'
+    environment:
+      - FLASK_ENV=production
+      - FLASK_DEBUG=0
+      - PORT=8080
+    volumes:
+      - .:/app
+    restart: unless-stopped

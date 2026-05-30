@@ -1,0 +1,52 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Trading Bot (Run)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/trading_bot.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "stopOnEntry": false,
+      "showReturnValue": true,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    {
+      "name": "Python: Trading Bot (Debug)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/trading_bot.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "stopOnEntry": true,
+      "showReturnValue": true,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [],
+      "stopAtEntry": false,
+      "externalConsole": true,
+      "cwd": "c:/Users/Joshua/Desktop/proyectos",
+      "program": "c:/Users/Joshua/Desktop/proyectos/build/Debug/outDebug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}

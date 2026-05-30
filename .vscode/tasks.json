@@ -1,0 +1,105 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install Python Dependencies",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"-r",
+				"requirements.txt"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Run Trading Bot",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"trading_bot.py"
+			],
+			"group": {
+				"kind": "test",
+				"isDefault": false
+			},
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Check Python Version",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"--version"
+			],
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Lint Code (Syntax Check)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"py_compile",
+				"trading_bot.py"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Verify app.py syntax",
+			"type": "shell",
+			"command": "python -m py_compile app.py",
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			]
+		},
+		{
+			"label": "Create release ZIP",
+			"type": "shell",
+			"command": "python -c \"import shutil; shutil.make_archive('release/TradingSystem-release','zip','release/dist/TradingSystem'); print('ZIP creado')\"",
+			"isBackground": false
+		},
+		{
+			"label": "Create release ZIP",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"tools\\make_zip.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Create release ZIP",
+			"type": "shell",
+			"command": "python tools\\make_zip.py",
+			"isBackground": false
+		}
+	]
+}
