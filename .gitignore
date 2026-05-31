@@ -21,6 +21,7 @@ release/
 # Logs
 *.log
 server.log
+trading_system_secure.log
 
 # Environment files
 .env
@@ -36,3 +37,7 @@ Thumbs.db
 # IDE
 *.iml
 .idea/
+
+# Local tools and caches
+.refact/
+.sixth/
