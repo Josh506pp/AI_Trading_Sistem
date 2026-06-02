@@ -1705,14 +1705,37 @@ DASHBOARD_HTML = """
                     }
                     document.getElementById('trades-list').innerHTML = html;
 
-                    if (chart) {
-                        try { chart.destroy(); } catch (err) { console.warn('Error destroying chart:', err); }
-                    }
                     try {
-                        const chartData = Array.isArray(d.candles) && d.candles.length ? d.candles : (Array.isArray(d.prices) ? d.prices : []);
-                        drawChart(chartData);
+                        const chartDataArr = Array.isArray(d.candles) && d.candles.length ? d.candles : (Array.isArray(d.prices) ? d.prices : []);
+                        const raw = Array.isArray(chartDataArr) ? chartDataArr : [];
+                        const useCandles = raw.length > 0 && typeof raw[0] === 'object' && raw[0].c !== undefined && raw[0].o !== undefined;
+                        const dataPoints = raw.map((item, index) => {
+                            if (useCandles) {
+                                return { x: item.x || index, y: item.c };
+                            }
+                            return { x: item && item.x !== undefined ? item.x : index, y: typeof item === 'number' ? item : (item.c || item.y || 0) };
+                        });
+                        const labels = dataPoints.map(p => p.x);
+
+                        // If chart exists, update its data in-place to avoid recreating and losing state/hover
+                        if (chart) {
+                            try {
+                                chart.data.labels = labels;
+                                chart.data.datasets[0].data = dataPoints;
+                                chart.update('none');
+                            } catch (err) {
+                                console.warn('Error actualizando datos del gráfico:', err);
+                            }
+                        } else {
+                            // create chart for the first time
+                            try {
+                                drawChart(raw);
+                            } catch (err) {
+                                console.warn('Error dibujando gráfico por primera vez:', err);
+                            }
+                        }
                     } catch (err) {
-                        console.warn('Error dibujando gráfico:', err);
+                        console.warn('Error actualizando gráfico:', err);
                     }
                     loadChat();
                     updateAIAnalysis();
