@@ -100,6 +100,352 @@
 			"type": "shell",
 			"command": "python tools\\make_zip.py",
 			"isBackground": false
+		},
+		{
+			"label": "Verify src/app.py syntax",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"py_compile",
+				"src/app.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe local status endpoint",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"(Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 5).StatusCode"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe local status endpoint 2",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"(Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 5).StatusCode"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe local status endpoint 3",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 5; Write-Output $r.StatusCode; Write-Output $r.Content.Substring(0,[Math]::Min(220,$r.Content.Length))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe local status endpoint 4",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 5; Write-Output $r.StatusCode"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe root endpoint",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/ -TimeoutSec 5; Write-Output $r.StatusCode"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe status endpoint",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 5; Write-Output $r.StatusCode; $j=$r.Content | ConvertFrom-Json; Write-Output ($j.symbol + ' ' + [string]$j.price)"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe status endpoint 5",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 8; Write-Output $r.StatusCode;"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe ping endpoint",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/ping -TimeoutSec 5; Write-Output $r.StatusCode; Write-Output $r.Content"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Stop all Python processes",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output 'Python processes stopped'"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe root endpoint clean",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/ -TimeoutSec 5; Write-Output $r.StatusCode"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe ping endpoint clean",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/ping -TimeoutSec 5; Write-Output $r.StatusCode; Write-Output $r.Content"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe status endpoint clean",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 8; Write-Output $r.StatusCode; $j=$r.Content | ConvertFrom-Json; Write-Output ($j.symbol + ' ' + [string]$j.price + ' candles=' + [string]$j.candles.Count)"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Probe status endpoint clean 2",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 8; Write-Output $r.StatusCode; Write-Output $r.Content.Substring(0,[Math]::Min(220,$r.Content.Length))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Stop all Python processes again",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output 'Python processes stopped'"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Test one-shot prediction endpoint",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing -Method POST http://127.0.0.1:5000/api/predict/one-shot -TimeoutSec 8; Write-Output $r.StatusCode; Write-Output $r.Content.Substring(0,[Math]::Min(260,$r.Content.Length))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Stop all Python processes for reload",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output 'Python processes stopped'"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Test one-shot prediction endpoint after reload",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r=Invoke-WebRequest -UseBasicParsing -Method POST http://127.0.0.1:5000/api/predict/one-shot -TimeoutSec 8; Write-Output $r.StatusCode; Write-Output $r.Content.Substring(0,[Math]::Min(320,$r.Content.Length))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Test one-shot cooldown behavior",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$r1=Invoke-WebRequest -UseBasicParsing -Method POST http://127.0.0.1:5000/api/predict/one-shot -TimeoutSec 8; Write-Output ('first=' + [string]$r1.StatusCode); try { $r2=Invoke-WebRequest -UseBasicParsing -Method POST http://127.0.0.1:5000/api/predict/one-shot -TimeoutSec 8; Write-Output ('second=' + [string]$r2.StatusCode); Write-Output $r2.Content } catch { if ($_.Exception.Response) { Write-Output ('second=' + [string][int]$_.Exception.Response.StatusCode); $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream()); $body = $sr.ReadToEnd(); Write-Output $body } else { throw } }"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Install runtime online dependencies",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"waitress",
+				"python-dotenv",
+				"requests",
+				"psutil"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Validate symbol switch guard",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-c",
+				"from src.app import app; c=app.test_client(); r1=c.post('/api/symbol', json={'symbol':'EURUSD'}); print('no_manual', r1.status_code, r1.get_json()); r2=c.post('/api/symbol', json={'symbol':'XAUUSD','manual':True}); print('manual', r2.status_code, (r2.get_json() or {}).get('symbol')); r3=c.get('/api/status'); d=r3.get_json() or {}; print('status_symbol', d.get('symbol'))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Validate symbol switch guard 2",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-c",
+				"from src.app import app; c=app.test_client(); r1=c.post('/api/symbol', json={'symbol':'EURUSD'}); print('no_manual', r1.status_code, r1.get_json()); r2=c.post('/api/symbol', json={'symbol':'XAUUSD','manual':True}); print('manual', r2.status_code, (r2.get_json() or {}).get('symbol')); r3=c.get('/api/status'); d=r3.get_json() or {}; print('status_symbol', d.get('symbol'))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Stop Python for symbol-fix reload",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output 'Python processes stopped'"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Verify symbol switch endpoint guard runtime",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"try { $resp1 = Invoke-WebRequest -UseBasicParsing -Method POST http://127.0.0.1:5000/api/symbol -ContentType 'application/json' -Body '{\"symbol\":\"EURUSD\"}' -TimeoutSec 8; Write-Output ('noManualStatus=' + [string]$resp1.StatusCode); Write-Output $resp1.Content } catch { if ($_.Exception.Response) { Write-Output ('noManualStatus=' + [string][int]$_.Exception.Response.StatusCode.value__); $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream()); Write-Output $sr.ReadToEnd() } else { throw } }; $resp2 = Invoke-WebRequest -UseBasicParsing -Method POST http://127.0.0.1:5000/api/symbol -ContentType 'application/json' -Body '{\"symbol\":\"XAUUSD\",\"manual\":true}' -TimeoutSec 8; Write-Output ('manualStatus=' + [string]$resp2.StatusCode); $status = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5000/api/status -TimeoutSec 8; $j = $status.Content | ConvertFrom-Json; Write-Output ('statusSymbol=' + [string]$j.symbol)"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Stop Python for reload",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output 'Python stopped'"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Setup FreeDomain Cloudflare tunnel",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"tools/setup_freedomain_cloudflare.ps1",
+				"-Domain",
+				"candlekiller.dpdns.org",
+				"-TunnelName",
+				"trading-system",
+				"-LocalPort",
+				"5000"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Cloudflare tunnel login",
+			"type": "shell",
+			"command": "cloudflared",
+			"args": [
+				"tunnel",
+				"login"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Setup FreeDomain Cloudflare tunnel",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"tools/setup_freedomain_cloudflare.ps1",
+				"-Domain",
+				"candlekiller.dpdns.org",
+				"-TunnelName",
+				"trading-system",
+				"-LocalPort",
+				"5000"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Git status quick",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"status",
+				"--short",
+				"--branch"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Git add all update",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"add",
+				"-A"
+			],
+			"isBackground": false
 		}
 	]
 }

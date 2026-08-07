@@ -1,0 +1,7 @@
+﻿tunnel: 7517dcd6-d0fe-4b47-830c-df7b624111d5
+credentials-file: C:\Users\Joshua\.cloudflared\7517dcd6-d0fe-4b47-830c-df7b624111d5.json
+
+ingress:
+  - hostname: candlekiller.dpdns.org
+    service: http://127.0.0.1:5000
+  - service: http_status:404

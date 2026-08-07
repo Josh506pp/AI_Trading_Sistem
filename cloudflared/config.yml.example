@@ -1,0 +1,7 @@
+tunnel: YOUR_TUNNEL_NAME_OR_ID
+credentials-file: C:\\path\\to\\your\\tunnel-credentials.json
+
+ingress:
+  - hostname: candlekiller.dpdns.org
+    service: http://127.0.0.1:5000
+  - service: http_status:404

@@ -26,6 +26,29 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def resolve_mt5_path(path_value):
+    """Normaliza la ruta de MT5 al ejecutable del terminal que espera MetaTrader5.initialize()."""
+    if not path_value:
+        return None
+
+    candidate = str(path_value).strip().strip('"').strip("'")
+    if not candidate:
+        return None
+
+    if os.path.isfile(candidate):
+        if os.path.basename(candidate).lower() in {'terminal64.exe', 'terminal.exe'}:
+            return candidate
+        return candidate
+
+    if os.path.isdir(candidate):
+        for exe_name in ['terminal64.exe', 'terminal.exe']:
+            exe_path = os.path.join(candidate, exe_name)
+            if os.path.isfile(exe_path):
+                return exe_path
+
+    return candidate
+
+
 class MT5Manager:
     """Gestor de conexión con MetaTrader 5"""
     
@@ -34,34 +57,30 @@ class MT5Manager:
         self.account_info = None
         self.mt5_available = MT5_AVAILABLE
         
-    def connect(self, login: int, password: str, server: str, path: str = None) -> Dict:
-        """Conecta a MetaTrader 5"""
+    def connect(self, login: int = None, password: str = None, server: str = None, path: str = None) -> Dict:
+        """Conecta a MetaTrader 5 directamente al terminal ya abierto sin login."""
         if not self.mt5_available:
             return {'success': False, 'error': 'MetaTrader5 no está instalado'}
         
         try:
-            # Inicializar MT5
-            if path:
-                result = mt5.initialize(path=path)
+            # Inicializar MT5 sin login
+            normalized_path = resolve_mt5_path(path) if path else None
+            if normalized_path:
+                result = mt5_initialize_with_fallback(normalized_path)
             else:
-                result = mt5.initialize()
+                result = mt5_initialize_with_fallback()
             
             if not result:
-                return {'success': False, 'error': 'Error al inicializar MT5'}
+                return {'success': False, 'error': 'Error al inicializar MT5. Asegúrate de que MetaTrader 5 está abierto y logueado.'}
             
-            # Login
-            if not mt5.login(login=login, password=password, server=server):
-                mt5.shutdown()
-                return {'success': False, 'error': 'Login fallido. Verifica credenciales.'}
-            
-            # Obtener info de cuenta
+            # Obtener info de cuenta sin hacer login
             self.account_info = mt5.account_info()
             if not self.account_info:
                 mt5.shutdown()
-                return {'success': False, 'error': 'No se pudo obtener info de cuenta'}
+                return {'success': False, 'error': 'MT5 inicializado pero no logueado. Abre MetaTrader 5 y entra a tu cuenta.'}
             
             self.connected = True
-            logger.info(f"✅ Conectado a MT5: {login} en {server}")
+            logger.info(f"✅ Conectado a MT5: cuenta {self.account_info.login}")
             
             return {
                 'success': True,

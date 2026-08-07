@@ -184,6 +184,8 @@ python -c "import secrets; print(secrets.token_hex(32))"
 - **[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)** - Guía extensiva de despliegue
 - **[MT5_SETUP.md](docs/MT5_SETUP.md)** - Integración MetaTrader 5
 - **[TRADING_BOT_READY.md](TRADING_BOT_READY.md)** - Verificación final
+- **[docs/CLOUDFLARE_24_7.md](docs/CLOUDFLARE_24_7.md)** - URL pública con Cloudflare y modo 24/7 sin PC personal
+- **[docs/FREEDOMAIN_CLOUDFLARE_SETUP.md](docs/FREEDOMAIN_CLOUDFLARE_SETUP.md)** - Flujo de FreeDomain + Cloudflare para dominio propio
 
 ---
 
