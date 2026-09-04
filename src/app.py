@@ -6,6 +6,7 @@ Versión limpia sin dependencias complicadas
 
 from flask import Flask, render_template_string, request, redirect, jsonify, session
 import os
+import sys
 import time
 import random
 import threading
@@ -13,6 +14,9 @@ import socket
 import webbrowser
 import secrets
 from datetime import datetime
+
+# Asegurar que el directorio src esté en el path para imports absolutos
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from dotenv import load_dotenv
@@ -26,6 +30,22 @@ try:
 except ImportError:
     mt5 = None
     MT5_AVAILABLE = False
+
+try:
+    from .market_symbols import (
+        list_symbols, get_symbol_config, normalize_symbol,
+        get_simulation_params, format_price, POPULAR_SYMBOLS
+    )
+    SYMBOLS_AVAILABLE = True
+except ImportError:
+    try:
+        from market_symbols import (
+            list_symbols, get_symbol_config, normalize_symbol,
+            get_simulation_params, format_price, POPULAR_SYMBOLS
+        )
+        SYMBOLS_AVAILABLE = True
+    except ImportError:
+        SYMBOLS_AVAILABLE = False
 
 try:
     from .professional_trading_system import AIAnalyzer as ProAIAnalyzer
@@ -91,9 +111,19 @@ app.config.update({
 # DATOS GLOBALES
 # ====================================================================
 
+SYMBOL_LIST = list(POPULAR_SYMBOLS.keys()) if SYMBOLS_AVAILABLE else ['EURUSD']
+DEFAULT_SYMBOL = 'XAUUSD' if SYMBOLS_AVAILABLE else 'EURUSD'
+_sim_params = get_simulation_params(DEFAULT_SYMBOL) if SYMBOLS_AVAILABLE else {'default_price': 1.0850, 'volatility': 0.00008, 'decimals': 5}
+_initial_price = float(_sim_params.get('default_price', 1.0850))
+_initial_vol = float(_sim_params.get('volatility', 0.00008))
+_initial_decimals = int(_sim_params.get('decimals', 5))
+
 TRADING_DATA = {
-    'price': 1.0850,
-    'price_history': [1.0850 + i * 0.0001 + random.uniform(-0.0005, 0.0005) for i in range(50)],  # Tendencia gradual
+    'symbol': DEFAULT_SYMBOL,
+    'symbols': SYMBOL_LIST,
+    'volume': 0.01,
+    'price': round(_initial_price, _initial_decimals),
+    'price_history': [round(_initial_price + i * (_initial_vol * 0.1) + random.uniform(-_initial_vol * 5, _initial_vol * 5), _initial_decimals) for i in range(50)],
     'balance': 10000.0,
     'equity': 10000.0,
     'trades_open': 0,
@@ -105,9 +135,33 @@ TRADING_DATA = {
     'chat_history': [{'sender': 'IA', 'text': 'Hola! Bienvenido al sistema de trading. Soy tu asistente de IA.'}]
 }
 
+
+def get_symbol_format(symbol):
+    """Devuelve decimales, pip_size, volatilidad, precio por defecto y volumen por defecto."""
+    if SYMBOLS_AVAILABLE:
+        cfg = get_symbol_config(symbol)
+        if cfg:
+            return cfg.decimals, cfg.pip_size, cfg.volatility, cfg.default_price, cfg.default_volume
+    return 5, 0.0001, 0.00008, 1.0850, 0.01
+
+
+def reset_price_history(symbol):
+    """Reinicia el historial de precios para un símbolo."""
+    decimals, pip_size, volatility, default_price, default_volume = get_symbol_format(symbol)
+    TRADING_DATA['symbol'] = symbol
+    TRADING_DATA['volume'] = default_volume
+    TRADING_DATA['price'] = round(default_price, decimals)
+    TRADING_DATA['price_history'] = [round(default_price + i * (volatility * 0.1) + random.uniform(-volatility * 5, volatility * 5), decimals) for i in range(50)]
+    return decimals, volatility, default_price, default_volume
+
 PRICE_LOCK = threading.Lock()
 MT5_CONNECTED = False
 MT5_ACCOUNT_INFO = None
+
+# Modo simulación: cuando está activo, las operaciones se ejecutan localmente
+# aunque el paquete MetaTrader5 esté instalado. Se desactiva automáticamente
+# al conectar una cuenta MT5 real.
+SIMULATION_MODE = True
 
 # IA Profesional Mejorada
 if PROFESSIONAL_AVAILABLE:
@@ -189,58 +243,114 @@ def calculate_bollinger_bands(prices, period=20, std_dev=2):
         'lower': middle - (std * std_dev)
     }
 
-def analyze_signal(prices):
-    """Análisis inteligente y mejorado con múltiples indicadores"""
-    if len(prices) < 20:
-        return {'action': 'ESPERA', 'confidence': 0.0}
-    
-    # Indicadores técnicos
+def _ema(prices, period):
+    """Calcula EMA simple."""
+    if len(prices) < period:
+        return sum(prices) / len(prices) if prices else 0.0
+    multiplier = 2.0 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = price * multiplier + ema * (1 - multiplier)
+    return ema
+
+
+def _stochastic(prices, k_period=14, d_period=3):
+    """Calcula estocástico %K."""
+    if len(prices) < k_period:
+        return 50.0
+    recent = prices[-k_period:]
+    lowest = min(recent)
+    highest = max(recent)
+    current = prices[-1]
+    if highest == lowest:
+        return 50.0
+    return ((current - lowest) / (highest - lowest)) * 100
+
+
+def _atr(prices, period=14):
+    """Calcula ATR simplificado."""
+    if len(prices) < 2:
+        return 0.001
+    tr_list = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+    return sum(tr_list[-period:]) / len(tr_list[-period:]) if tr_list else 0.001
+
+
+def analyze_signal(prices, symbol=None):
+    """Análisis inteligente con scoring ponderado multi-factor."""
+    if len(prices) < 30:
+        return {'action': 'ESPERA', 'confidence': 0.0, 'rsi': 50.0, 'trend': 'NEUTRAL',
+                'macd': 0.0, 'bb': '0-0', 'ema_fast': 0.0, 'ema_slow': 0.0,
+                'stochastic': 50.0, 'atr': 0.0, 'score': 0.0, 'pattern': {}}
+
+    current = prices[-1]
     rsi = calculate_rsi(prices)
     macd_data = calculate_macd(prices)
     bb_data = calculate_bollinger_bands(prices)
-    
-    current = prices[-1]
-    prev = prices[-2]
-    sma_short = sum(prices[-5:]) / 5
+    ema_fast = _ema(prices, 12)
+    ema_slow = _ema(prices, 26)
+    stochastic = _stochastic(prices)
+    atr = _atr(prices)
     sma_long = sum(prices[-20:]) / 20
-    
-    trend = 'ALZA' if current > sma_long else 'BAJA'
-    momentum = 'FUERTE' if abs(current - prev) > 0.0005 else 'DÉBIL'
-    
-    # Aprendizaje: Aprender de patrones históricos exitosos
+    trend = 'ALZA' if current > sma_long else 'BAJA' if current < sma_long else 'LATERAL'
+
+    score = 0.0
+    # RSI
+    if rsi < 30:
+        score += 30
+    elif rsi < 40:
+        score += 15
+    elif rsi > 70:
+        score -= 30
+    elif rsi > 60:
+        score -= 15
+    # MACD
+    if macd_data['histogram'] > 0:
+        score += 20
+    elif macd_data['histogram'] < 0:
+        score -= 20
+    # EMA cruzada
+    if ema_fast > ema_slow:
+        score += 15
+    elif ema_fast < ema_slow:
+        score -= 15
+    # Stochastic
+    if stochastic < 20:
+        score += 15
+    elif stochastic > 80:
+        score -= 15
+    # Bollinger
+    if current < bb_data['lower']:
+        score += 10
+    elif current > bb_data['upper']:
+        score -= 10
+    # Momentum
+    momentum = current - prices[-5]
+    if momentum > atr * 1.5:
+        score += 10
+    elif momentum < -atr * 1.5:
+        score -= 10
+
+    # Aprendizaje de patrones
     learned_bonus = 0.0
     if AI_LEARNING_DB['successful_patterns']:
-        # Buscar patrones similares en el histórico
         for pattern in AI_LEARNING_DB['successful_patterns'][-10:]:
-            if pattern['trend'] == trend and pattern['momentum'] == momentum:
-                learned_bonus += 0.15 * (pattern['success_rate'] or 0.5)
-    
-    # Señal de trading inteligente
-    confidence = 0.0
-    action = 'ESPERA'
-    
-    if rsi < 35 and trend == 'BAJA' and macd_data['histogram'] < 0:
-        confidence = min(0.95, 0.4 + (35 - rsi) / 70 + learned_bonus)
+            if pattern.get('trend') == trend:
+                learned_bonus += 5 * (pattern.get('success_rate', 0.5) or 0.5)
+    score += max(-15, min(15, learned_bonus))
+
+    if score > 30:
         action = 'COMPRA'
-    elif rsi > 65 and trend == 'ALZA' and macd_data['histogram'] > 0:
-        confidence = min(0.95, 0.4 + (rsi - 65) / 35 + learned_bonus)
+    elif score < -30:
         action = 'VENTA'
-    elif (current > bb_data['upper']) and rsi > 60:
-        confidence = min(0.85, 0.3 + (rsi - 60) / 40)
-        action = 'VENTA'
-    elif (current < bb_data['lower']) and rsi < 40:
-        confidence = min(0.85, 0.3 + (40 - rsi) / 40)
-        action = 'COMPRA'
-    
-    # Registrar patrón para futuro aprendizaje
+    else:
+        action = 'ESPERA'
+    confidence = min(0.98, abs(score) / 100.0)
+
     pattern_record = {
-        'rsi': rsi,
-        'trend': trend,
-        'momentum': momentum,
-        'action': action,
-        'confidence': confidence
+        'rsi': rsi, 'trend': trend, 'score': score, 'action': action,
+        'confidence': confidence, 'atr': atr
     }
-    
+
     return {
         'action': action,
         'confidence': confidence,
@@ -248,6 +358,11 @@ def analyze_signal(prices):
         'trend': trend,
         'macd': macd_data['histogram'],
         'bb': f"{bb_data['lower']:.4f}-{bb_data['upper']:.4f}",
+        'ema_fast': ema_fast,
+        'ema_slow': ema_slow,
+        'stochastic': stochastic,
+        'atr': atr,
+        'score': score,
         'pattern': pattern_record
     }
 
@@ -260,10 +375,13 @@ def update_prices():
     while True:
         try:
             with PRICE_LOCK:
+                symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+                decimals, pip_size, volatility, default_price, _ = get_symbol_format(symbol)
                 last = TRADING_DATA['price_history'][-1]
-                # Movimientos realistas con volatilidad variable
-                change = random.uniform(-0.00008, 0.00008)
-                new_price = max(0.9, last + change)
+                # Movimientos realistas con volatilidad variable según símbolo
+                change = random.uniform(-volatility, volatility)
+                new_price = max(default_price * 0.5, last + change)
+                new_price = round(new_price, decimals)
                 TRADING_DATA['price_history'].append(new_price)
                 if len(TRADING_DATA['price_history']) > 200:
                     TRADING_DATA['price_history'].pop(0)
@@ -368,6 +486,70 @@ def update_prices():
             pass
 
 
+def find_mt5_terminal():
+    """Busca terminal64.exe en rutas comunes de instalación."""
+    candidates = [
+        r'C:\Program Files\MetaTrader 5\terminal64.exe',
+        r'C:\Program Files (x86)\MetaTrader 5\terminal64.exe',
+        r'D:\Program Files\MetaTrader 5\terminal64.exe',
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'MetaQuotes\Terminal\terminal64.exe'),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _mt5_terminal_running():
+    """Verifica si el proceso terminal64.exe está activo."""
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name']):
+            if proc.info.get('name', '').lower() in ('terminal64.exe', 'metaeditor64.exe'):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _mt5_init_worker(path, queue):
+    """Worker que ejecuta mt5.initialize en un proceso separado."""
+    try:
+        import MetaTrader5 as mt5
+        if path:
+            result = mt5.initialize(path=path)
+        else:
+            result = mt5.initialize()
+        queue.put(('success', result))
+    except Exception as e:
+        queue.put(('error', str(e)))
+
+
+def _mt5_initialize_with_timeout(path=None, timeout=15):
+    """Ejecuta mt5.initialize en un proceso separado con timeout para no bloquear el servidor."""
+    import multiprocessing
+    queue = multiprocessing.Queue()
+    process = multiprocessing.Process(target=_mt5_init_worker, args=(path, queue))
+    process.start()
+    process.join(timeout=timeout)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        return False, 'Timeout: MT5 no respondió a tiempo. Abre MetaTrader 5 manualmente, inicia sesión y vuelve a conectar.'
+
+    try:
+        status, value = queue.get_nowait()
+        if status == 'error':
+            return False, value
+        return bool(value), None
+    except Exception:
+        return False, 'No se pudo obtener respuesta del proceso de inicialización de MT5'
+
+
 def initialize_mt5(login=None, password=None, server=None, path=None):
     """Inicializa y conecta MetaTrader5 con credenciales dadas o con las guardadas."""
     global MT5_CONNECTED, MT5_ACCOUNT_INFO, MT5_CREDENTIALS
@@ -379,8 +561,10 @@ def initialize_mt5(login=None, password=None, server=None, path=None):
             'login': str(login).strip(),
             'password': str(password).strip(),
             'server': str(server).strip(),
-            'path': str(path).strip() if path else MT5_PATH
+            'path': str(path).strip() if path else (MT5_PATH or find_mt5_terminal())
         }
+    elif not MT5_CREDENTIALS.get('path'):
+        MT5_CREDENTIALS['path'] = MT5_PATH or find_mt5_terminal()
 
     if not MT5_CREDENTIALS.get('login') or not MT5_CREDENTIALS.get('password') or not MT5_CREDENTIALS.get('server'):
         return {'success': False, 'error': 'MT5 credentials no configuradas. Envía login, password y server.'}
@@ -396,24 +580,35 @@ def initialize_mt5(login=None, password=None, server=None, path=None):
         except Exception:
             pass
 
-        if MT5_CREDENTIALS.get('path'):
-            if not os.path.isfile(MT5_CREDENTIALS['path']):
+        mt5_path = MT5_CREDENTIALS.get('path') or find_mt5_terminal()
+        if mt5_path:
+            if not os.path.isfile(mt5_path):
                 return {
                     'success': False,
-                    'error': f'Ruta MT5 no encontrada: {MT5_CREDENTIALS["path"]}. Ajusta MT5_PATH o ingresa la ruta correcta.'
+                    'error': f'Ruta MT5 no encontrada: {mt5_path}. Ajusta MT5_PATH o ingresa la ruta correcta.'
                 }
-            result_init = mt5.initialize(path=MT5_CREDENTIALS['path'])
+        if not _mt5_terminal_running():
+            return {
+                'success': False,
+                'error': 'MetaTrader 5 no está abierto. Abre MT5, inicia sesión con tu cuenta y vuelve a conectar.'
+            }
+        if mt5_path:
+            result_init, init_error = _mt5_initialize_with_timeout(path=mt5_path, timeout=20)
         else:
-            result_init = mt5.initialize()
+            result_init, init_error = _mt5_initialize_with_timeout(timeout=20)
 
         if not result_init:
             last_error = mt5.last_error()
             if isinstance(last_error, tuple):
                 last_error = ' - '.join(map(str, last_error))
             msg = 'Error inicializando MT5.'
-            if last_error:
+            if init_error:
+                msg += f' {init_error}'
+            elif last_error:
                 msg += f' {last_error}'
-            if not MT5_CREDENTIALS.get('path'):
+            if 'IPC timeout' in msg or '10005' in msg:
+                msg += ' Abre MetaTrader 5 manualmente, inicia sesión con tu cuenta y vuelve a conectar.'
+            elif not mt5_path:
                 msg += ' Si MT5 está instalado, configura MT5_PATH con la ruta completa a terminal64.exe.'
             return {'success': False, 'error': msg}
 
@@ -472,11 +667,32 @@ def ensure_mt5_connected():
     return result.get('success', False)
 
 
+
+
+def detect_mt5_symbol(symbol):
+    """Detecta el nombre exacto del símbolo en MT5 probando aliases."""
+    if not MT5_AVAILABLE:
+        return symbol
+    if SYMBOLS_AVAILABLE:
+        cfg = get_symbol_config(symbol)
+        aliases = cfg.mt5_symbol_aliases if cfg else [symbol]
+    else:
+        aliases = [symbol]
+    for alias in aliases:
+        try:
+            if mt5.symbol_select(alias, True):
+                tick = mt5.symbol_info_tick(alias)
+                if tick is not None:
+                    return alias
+        except Exception:
+            continue
+    return symbol
+
 def get_candle_data(max_candles=40):
     """Devuelve datos de velas para el gráfico."""
     if MT5_AVAILABLE and MT5_CONNECTED:
         try:
-            symbol = TRADING_SYMBOL or 'EURUSD'
+            symbol = detect_mt5_symbol(TRADING_SYMBOL or TRADING_DATA.get('symbol', 'EURUSD'))
             rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, max_candles)
             if rates is not None and len(rates) > 0:
                 candles = []
@@ -551,8 +767,8 @@ def place_mt5_order(action):
     if not ensure_mt5_connected():
         return {'success': False, 'error': 'No conectado a MT5. Verifica las credenciales y la ruta de MT5.'}
 
-    symbol = TRADING_SYMBOL or 'EURUSD'
-    volume = DEFAULT_VOLUME or 0.01
+    symbol = detect_mt5_symbol(TRADING_SYMBOL or TRADING_DATA.get('symbol', 'EURUSD'))
+    volume = TRADING_DATA.get('volume', DEFAULT_VOLUME or 0.01)
     if not mt5.symbol_select(symbol, True):
         return {'success': False, 'error': f'No se pudo seleccionar el símbolo {symbol} en MT5'}
     tick = mt5.symbol_info_tick(symbol)
@@ -599,7 +815,7 @@ def close_all_mt5_positions():
     if not MT5_AVAILABLE or not MT5_CONNECTED:
         return {'success': False, 'error': 'MT5 no conectado'}
 
-    symbol = TRADING_SYMBOL or 'EURUSD'
+    symbol = detect_mt5_symbol(TRADING_SYMBOL or TRADING_DATA.get('symbol', 'EURUSD'))
     positions = mt5.positions_get(symbol=symbol)
     if positions is None or len(positions) == 0:
         return {'success': True, 'closed': 0}
@@ -666,6 +882,9 @@ def api_status():
             'auto_enabled': TRADING_DATA['auto_enabled'],
             'use_prediction': TRADING_DATA.get('use_prediction', True),
             'signal': TRADING_DATA['signal'],
+            'symbol': TRADING_DATA.get('symbol', DEFAULT_SYMBOL),
+            'volume': TRADING_DATA.get('volume', 0.01),
+            'simulation_mode': SIMULATION_MODE,
             'prices': TRADING_DATA['price_history'][-30:],
             'candles': get_candle_data(40),
             'closed_count': len(TRADING_DATA['closed_trades']),
@@ -674,9 +893,107 @@ def api_status():
         })
 
 
+
+
+@app.route('/api/symbols')
+def api_symbols():
+    """Lista los símbolos disponibles."""
+    if SYMBOLS_AVAILABLE:
+        return jsonify({'success': True, 'symbols': list_symbols(), 'current': TRADING_DATA.get('symbol', DEFAULT_SYMBOL)})
+    return jsonify({'success': True, 'symbols': [{'name': 'EURUSD', 'display_name': 'Euro / Dólar', 'category': 'FOREX', 'default_price': 1.0850, 'default_volume': 0.01, 'decimals': 5, 'description': '', 'session_hours': ''}], 'current': 'EURUSD'})
+
+
+@app.route('/api/symbol', methods=['POST'])
+def api_set_symbol():
+    """Cambia el símbolo activo."""
+    global TRADING_SYMBOL, DEFAULT_VOLUME
+    data = request.get_json(silent=True) or {}
+    symbol = data.get('symbol', DEFAULT_SYMBOL)
+    volume = data.get('volume')
+    if SYMBOLS_AVAILABLE:
+        symbol = normalize_symbol(symbol)
+        cfg = get_symbol_config(symbol)
+        if not cfg:
+            return jsonify({'success': False, 'error': f'Símbolo {symbol} no soportado'}), 400
+    symbol = symbol.upper()
+    TRADING_SYMBOL = symbol
+    reset_price_history(symbol)
+    if volume is not None:
+        try:
+            vol = float(volume)
+            if vol > 0:
+                TRADING_DATA['volume'] = vol
+                DEFAULT_VOLUME = vol
+        except Exception:
+            pass
+    msg = f'Símbolo cambiado a {symbol}, volumen {TRADING_DATA["volume"]}'
+    TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
+    return jsonify({'success': True, 'symbol': symbol, 'volume': TRADING_DATA['volume'], 'price': TRADING_DATA['price']})
+
+
+@app.route('/api/advanced-prediction')
+def api_advanced_prediction():
+    """Panel de predicción avanzada con todos los indicadores."""
+    with PRICE_LOCK:
+        prices = TRADING_DATA['price_history']
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+        analysis = analyze_signal(prices, symbol)
+        pred = {'predicted_price': prices[-1], 'expected_high': prices[-1], 'expected_low': prices[-1], 'confidence': 0.0, 'direction': 'NEUTRAL', 'volatility': 0.0}
+        levels = {'support': 0, 'resistance': 0, 'pivot': 0, 'entry': prices[-1], 'stop_loss': prices[-1], 'take_profit': prices[-1]}
+        if PREDICTION_AVAILABLE and prediction_engine:
+            try:
+                pred = prediction_engine.predict_price_range(prices, periods=5)
+                levels = prediction_engine.get_trading_levels(prices)
+            except Exception as e:
+                print(f"Error predicción avanzada: {e}")
+        else:
+            if len(prices) >= 10:
+                recent = prices[-50:]
+                high = max(recent)
+                low = min(recent)
+                pivot = (high + low + prices[-1]) / 3
+                atr = analysis.get('atr', 0.001) or 0.001
+                levels = {
+                    'support': (2 * pivot) - high,
+                    'resistance': (2 * pivot) - low,
+                    'pivot': pivot,
+                    'entry': prices[-1],
+                    'stop_loss': prices[-1] - atr * 2,
+                    'take_profit': prices[-1] + atr * 2
+                }
+                pred = {
+                    'predicted_price': prices[-1] + (prices[-1] - prices[-5]) if len(prices) >= 5 else prices[-1],
+                    'expected_high': prices[-1] + atr * 3,
+                    'expected_low': prices[-1] - atr * 3,
+                    'confidence': analysis.get('confidence', 0),
+                    'direction': 'ALCISTA' if analysis['action'] == 'COMPRA' else ('BAJISTA' if analysis['action'] == 'VENTA' else 'NEUTRAL'),
+                    'volatility': atr
+                }
+        return jsonify({
+            'success': True,
+            'symbol': symbol,
+            'signal': analysis['action'],
+            'score': analysis.get('score', 0),
+            'confidence': analysis['confidence'],
+            'indicators': {
+                'rsi': round(analysis['rsi'], 2),
+                'macd': round(analysis['macd'], 6),
+                'ema_fast': round(analysis['ema_fast'], 6),
+                'ema_slow': round(analysis['ema_slow'], 6),
+                'stochastic': round(analysis['stochastic'], 2),
+                'atr': round(analysis['atr'], 6),
+                'trend': analysis['trend'],
+                'bb': analysis['bb']
+            },
+            'levels': {k: round(v, 6) if isinstance(v, float) else v for k, v in levels.items()},
+            'prediction': {k: round(v, 6) if isinstance(v, float) else v for k, v in pred.items()},
+            'timestamp': datetime.now().isoformat()
+        })
+
 @app.route('/api/mt5/connect', methods=['POST'])
 def api_mt5_connect():
     """Conecta MT5 usando credenciales enviadas por la web o mt5_config.py"""
+    global SIMULATION_MODE
     data = request.get_json(silent=True) or {}
     login = data.get('login')
     password = data.get('password')
@@ -685,8 +1002,9 @@ def api_mt5_connect():
 
     result = initialize_mt5(login=login, password=password, server=server, path=path)
     if result.get('success'):
+        SIMULATION_MODE = False
         mt5_state = mt5_status() if MT5_AVAILABLE else {'connected': False, 'error': 'MetaTrader5 package no instalado'}
-        response = {**result, 'mt5': mt5_state}
+        response = {**result, 'mt5': mt5_state, 'simulation_mode': SIMULATION_MODE}
         return jsonify(response)
     return jsonify(result), 400
 
@@ -696,9 +1014,9 @@ def api_mt5_status():
     return jsonify(mt5_status())
 
 
-def save_mt5_config_file(login, password, server, path=None):
+def save_mt5_config_file(login, password, server, path=None, symbol=None, volume=None):
     """Guarda las credenciales MT5 en el archivo mt5_config.py para uso persistente."""
-    global MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH, MT5_CREDENTIALS
+    global MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH, MT5_CREDENTIALS, TRADING_SYMBOL, DEFAULT_VOLUME
     cfg_path = os.path.join(os.path.dirname(__file__), 'mt5_config.py')
     try:
         # Decide si login es numérico
@@ -712,6 +1030,8 @@ def save_mt5_config_file(login, password, server, path=None):
         server_repr = '"' + str(server).replace('"', '\\"') + '"'
         path_repr = 'None' if not path else 'r"' + str(path).replace('"', '\\"') + '"'
 
+        active_symbol = (normalize_symbol(symbol) if SYMBOLS_AVAILABLE and symbol else (symbol or TRADING_SYMBOL or 'EURUSD')).upper()
+        active_volume = DEFAULT_VOLUME if volume is None else float(volume)
         content = (
             "#!/usr/bin/env python3\n"
             '"""MetaTrader5 Configuration File (auto-generated)"""\n\n'
@@ -719,10 +1039,10 @@ def save_mt5_config_file(login, password, server, path=None):
             f"MT5_LOGIN = {login_repr}\n"
             f"MT5_PASSWORD = {password_repr}\n"
             f"MT5_SERVER = {server_repr}\n"
-            f"MT5_PATH = {path_repr}\n\n"
-            "# Defaults (preserved from original template)\n"
-            "TRADING_SYMBOL = \"EURUSD\"\n"
-            "DEFAULT_VOLUME = 0.01\n"
+            f"MT5_PATH = {path_repr}\n"
+            f"TRADING_SYMBOL = \"{active_symbol}\"\n"
+            f"DEFAULT_VOLUME = {active_volume}\n\n"
+            "# Defaults\n"
             "USE_REAL_ACCOUNT = False\n"
             "TIMEFRAME_MINUTES = 1\n"
             "CANDLE_COUNT = 100\n"
@@ -735,6 +1055,13 @@ def save_mt5_config_file(login, password, server, path=None):
         MT5_PASSWORD = str(password)
         MT5_SERVER = str(server).strip()
         MT5_PATH = str(path).strip() if path else MT5_PATH
+        if symbol:
+            TRADING_SYMBOL = normalize_symbol(symbol) if SYMBOLS_AVAILABLE else symbol.upper()
+        if volume is not None:
+            try:
+                DEFAULT_VOLUME = float(volume)
+            except Exception:
+                pass
         MT5_CREDENTIALS = {
             'login': MT5_LOGIN,
             'password': MT5_PASSWORD,
@@ -892,9 +1219,10 @@ def api_predict_signal():
 
 @app.route('/api/buy', methods=['POST'])
 def api_buy():
-    """Ejecutar compra"""
+    """Ejecutar compra (MT5 si está conectado, o simulación local)"""
+    global SIMULATION_MODE
     with PRICE_LOCK:
-        if MT5_AVAILABLE:
+        if not SIMULATION_MODE and MT5_AVAILABLE:
             if ensure_mt5_connected():
                 result = place_mt5_order('BUY')
                 if result.get('success'):
@@ -911,26 +1239,30 @@ def api_buy():
                     TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
                     return jsonify({'success': True, 'trade': trade, 'price': result['price']})
                 return jsonify({'success': False, 'error': result.get('error')}), 400
-            return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de ejecutar órdenes.'}), 400
+            return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de ejecutar órdenes o activa Modo Simulación.'}), 400
 
+        # Simulación local
         trade = {
             'id': len(TRADING_DATA['trades']) + 1,
             'action': 'BUY',
             'entry': TRADING_DATA['price'],
-            'size': 0.1,
+            'size': TRADING_DATA.get('volume', DEFAULT_VOLUME or 0.1),
             'pl': 0,
             'source': 'SIM'
         }
         TRADING_DATA['trades'].append(trade)
         TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-        return jsonify({'success': True, 'trade': trade, 'price': TRADING_DATA['price']})
+        msg = f"Operación de COMPRA simulada en {TRADING_DATA['symbol']} a {trade['entry']} (vol {trade['size']})"
+        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
+        return jsonify({'success': True, 'trade': trade, 'price': TRADING_DATA['price'], 'simulated': True})
 
 
 @app.route('/api/sell', methods=['POST'])
 def api_sell():
-    """Ejecutar venta"""
+    """Ejecutar venta (MT5 si está conectado, o simulación local)"""
+    global SIMULATION_MODE
     with PRICE_LOCK:
-        if MT5_AVAILABLE:
+        if not SIMULATION_MODE and MT5_AVAILABLE:
             if ensure_mt5_connected():
                 result = place_mt5_order('SELL')
                 if result.get('success'):
@@ -947,26 +1279,31 @@ def api_sell():
                     TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
                     return jsonify({'success': True, 'trade': trade, 'price': result['price']})
                 return jsonify({'success': False, 'error': result.get('error')}), 400
-            return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de ejecutar órdenes.'}), 400
+            return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de ejecutar órdenes o activa Modo Simulación.'}), 400
 
+        # Simulación local
         trade = {
             'id': len(TRADING_DATA['trades']) + 1,
             'action': 'SELL',
             'entry': TRADING_DATA['price'],
-            'size': 0.1,
+            'size': TRADING_DATA.get('volume', DEFAULT_VOLUME or 0.1),
             'pl': 0,
             'source': 'SIM'
         }
         TRADING_DATA['trades'].append(trade)
         TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-        return jsonify({'success': True, 'trade': trade, 'price': TRADING_DATA['price']})
+        msg = f"Operación de VENTA simulada en {TRADING_DATA['symbol']} a {trade['entry']} (vol {trade['size']})"
+        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
+        return jsonify({'success': True, 'trade': trade, 'price': TRADING_DATA['price'], 'simulated': True})
 
 
 @app.route('/api/close-all', methods=['POST'])
 def api_close_all():
     """Cerrar todos los trades"""
+    global SIMULATION_MODE
     with PRICE_LOCK:
-        if MT5_AVAILABLE:
+        closed = 0
+        if not SIMULATION_MODE and MT5_AVAILABLE:
             if ensure_mt5_connected():
                 result = close_all_mt5_positions()
                 if result.get('success'):
@@ -974,13 +1311,15 @@ def api_close_all():
                 else:
                     return jsonify({'success': False, 'error': result.get('error')}), 400
             else:
-                return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de cerrar posiciones.'}), 400
+                return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de cerrar posiciones o activa Modo Simulación.'}), 400
         else:
             closed = len(TRADING_DATA['trades'])
 
         TRADING_DATA['closed_trades'].extend(TRADING_DATA['trades'])
         TRADING_DATA['trades'] = []
         TRADING_DATA['trades_open'] = 0
+        msg = f"Cerradas {closed} operaciones en {TRADING_DATA['symbol']}"
+        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
         return jsonify({'success': True, 'closed': closed})
 
 
@@ -1003,6 +1342,21 @@ def api_toggle_prediction():
             'text': f"Uso de predicción automática {'activado' if status else 'desactivado'}."
         })
         return jsonify({'success': True, 'use_prediction': status})
+
+
+@app.route('/api/simulation/toggle', methods=['POST'])
+def api_toggle_simulation():
+    """Alternar entre modo simulación y modo MT5 real"""
+    global SIMULATION_MODE
+    with PRICE_LOCK:
+        SIMULATION_MODE = not SIMULATION_MODE
+        status_text = 'SIMULACIÓN' if SIMULATION_MODE else 'MT5 REAL'
+        TRADING_DATA['chat_history'].append({
+            'timestamp': datetime.now().isoformat(),
+            'sender': 'IA',
+            'text': f"Modo cambiado a: {status_text}."
+        })
+        return jsonify({'success': True, 'simulation_mode': SIMULATION_MODE})
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -1593,14 +1947,34 @@ DASHBOARD_HTML = """
 
         <div class="card">
             <h3>Controles de Operaciones</h3>
+            <div style="margin-bottom: 15px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                <label style="color:#d4af37; font-weight:600;">Símbolo:</label>
+                <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 8px 12px; background:#16213e; border:1px solid #d4af37; color:#e2e8f0; border-radius:6px;">
+                    <option value="XAUUSD">XAUUSD (Oro)</option>
+                    <option value="EURUSD">EURUSD</option>
+                    <option value="GBPUSD">GBPUSD</option>
+                    <option value="USDJPY">USDJPY</option>
+                    <option value="US30">US30</option>
+                    <option value="NAS100">NAS100</option>
+                    <option value="BTCUSD">BTCUSD</option>
+                    <option value="USDCHF">USDCHF</option>
+                    <option value="AUDUSD">AUDUSD</option>
+                    <option value="USOIL">USOIL</option>
+                </select>
+                <label style="color:#d4af37; font-weight:600;">Volumen:</label>
+                <input id="volume-input" type="number" step="0.01" value="0.01" style="width:80px; padding:8px; background:#16213e; border:1px solid #d4af37; color:#e2e8f0; border-radius:6px;">
+                <button class="btn" onclick="applyVolume()" style="padding:8px 16px;">Aplicar</button>
+            </div>
             <button class="btn btn-green" onclick="buy()">COMPRAR</button>
             <button class="btn btn-red" onclick="sell()">VENDER</button>
             <button class="btn btn-red" onclick="closeAll()">Cerrar Todo</button>
             <button class="btn" onclick="toggleAuto()">IA Automática</button>
             <button class="btn" onclick="togglePrediction()">Predicción Auto</button>
+            <button class="btn" onclick="toggleSimulation()" id="sim-btn">Modo Simulación</button>
             <div style="margin-top: 20px; display: grid; gap: 8px;">
                 <div><strong style="color: #d4af37;">Estado de IA:</strong> <span id="auto-status" style="color: #27ae60;">INACTIVA</span></div>
                 <div><strong style="color: #d4af37;">Uso de Predicción:</strong> <span id="prediction-status" style="color: #d4af37;">ON</span></div>
+                <div><strong style="color: #d4af37;">Modo Operación:</strong> <span id="sim-status" style="color: #27ae60;">SIMULACIÓN</span></div>
             </div>
         </div>
 
@@ -1637,6 +2011,25 @@ DASHBOARD_HTML = """
             <div style="margin: 12px 0;"><strong style="color: #d4af37;">Precio Previsto:</strong> <span id="pred-price">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: #d4af37;">Confianza Predicción:</strong> <span id="pred-confidence">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: #d4af37;">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: #d4af37; margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: #d4af37; margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
+        </div>
+
+        <div class="card">
+            <h3>Predicción Avanzada de IA</h3>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
+                <div><strong style="color: #d4af37;">Señal Combinada:</strong> <span id="adv-signal">-</span></div>
+                <div><strong style="color: #d4af37;">Score:</strong> <span id="adv-score">-</span></div>
+                <div><strong style="color: #d4af37;">Confianza:</strong> <span id="adv-confidence">-</span></div>
+                <div><strong style="color: #d4af37;">Tendencia:</strong> <span id="adv-trend">-</span></div>
+                <div><strong style="color: #d4af37;">RSI:</strong> <span id="adv-rsi">-</span></div>
+                <div><strong style="color: #d4af37;">MACD:</strong> <span id="adv-macd">-</span></div>
+                <div><strong style="color: #d4af37;">EMA 12/26:</strong> <span id="adv-ema">-</span></div>
+                <div><strong style="color: #d4af37;">Estocástico:</strong> <span id="adv-stoch">-</span></div>
+                <div><strong style="color: #d4af37;">ATR:</strong> <span id="adv-atr">-</span></div>
+                <div><strong style="color: #d4af37;">Soporte:</strong> <span id="adv-support">-</span></div>
+                <div><strong style="color: #d4af37;">Resistencia:</strong> <span id="adv-resistance">-</span></div>
+                <div><strong style="color: #d4af37;">Rango Esperado:</strong> <span id="adv-range">-</span></div>
+                <div><strong style="color: #d4af37;">Próximo Precio:</strong> <span id="adv-next">-</span></div>
+            </div>
         </div>
 
         <div class="card">
@@ -1685,6 +2078,13 @@ DASHBOARD_HTML = """
                     document.getElementById('auto-status').style.color = d.auto_enabled ? '#27ae60' : '#e74c3c';
                     document.getElementById('prediction-status').textContent = d.use_prediction ? 'ON' : 'OFF';
                     document.getElementById('prediction-status').style.color = d.use_prediction ? '#27ae60' : '#e74c3c';
+
+                    const simActive = d.simulation_mode !== false;
+                    const simText = simActive ? 'SIMULACIÓN' : 'MT5 REAL';
+                    const simColor = simActive ? '#f39c12' : '#27ae60';
+                    document.getElementById('sim-status').textContent = simText;
+                    document.getElementById('sim-status').style.color = simColor;
+                    document.getElementById('sim-btn').textContent = simActive ? 'Desactivar Simulación' : 'Activar Simulación';
 
                     if (d.mt5) {
                         document.getElementById('mt5-status').textContent = d.mt5.connected ? 'Conectado' : 'Desconectado';
@@ -1738,8 +2138,10 @@ DASHBOARD_HTML = """
                         console.warn('Error actualizando gráfico:', err);
                     }
                     loadChat();
+                    loadSymbols();
                     updateAIAnalysis();
                     updatePrediction();
+                    updateAdvancedPrediction();
                 })
                 .catch(e => {
                     console.error('Error fetching dashboard status:', e);
@@ -1923,6 +2325,20 @@ DASHBOARD_HTML = """
                 });
         }
 
+        function toggleSimulation() {
+            fetch('/api/simulation/toggle', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    const estado = d.simulation_mode ? 'SIMULACIÓN' : 'MT5 REAL';
+                    const color = d.simulation_mode ? '#f39c12' : '#27ae60';
+                    document.getElementById('sim-status').textContent = estado;
+                    document.getElementById('sim-status').style.color = color;
+                    document.getElementById('sim-btn').textContent = d.simulation_mode ? 'Desactivar Simulación' : 'Activar Simulación';
+                    alert('Modo de operación: ' + estado);
+                    update();
+                });
+        }
+
         function connectMT5() {
             const login = prompt('Ingrese el número de cuenta MT5:');
             if (!login) return;
@@ -2084,6 +2500,72 @@ DASHBOARD_HTML = """
                     console.debug('Prediction signal:', d.prediction_signal || d.predictionSignal);
                 })
                 .catch(e => console.error('Error fetching predict signal:', e));
+        }
+
+        function loadSymbols() {
+            fetch('/api/symbols')
+                .then(r => r.json())
+                .then(d => {
+                    if (!d.success) return;
+                    const sel = document.getElementById('symbol-select');
+                    if (sel && d.current && sel.value !== d.current) {
+                        sel.value = d.current;
+                    }
+                })
+                .catch(e => console.error('Error cargando símbolos:', e));
+        }
+
+        function changeSymbol(symbol) {
+            const volume = parseFloat(document.getElementById('volume-input').value) || 0.01;
+            fetch('/api/symbol', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ symbol, volume })
+            })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        alert('Símbolo cambiado a ' + d.symbol + ' (volumen ' + d.volume + ')');
+                        update();
+                    } else {
+                        alert('Error: ' + (d.error || ''));
+                    }
+                })
+                .catch(e => alert('Error cambiando símbolo: ' + e.message));
+        }
+
+        function applyVolume() {
+            const symbol = document.getElementById('symbol-select').value;
+            changeSymbol(symbol);
+        }
+
+        function updateAdvancedPrediction() {
+            fetch('/api/advanced-prediction')
+                .then(r => r.json())
+                .then(d => {
+                    if (!d.success) return;
+                    const sigEl = document.getElementById('adv-signal');
+                    sigEl.textContent = d.signal || '-';
+                    sigEl.style.color = d.signal === 'COMPRA' ? '#27ae60' : d.signal === 'VENTA' ? '#e74c3c' : '#f39c12';
+                    document.getElementById('adv-score').textContent = (d.score || 0).toFixed(1);
+                    document.getElementById('adv-confidence').textContent = ((d.confidence || 0) * 100).toFixed(1) + '%';
+                    const ind = d.indicators || {};
+                    document.getElementById('adv-trend').textContent = ind.trend || '-';
+                    document.getElementById('adv-rsi').textContent = ind.rsi !== undefined ? ind.rsi.toFixed(2) : '-';
+                    document.getElementById('adv-macd').textContent = ind.macd !== undefined ? ind.macd.toFixed(6) : '-';
+                    document.getElementById('adv-ema').textContent = (ind.ema_fast !== undefined ? ind.ema_fast.toFixed(5) : '-') + ' / ' + (ind.ema_slow !== undefined ? ind.ema_slow.toFixed(5) : '-');
+                    document.getElementById('adv-stoch').textContent = ind.stochastic !== undefined ? ind.stochastic.toFixed(2) : '-';
+                    document.getElementById('adv-atr').textContent = ind.atr !== undefined ? ind.atr.toFixed(6) : '-';
+                    const lvl = d.levels || {};
+                    document.getElementById('adv-support').textContent = lvl.support !== undefined ? lvl.support.toFixed(5) : '-';
+                    document.getElementById('adv-resistance').textContent = lvl.resistance !== undefined ? lvl.resistance.toFixed(5) : '-';
+                    const pred = d.prediction || {};
+                    document.getElementById('adv-next').textContent = pred.predicted_price !== undefined ? pred.predicted_price.toFixed(5) : '-';
+                    const low = pred.expected_low !== undefined ? pred.expected_low.toFixed(5) : '-';
+                    const high = pred.expected_high !== undefined ? pred.expected_high.toFixed(5) : '-';
+                    document.getElementById('adv-range').textContent = low + ' - ' + high;
+                })
+                .catch(e => console.error('Error predicción avanzada:', e));
         }
 
         update();
