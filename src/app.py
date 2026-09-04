@@ -132,8 +132,210 @@ TRADING_DATA = {
     'auto_enabled': False,
     'use_prediction': True,
     'signal': {'action': 'HOLD', 'confidence': 0.0},
-    'chat_history': [{'sender': 'IA', 'text': 'Hola! Bienvenido al sistema de trading. Soy tu asistente de IA.'}]
+    'chat_history': [{'sender': 'IA', 'text': 'Hola! Bienvenido al sistema de trading. Soy tu asistente de IA.'}],
+    'alerts': [],
+    'news': []
 }
+
+# Configuración de alertas de volatilidad
+ALERT_CONFIG = {
+    'price_spike_pct': 0.15,       # % mínimo de movimiento brusco en ventana corta
+    'volatility_window': 10,       # puntos del historial para medir spike
+    'atr_spike_multiplier': 2.5,   # ATR actual > media ATR * multiplicador
+    'max_alerts': 50,              # máximo de alertas guardadas
+    'cooldown_seconds': 30         # tiempo mínimo entre alertas similares
+}
+
+_LAST_ALERT_TIME = {}
+
+NEWS_TEMPLATES = {
+    'XAUUSD': [
+        {'title': 'El oro se dispara ante la caída del dólar y la aversión al riesgo', 'impact': 'alto', 'source': 'Market Pulse'},
+        {'title': 'Reservas de oro de los bancos centrales alcanzan máximos históricos', 'impact': 'medio', 'source': 'FX Insights'},
+        {'title': 'Tensiones geopolíticas impulsan la demanda de activos refugio', 'impact': 'alto', 'source': 'Global Macro'},
+        {'title': 'Datos de inflación de EE.UU. generan volatilidad en metales preciosos', 'impact': 'alto', 'source': 'Economic Calendar'},
+    ],
+    'EURUSD': [
+        {'title': 'El BCE deja entrever posibles recortes de tipos en próximas reuniones', 'impact': 'alto', 'source': 'Euro FX'},
+        {'title': 'Dólar se debilita tras decepcionantes datos de empleo en EE.UU.', 'impact': 'alto', 'source': 'Market Pulse'},
+        {'title': 'Zona euro publica cifras de manufactura mejor de lo esperado', 'impact': 'medio', 'source': 'Economic Calendar'},
+        {'title': 'Paridad euro/dólar en foco por diferencial de tipos', 'impact': 'medio', 'source': 'FX Insights'},
+    ],
+    'GBPUSD': [
+        {'title': 'El Banco de Inglaterra mantiene tipos en máximos de ciclo', 'impact': 'alto', 'source': 'Sterling Watch'},
+        {'title': 'Libra recupera terreno tras datos de crecimiento del Reino Unido', 'impact': 'medio', 'source': 'Market Pulse'},
+        {'title': 'Incertidumbre política en UK presiona a la libra esterlina', 'impact': 'medio', 'source': 'Global Macro'},
+    ],
+    'USDJPY': [
+        {'title': 'El Banco de Japón insinúa salida de política ultrafloja', 'impact': 'alto', 'source': 'Yen Desk'},
+        {'title': 'Diferencial de tipos USD/JPY se estrecha rápidamente', 'impact': 'alto', 'source': 'FX Insights'},
+        {'title': 'Intervención verbal del Ministerio de Finanzas de Japón', 'impact': 'medio', 'source': 'Market Pulse'},
+    ],
+    'US30': [
+        {'title': 'Wall Street abre con fuerte volatilidad tras datos macro', 'impact': 'alto', 'source': 'Equities Desk'},
+        {'title': 'Resultados corporativos del Dow Jones superan expectativas', 'impact': 'medio', 'source': 'Market Pulse'},
+        {'title': 'Temor recesivo arrastra al Dow Jones en sesión asiática', 'impact': 'alto', 'source': 'Global Macro'},
+    ],
+    'NAS100': [
+        {'title': 'Tecnológicas del Nasdaq impulsan el índice tras reportes trimestrales', 'impact': 'alto', 'source': 'Tech Trader'},
+        {'title': 'Rendimientos del Tesoro afectan a valores de crecimiento del Nasdaq', 'impact': 'medio', 'source': 'Market Pulse'},
+        {'title': 'Nuevo récord histórico para el Nasdaq 100', 'impact': 'medio', 'source': 'Global Macro'},
+    ],
+    'BTCUSD': [
+        {'title': 'Bitcoin rompe resistencia clave con volumen récord', 'impact': 'alto', 'source': 'Crypto Desk'},
+        {'title': 'Entradas masivas en ETFs de Bitcoin impulsan al alza', 'impact': 'alto', 'source': 'CoinWatch'},
+        {'title': 'Reguladores estadounidenses aclaran normativa para criptoactivos', 'impact': 'medio', 'source': 'Crypto News'},
+    ],
+    'USDCHF': [
+        {'title': 'El franco suizo se fortalece como refugio ante la incertidumbre', 'impact': 'medio', 'source': 'FX Insights'},
+        {'title': 'SNB interviene para moderar la apreciación del franco', 'impact': 'alto', 'source': 'Market Pulse'},
+    ],
+    'AUDUSD': [
+        {'title': 'Australia publica datos de empleo sólidos; el dólar australiano repunta', 'impact': 'medio', 'source': 'Aussie FX'},
+        {'title': 'Precios de materias primas impulsan al dólar australiano', 'impact': 'medio', 'source': 'Global Macro'},
+    ],
+    'USOIL': [
+        {'title': 'El petróleo WTI sube ante recortes de producción de la OPEP+', 'impact': 'alto', 'source': 'Energy Desk'},
+        {'title': 'Reservas de crudo de EE.UU. caen más de lo previsto', 'impact': 'medio', 'source': 'Market Pulse'},
+        {'title': 'Tensiones en el Golfo Pérsico elevan el precio del crudo', 'impact': 'alto', 'source': 'Global Macro'},
+    ]
+}
+
+GENERIC_NEWS = [
+    {'title': 'Los mercados globales operan con nerviosismo antes de datos clave', 'impact': 'medio', 'source': 'Market Pulse'},
+    {'title': 'Índices asiáticos cierran mixtos; Europa a la espera de apertura', 'impact': 'bajo', 'source': 'Global Macro'},
+    {'title': 'El dólar index mantiene rango estrecho en sesión europea', 'impact': 'bajo', 'source': 'FX Insights'},
+    {'title': 'Los operadores ajustan posiciones antes del fin de semana', 'impact': 'bajo', 'source': 'Trading Desk'},
+]
+
+
+def _get_symbol_news(symbol):
+    """Devuelve noticias relevantes para el símbolo activo."""
+    symbol = normalize_symbol(symbol) if SYMBOLS_AVAILABLE else symbol.upper()
+    templates = NEWS_TEMPLATES.get(symbol, GENERIC_NEWS)
+    now = datetime.now()
+    news = []
+    for i, item in enumerate(templates[:6]):
+        news.append({
+            'title': item['title'],
+            'impact': item['impact'],
+            'source': item['source'],
+            'time': (now.replace(minute=max(0, now.minute - i * 12))).strftime('%H:%M'),
+            'symbol': symbol
+        })
+    # Mezclar noticias genéricas para dar sensación de feed en vivo
+    for i, item in enumerate(random.sample(GENERIC_NEWS, min(2, len(GENERIC_NEWS)))):
+        news.append({
+            'title': item['title'],
+            'impact': item['impact'],
+            'source': item['source'],
+            'time': (now.replace(minute=max(0, now.minute - (i + 5) * 15))).strftime('%H:%M'),
+            'symbol': 'GLOBAL'
+        })
+    random.shuffle(news)
+    return news[:8]
+
+
+def _calculate_volatility_metrics(prices, decimals=5):
+    """Calcula métricas de volatilidad: spike, ATR relativo, rango."""
+    if len(prices) < ALERT_CONFIG['volatility_window'] + 5:
+        return {'spike_pct': 0.0, 'atr': 0.0, 'atr_ratio': 1.0, 'range_pct': 0.0}
+    current = prices[-1]
+    window_start = prices[-ALERT_CONFIG['volatility_window']]
+    spike_pct = abs(current - window_start) / window_start * 100 if window_start != 0 else 0.0
+
+    tr_list = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+    atr_current = sum(tr_list[-ALERT_CONFIG['volatility_window']:]) / ALERT_CONFIG['volatility_window']
+    atr_mean = sum(tr_list[-50:]) / min(50, len(tr_list)) if tr_list else atr_current
+    atr_ratio = (atr_current / atr_mean) if atr_mean > 0 else 1.0
+
+    recent = prices[-50:]
+    range_pct = (max(recent) - min(recent)) / current * 100 if current != 0 else 0.0
+    return {
+        'spike_pct': round(spike_pct, 4),
+        'atr': round(atr_current, decimals),
+        'atr_ratio': round(atr_ratio, 3),
+        'range_pct': round(range_pct, 4)
+    }
+
+
+def _can_trigger(alert_type):
+    """Controla cooldown entre alertas del mismo tipo."""
+    global _LAST_ALERT_TIME
+    now = time.time()
+    last = _LAST_ALERT_TIME.get(alert_type, 0)
+    if now - last < ALERT_CONFIG['cooldown_seconds']:
+        return False
+    _LAST_ALERT_TIME[alert_type] = now
+    return True
+
+
+def _add_alert(level, alert_type, title, message):
+    """Añade una alerta al historial manteniendo límite máximo."""
+    alert = {
+        'id': int(time.time() * 1000),
+        'timestamp': datetime.now().isoformat(),
+        'level': level,  # critica, alta, media, baja
+        'type': alert_type,  # volatilidad, noticia, breakout, oportunidad
+        'title': title,
+        'message': message,
+        'symbol': TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+    }
+    TRADING_DATA['alerts'].insert(0, alert)
+    if len(TRADING_DATA['alerts']) > ALERT_CONFIG['max_alerts']:
+        TRADING_DATA['alerts'].pop()
+    return alert
+
+
+def check_market_alerts():
+    """Evalúa condiciones de mercado y genera alertas/noticias.
+    NOTA: debe llamarse dentro de un bloque con PRICE_LOCK ya adquirido."""
+    symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+    decimals, pip_size, volatility, default_price, _ = get_symbol_format(symbol)
+    prices = TRADING_DATA['price_history']
+    if len(prices) < 20:
+        return
+
+    metrics = _calculate_volatility_metrics(prices, decimals)
+    current = prices[-1]
+
+    # Alerta de movimiento brusco
+    if metrics['spike_pct'] >= ALERT_CONFIG['price_spike_pct'] and _can_trigger('spike'):
+        direction = 'ALCISTA' if current > prices[-ALERT_CONFIG['volatility_window']] else 'BAJISTA'
+        _add_alert(
+            'alta' if metrics['spike_pct'] >= 0.35 else 'media',
+            'volatilidad',
+            f'Movimiento brusco {direction} en {symbol}',
+            f'El precio se movió {metrics["spike_pct"]:.3f}% en los últimos {ALERT_CONFIG["volatility_window"]} ticks. ATR: {metrics["atr"]}'
+        )
+
+    # Alerta de ATR elevado
+    if metrics['atr_ratio'] >= ALERT_CONFIG['atr_spike_multiplier'] and _can_trigger('atr'):
+        _add_alert(
+            'alta',
+            'volatilidad',
+            f'Volatilidad extrema detectada en {symbol}',
+            f'El ATR actual es {metrics["atr_ratio"]:.1f}x superior a la media reciente. Rango 50 ticks: {metrics["range_pct"]:.3f}%'
+        )
+
+    # Alerta de oportunidad tras rango acumulado amplio
+    if metrics['range_pct'] >= 1.2 and metrics['spike_pct'] >= 0.10 and _can_trigger('range_opportunity'):
+        direction = 'COMPRA' if prices[-1] > sum(prices[-10:]) / 10 else 'VENTA'
+        _add_alert(
+            'media',
+            'oportunidad',
+            f'Posible oportunidad de {direction} en {symbol}',
+            f'Rango ampliado del {metrics["range_pct"]:.3f}% con momentum. Evalúa entrada en {direction}.'
+        )
+
+    # Actualizar feed de noticias periódicamente
+    if not TRADING_DATA['news'] or random.random() < 0.05:
+        TRADING_DATA['news'] = _get_symbol_news(symbol)
+
+
+def get_recent_alerts(limit=20):
+    """Devuelve las alertas más recientes."""
+    return TRADING_DATA['alerts'][:limit]
 
 
 def get_symbol_format(symbol):
@@ -387,6 +589,12 @@ def update_prices():
                     TRADING_DATA['price_history'].pop(0)
                 TRADING_DATA['price'] = new_price
                 
+                # Sistema de alertas de volatilidad/noticias
+                try:
+                    check_market_alerts()
+                except Exception as e:
+                    print(f'Error en alertas de mercado: {e}')
+
                 # Sistema automático de trading inteligente
                 if TRADING_DATA['auto_enabled'] and len(TRADING_DATA['price_history']) >= 50:
                     # Análisis inteligente con múltiples indicadores
@@ -932,6 +1140,27 @@ def api_set_symbol():
     msg = f'Símbolo cambiado a {symbol}, volumen {TRADING_DATA["volume"]}'
     TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
     return jsonify({'success': True, 'symbol': symbol, 'volume': TRADING_DATA['volume'], 'price': TRADING_DATA['price']})
+
+
+@app.route('/api/news-alerts')
+def api_news_alerts():
+    """Devuelve noticias y alertas de volatilidad recientes."""
+    with PRICE_LOCK:
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+        prices = TRADING_DATA['price_history']
+        metrics = _calculate_volatility_metrics(prices, get_symbol_format(symbol)[0]) if len(prices) >= 20 else {
+            'spike_pct': 0.0, 'atr': 0.0, 'atr_ratio': 1.0, 'range_pct': 0.0
+        }
+        # Asegurar que siempre haya noticias
+        if not TRADING_DATA['news']:
+            TRADING_DATA['news'] = _get_symbol_news(symbol)
+        return jsonify({
+            'success': True,
+            'symbol': symbol,
+            'volatility': metrics,
+            'alerts': get_recent_alerts(15),
+            'news': TRADING_DATA['news'][:10]
+        })
 
 
 @app.route('/api/advanced-prediction')
@@ -1947,6 +2176,104 @@ DASHBOARD_HTML = """
             background: var(--surface-2);
             box-shadow: inset 0 0 0 1px rgba(255,215,0,0.08), 0 12px 40px rgba(0,0,0,0.5);
         }
+        .alert-list {
+            max-height: 320px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .alert-item {
+            padding: 12px 14px;
+            border-radius: 10px;
+            border-left: 4px solid var(--gold);
+            background: var(--surface-2);
+            font-size: 13px;
+            transition: transform 0.15s ease;
+        }
+        .alert-item:hover { transform: translateX(4px); }
+        .alert-item.critica { border-left-color: var(--red); box-shadow: 0 0 14px rgba(255, 45, 45, 0.15); }
+        .alert-item.alta { border-left-color: #FF6B35; }
+        .alert-item.media { border-left-color: var(--gold); }
+        .alert-item.baja { border-left-color: var(--green); }
+        .alert-item .alert-title {
+            font-weight: 700;
+            margin-bottom: 4px;
+            color: var(--text);
+        }
+        .alert-item .alert-meta {
+            color: var(--text-dim);
+            font-size: 11px;
+            margin-bottom: 6px;
+        }
+        .alert-item .alert-msg {
+            color: var(--text-dim);
+            line-height: 1.4;
+        }
+        .alert-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-right: 6px;
+        }
+        .badge-volatilidad { background: rgba(255, 45, 45, 0.15); color: var(--red); border: 1px solid rgba(255, 45, 45, 0.3); }
+        .badge-oportunidad { background: rgba(0, 230, 118, 0.12); color: var(--green); border: 1px solid rgba(0, 230, 118, 0.3); }
+        .badge-noticia { background: rgba(139, 92, 246, 0.12); color: var(--purple); border: 1px solid rgba(139, 92, 246, 0.3); }
+        .badge-breakout { background: rgba(255, 215, 0, 0.12); color: var(--gold); border: 1px solid rgba(255, 215, 0, 0.3); }
+        .news-list {
+            max-height: 340px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .news-item {
+            padding: 12px 14px;
+            border-radius: 10px;
+            background: var(--surface-2);
+            border: 1px solid rgba(255,255,255,0.04);
+            font-size: 13px;
+        }
+        .news-item .news-title { color: var(--text); margin-bottom: 5px; line-height: 1.4; }
+        .news-item .news-meta { color: var(--text-dim); font-size: 11px; }
+        .news-impact { font-weight: 700; text-transform: uppercase; font-size: 10px; margin-left: 8px; }
+        .impact-alto { color: var(--red); }
+        .impact-medio { color: var(--gold); }
+        .impact-bajo { color: var(--green); }
+        .volatility-bar {
+            height: 6px;
+            border-radius: 3px;
+            background: rgba(255,255,255,0.06);
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        .volatility-fill {
+            height: 100%;
+            border-radius: 3px;
+            background: linear-gradient(90deg, var(--green), var(--gold), var(--red));
+            transition: width 0.5s ease;
+        }
+        .pulse-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--red);
+            margin-right: 6px;
+            box-shadow: 0 0 0 0 rgba(255, 45, 45, 0.7);
+            animation: pulse-alert 1.5s infinite;
+        }
+        @keyframes pulse-alert {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 45, 45, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(255, 45, 45, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 45, 45, 0); }
+        }
         .chart-container canvas {
             width: 100% !important;
             height: 100% !important;
@@ -2068,6 +2395,46 @@ DASHBOARD_HTML = """
                 <div><strong style="color: var(--gold);">Resistencia:</strong> <span id="adv-resistance">-</span></div>
                 <div><strong style="color: var(--gold);">Rango Esperado:</strong> <span id="adv-range">-</span></div>
                 <div><strong style="color: var(--gold);">Próximo Precio:</strong> <span id="adv-next">-</span></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Noticias y Alertas de Volatilidad</h3>
+            <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;">
+                <button class="btn btn-purple" id="news-btn" onclick="loadNewsAlerts()">Actualizar Noticias/Alertas</button>
+                <span id="news-loading" style="display:none; color:var(--purple); font-size:13px; align-self:center;">Cargando...</span>
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px;">
+                <div>
+                    <h4 style="color:var(--gold); font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">Alertas en Vivo</h4>
+                    <div id="alert-list" class="alert-list">
+                        <div class="alert-item media">
+                            <div class="alert-title">Sistema de alertas activo</div>
+                            <div class="alert-meta">Ahora</div>
+                            <div class="alert-msg">Se monitorean movimientos bruscos, ATR elevado y oportunidades de entrada.</div>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <h4 style="color:var(--gold); font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">Noticias del Mercado</h4>
+                    <div id="news-list" class="news-list">
+                        <div class="news-item">
+                            <div class="news-title">Cargando noticias...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div style="margin-top: 16px; padding: 14px; border-radius: 10px; background: var(--surface-2); border: 1px solid rgba(255,255,255,0.04);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <span style="font-size:13px; color:var(--text-dim);">Índice de Volatilidad Actual</span>
+                    <span id="vol-index" style="font-weight:700; color:var(--gold);">0%</span>
+                </div>
+                <div class="volatility-bar"><div id="vol-fill" class="volatility-fill" style="width:0%"></div></div>
+                <div style="display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--text-dim);">
+                    <span>Spike: <b id="vol-spike" style="color:var(--text);">0%</b></span>
+                    <span>ATR ratio: <b id="vol-atr" style="color:var(--text);">1.0x</b></span>
+                    <span>Rango: <b id="vol-range" style="color:var(--text);">0%</b></span>
+                </div>
             </div>
         </div>
 
@@ -2200,6 +2567,7 @@ DASHBOARD_HTML = """
                     loadSymbols();
                     updateAIAnalysis();
                     updatePrediction();
+                    loadNewsAlerts(false);
                 })
                 .catch(e => {
                     console.error('Error fetching dashboard status:', e);
@@ -2655,7 +3023,73 @@ DASHBOARD_HTML = """
                 });
         }
 
+        function renderAlerts(alerts) {
+            const container = document.getElementById('alert-list');
+            if (!alerts || alerts.length === 0) {
+                container.innerHTML = '<div class="alert-item baja"><div class="alert-title">Sin alertas recientes</div><div class="alert-msg">El mercado opera dentro de parámetros normales.</div></div>';
+                return;
+            }
+            container.innerHTML = alerts.map(a => {
+                const time = a.timestamp ? new Date(a.timestamp).toLocaleTimeString() : 'Ahora';
+                const badgeClass = a.type === 'volatilidad' ? 'badge-volatilidad' : a.type === 'oportunidad' ? 'badge-oportunidad' : a.type === 'noticia' ? 'badge-noticia' : 'badge-breakout';
+                return `<div class="alert-item ${a.level}">
+                    <div class="alert-meta"><span class="alert-badge ${badgeClass}">${a.type}</span>${time} · ${a.symbol}</div>
+                    <div class="alert-title">${a.title}</div>
+                    <div class="alert-msg">${a.message}</div>
+                </div>`;
+            }).join('');
+        }
+
+        function renderNews(news) {
+            const container = document.getElementById('news-list');
+            if (!news || news.length === 0) {
+                container.innerHTML = '<div class="news-item"><div class="news-title">No hay noticias disponibles</div></div>';
+                return;
+            }
+            container.innerHTML = news.map(n => {
+                const impactClass = n.impact === 'alto' ? 'impact-alto' : n.impact === 'medio' ? 'impact-medio' : 'impact-bajo';
+                return `<div class="news-item">
+                    <div class="news-title">${n.title}</div>
+                    <div class="news-meta">${n.time} · ${n.source} · ${n.symbol || 'GLOBAL'}<span class="news-impact ${impactClass}">${n.impact}</span></div>
+                </div>`;
+            }).join('');
+        }
+
+        function updateVolatilityMetrics(metrics) {
+            const spike = metrics.spike_pct || 0;
+            const atrRatio = metrics.atr_ratio || 1;
+            const rangePct = metrics.range_pct || 0;
+            const index = Math.min(100, Math.round((spike * 8 + (atrRatio - 1) * 25 + rangePct * 5)));
+            document.getElementById('vol-index').textContent = index + '%';
+            document.getElementById('vol-index').style.color = index >= 70 ? 'var(--red)' : index >= 40 ? 'var(--gold)' : 'var(--green)';
+            document.getElementById('vol-fill').style.width = index + '%';
+            document.getElementById('vol-spike').textContent = spike.toFixed(3) + '%';
+            document.getElementById('vol-atr').textContent = atrRatio.toFixed(2) + 'x';
+            document.getElementById('vol-range').textContent = rangePct.toFixed(3) + '%';
+        }
+
+        function loadNewsAlerts(forceLoading = true) {
+            const btn = document.getElementById('news-btn');
+            const loading = document.getElementById('news-loading');
+            if (forceLoading && btn) btn.disabled = true;
+            if (loading) loading.style.display = 'inline';
+            fetch('/api/news-alerts')
+                .then(r => r.json())
+                .then(d => {
+                    if (!d.success) return;
+                    renderAlerts(d.alerts);
+                    renderNews(d.news);
+                    updateVolatilityMetrics(d.volatility || {});
+                })
+                .catch(e => console.error('Error cargando noticias/alertas:', e))
+                .finally(() => {
+                    if (btn) btn.disabled = false;
+                    if (loading) loading.style.display = 'none';
+                });
+        }
+
         update();
+        setInterval(() => loadNewsAlerts(false), 5000);
         setInterval(update, 1000);
     </script>
 </body>
