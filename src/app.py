@@ -873,8 +873,11 @@ def api_status():
     """Obtener estado del trading"""
     with PRICE_LOCK:
         mt5_state = mt5_status() if MT5_AVAILABLE else {'connected': False, 'error': 'MetaTrader5 package no instalado'}
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+        decimals, _, _, _, _ = get_symbol_format(symbol)
         return jsonify({
             'price': TRADING_DATA['price'],
+            'decimals': decimals,
             'balance': TRADING_DATA['balance'],
             'equity': TRADING_DATA['equity'],
             'trades_open': TRADING_DATA['trades_open'],
@@ -882,7 +885,7 @@ def api_status():
             'auto_enabled': TRADING_DATA['auto_enabled'],
             'use_prediction': TRADING_DATA.get('use_prediction', True),
             'signal': TRADING_DATA['signal'],
-            'symbol': TRADING_DATA.get('symbol', DEFAULT_SYMBOL),
+            'symbol': symbol,
             'volume': TRADING_DATA.get('volume', 0.01),
             'simulation_mode': SIMULATION_MODE,
             'prices': TRADING_DATA['price_history'][-30:],
@@ -1768,55 +1771,76 @@ DASHBOARD_HTML = """
     <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.1.0/dist/chartjs-chart-financial.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #050505;
+            --surface: #0a0a0a;
+            --surface-2: #111111;
+            --gold: #FFD700;
+            --gold-dim: #B8860B;
+            --red: #FF2D2D;
+            --green: #00E676;
+            --purple: #8B5CF6;
+            --text: #F5F5F5;
+            --text-dim: #A0A0A0;
+            --border: rgba(255, 215, 0, 0.15);
+        }
         body {
             font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
-            background: linear-gradient(135deg, #0a0e27 0%, #16213e 100%);
-            color: #e2e8f0;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
         }
         .navbar {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #e2e8f0;
-            padding: 20px 40px;
+            background: linear-gradient(90deg, #000000 0%, #1a0a1a 50%, #000000 100%);
+            color: var(--text);
+            padding: 22px 40px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 2px solid #d4af37;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            border-bottom: 1px solid var(--border);
+            box-shadow: 0 0 30px rgba(139, 92, 246, 0.15);
         }
         .navbar h1 {
-            background: linear-gradient(135deg, #d4af37, #f0e68c);
+            background: linear-gradient(90deg, var(--gold), #fff7cc, var(--gold));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
-            font-size: 28px;
-            letter-spacing: 1px;
+            font-size: 26px;
+            letter-spacing: 2px;
+            font-weight: 700;
+            text-transform: uppercase;
         }
         .navbar a {
-            color: white;
+            color: var(--text);
             text-decoration: none;
-            background: rgba(255,255,255,0.2);
-            padding: 8px 15px;
-            border-radius: 5px;
+            background: rgba(139, 92, 246, 0.12);
+            padding: 8px 18px;
+            border-radius: 6px;
+            border: 1px solid rgba(139, 92, 246, 0.3);
             cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .navbar a:hover {
+            background: rgba(139, 92, 246, 0.25);
+            box-shadow: 0 0 12px rgba(139, 92, 246, 0.3);
         }
         .container {
             max-width: 1400px;
-            margin: 20px auto;
+            margin: 24px auto;
             padding: 20px;
         }
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 18px;
+            margin-bottom: 22px;
         }
         .card {
-            background: linear-gradient(135deg, #1a2a4e 0%, #16213e 100%);
-            padding: 24px;
-            border-radius: 12px;
-            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(212, 175, 55, 0.1);
-            border: 1px solid #d4af37;
+            background: var(--surface);
+            padding: 22px;
+            border-radius: 14px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border);
             position: relative;
             overflow: hidden;
         }
@@ -1826,61 +1850,71 @@ DASHBOARD_HTML = """
             top: 0;
             left: 0;
             right: 0;
-            height: 1px;
-            background: linear-gradient(90deg, transparent, #d4af37, transparent);
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--gold), var(--purple), transparent);
         }
         .card h3 {
-            color: #d4af37;
-            margin-bottom: 18px;
-            font-size: 16px;
+            color: var(--gold);
+            margin-bottom: 16px;
+            font-size: 13px;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            font-weight: 600;
             letter-spacing: 1px;
             font-weight: 600;
             text-transform: uppercase;
         }
         .stat {
-            font-size: 36px;
+            font-size: 34px;
             font-weight: 700;
-            background: linear-gradient(135deg, #d4af37, #f0e68c);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin: 16px 0;
+            font-family: 'SF Mono', 'Roboto Mono', Consolas, monospace;
+            color: var(--text);
+            margin: 14px 0;
+            text-shadow: 0 0 18px rgba(255, 215, 0, 0.25);
         }
         .btn {
-            padding: 12px 28px;
+            padding: 11px 24px;
             margin: 8px 6px 0 0;
-            background: linear-gradient(135deg, #d4af37, #b8860b);
-            color: #1a2a4e;
-            border: none;
-            border-radius: 6px;
+            background: transparent;
+            color: var(--gold);
+            border: 1px solid var(--gold);
+            border-radius: 8px;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: all 0.25s ease;
             font-weight: 600;
             letter-spacing: 0.5px;
-            box-shadow: 0 6px 20px rgba(212, 175, 55, 0.3);
+            box-shadow: 0 0 0 rgba(255, 215, 0, 0);
         }
         .btn:hover {
-            background: linear-gradient(135deg, #f0e68c, #d4af37);
-            box-shadow: 0 8px 30px rgba(212, 175, 55, 0.5);
-            transform: translateY(-2px);
+            background: rgba(255, 215, 0, 0.12);
+            box-shadow: 0 0 18px rgba(255, 215, 0, 0.25);
+            transform: translateY(-1px);
         }
         .btn-red {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-            color: #fff;
-            box-shadow: 0 6px 20px rgba(231, 76, 60, 0.3);
+            color: var(--red);
+            border-color: var(--red);
+            box-shadow: 0 0 0 rgba(255, 45, 45, 0);
         }
         .btn-red:hover {
-            background: linear-gradient(135deg, #ec7063, #e74c3c);
-            box-shadow: 0 8px 30px rgba(231, 76, 60, 0.5);
+            background: rgba(255, 45, 45, 0.12);
+            box-shadow: 0 0 18px rgba(255, 45, 45, 0.25);
         }
         .btn-green {
-            background: linear-gradient(135deg, #27ae60, #229954);
-            color: #fff;
-            box-shadow: 0 6px 20px rgba(39, 174, 96, 0.3);
+            color: var(--green);
+            border-color: var(--green);
+            box-shadow: 0 0 0 rgba(0, 230, 118, 0);
         }
         .btn-green:hover {
-            background: linear-gradient(135deg, #2ecc71, #27ae60);
-            box-shadow: 0 8px 30px rgba(39, 174, 96, 0.5);
+            background: rgba(0, 230, 118, 0.12);
+            box-shadow: 0 0 18px rgba(0, 230, 118, 0.25);
+        }
+        .btn-purple {
+            color: var(--purple);
+            border-color: var(--purple);
+        }
+        .btn-purple:hover {
+            background: rgba(139, 92, 246, 0.12);
+            box-shadow: 0 0 18px rgba(139, 92, 246, 0.25);
         }
         table {
             width: 100%;
@@ -1888,30 +1922,30 @@ DASHBOARD_HTML = """
             margin-top: 15px;
         }
         th, td {
-            padding: 14px 16px;
+            padding: 13px 15px;
             text-align: left;
-            border-bottom: 1px solid rgba(212, 175, 55, 0.2);
-            color: #cbd5e1;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            color: var(--text-dim);
         }
         th {
-            background: rgba(212, 175, 55, 0.1);
+            background: rgba(255, 215, 0, 0.06);
             font-weight: 700;
-            color: #d4af37;
+            color: var(--gold);
             text-transform: uppercase;
-            font-size: 13px;
-            letter-spacing: 0.5px;
+            font-size: 12px;
+            letter-spacing: 0.8px;
         }
         tr:hover {
-            background: rgba(212, 175, 55, 0.05);
+            background: rgba(139, 92, 246, 0.05);
         }
         .chart-container {
             position: relative;
             height: 420px;
             margin-top: 15px;
-            border-radius: 18px;
+            border-radius: 14px;
             overflow: hidden;
-            background: linear-gradient(180deg, rgba(15,23,42,0.95), rgba(15,23,42,0.75));
-            box-shadow: inset 0 0 0 1px rgba(212,175,55,0.12), 0 18px 50px rgba(0,0,0,0.35);
+            background: var(--surface-2);
+            box-shadow: inset 0 0 0 1px rgba(255,215,0,0.08), 0 12px 40px rgba(0,0,0,0.5);
         }
         .chart-container canvas {
             width: 100% !important;
@@ -1925,7 +1959,7 @@ DASHBOARD_HTML = """
         <h1>Sistema de Trading Inteligente</h1>
     </div>
     <div class="container">
-        <h2 style="margin-bottom: 30px; color: #d4af37; font-size: 24px; letter-spacing: 1px;">Panel de Control de Trading en Vivo</h2>
+        <h2 style="margin-bottom: 28px; color: var(--text); font-size: 22px; letter-spacing: 2px; font-weight: 300; text-transform: uppercase;">Panel de Control de Trading en Vivo</h2>
         <div class="grid">
             <div class="card">
                 <h3>Saldo</h3>
@@ -1948,8 +1982,8 @@ DASHBOARD_HTML = """
         <div class="card">
             <h3>Controles de Operaciones</h3>
             <div style="margin-bottom: 15px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
-                <label style="color:#d4af37; font-weight:600;">Símbolo:</label>
-                <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 8px 12px; background:#16213e; border:1px solid #d4af37; color:#e2e8f0; border-radius:6px;">
+                <label style="color:var(--gold); font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">Símbolo:</label>
+                <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 9px 14px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:8px; font-family:'SF Mono',Consolas,monospace;">
                     <option value="XAUUSD">XAUUSD (Oro)</option>
                     <option value="EURUSD">EURUSD</option>
                     <option value="GBPUSD">GBPUSD</option>
@@ -1961,8 +1995,8 @@ DASHBOARD_HTML = """
                     <option value="AUDUSD">AUDUSD</option>
                     <option value="USOIL">USOIL</option>
                 </select>
-                <label style="color:#d4af37; font-weight:600;">Volumen:</label>
-                <input id="volume-input" type="number" step="0.01" value="0.01" style="width:80px; padding:8px; background:#16213e; border:1px solid #d4af37; color:#e2e8f0; border-radius:6px;">
+                <label style="color:var(--gold); font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">Volumen:</label>
+                <input id="volume-input" type="number" step="0.01" value="0.01" style="width:90px; padding:9px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:8px; font-family:'SF Mono',Consolas,monospace;">
                 <button class="btn" onclick="applyVolume()" style="padding:8px 16px;">Aplicar</button>
             </div>
             <button class="btn btn-green" onclick="buy()">COMPRAR</button>
@@ -1972,20 +2006,20 @@ DASHBOARD_HTML = """
             <button class="btn" onclick="togglePrediction()">Predicción Auto</button>
             <button class="btn" onclick="toggleSimulation()" id="sim-btn">Modo Simulación</button>
             <div style="margin-top: 20px; display: grid; gap: 8px;">
-                <div><strong style="color: #d4af37;">Estado de IA:</strong> <span id="auto-status" style="color: #27ae60;">INACTIVA</span></div>
-                <div><strong style="color: #d4af37;">Uso de Predicción:</strong> <span id="prediction-status" style="color: #d4af37;">ON</span></div>
-                <div><strong style="color: #d4af37;">Modo Operación:</strong> <span id="sim-status" style="color: #27ae60;">SIMULACIÓN</span></div>
+                <div><strong style="color: var(--gold);">Estado de IA:</strong> <span id="auto-status" style="color: var(--green);">INACTIVA</span></div>
+                <div><strong style="color: var(--gold);">Uso de Predicción:</strong> <span id="prediction-status" style="color: var(--gold);">ON</span></div>
+                <div><strong style="color: var(--gold);">Modo Operación:</strong> <span id="sim-status" style="color: var(--purple);">SIMULACIÓN</span></div>
             </div>
         </div>
 
         <div class="card">
             <h3>Conexión MetaTrader 5</h3>
-            <button class="btn" onclick="connectMT5()">Conectar Cuenta MT5</button>
+            <button class="btn btn-purple" onclick="connectMT5()">Conectar Cuenta MT5</button>
             <div style="margin-top: 20px;">
-                <div style="margin: 10px 0;"><strong style="color: #d4af37;">Estado:</strong> <span id="mt5-status" style="color: #e74c3c;">Desconectado</span></div>
-                <div style="margin: 10px 0;"><strong style="color: #d4af37;">Cuenta:</strong> <span id="mt5-login">-</span></div>
-                <div style="margin: 10px 0;"><strong style="color: #d4af37;">Saldo MT5:</strong> <span id="mt5-balance">-</span></div>
-                <div style="margin: 10px 0;"><strong style="color: #d4af37;">Patrimonio MT5:</strong> <span id="mt5-equity">-</span></div>
+                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Estado:</strong> <span id="mt5-status" style="color: var(--red);">Desconectado</span></div>
+                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Cuenta:</strong> <span id="mt5-login" style="color:var(--text-dim);">-</span></div>
+                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Saldo MT5:</strong> <span id="mt5-balance" style="color:var(--text-dim);">-</span></div>
+                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Patrimonio MT5:</strong> <span id="mt5-equity" style="color:var(--text-dim);">-</span></div>
             </div>
         </div>
 
@@ -1998,37 +2032,42 @@ DASHBOARD_HTML = """
 
         <div class="card">
             <h3>Análisis Inteligente de IA</h3>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Señal:</strong> <span id="ai-signal" style="color: #27ae60;">ESPERA</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Confianza:</strong> <span id="ai-confidence" style="color: #f39c12;">0%</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Patrón:</strong> <span id="ai-pattern">-</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Volatilidad:</strong> <span id="ai-volatility">-</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Inteligencia IA:</strong> <span id="ai-learning" style="color: #3498db;">Aprendiendo...</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Señal:</strong> <span id="ai-signal" style="color: var(--green);">ESPERA</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Confianza:</strong> <span id="ai-confidence" style="color: var(--gold);">0%</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Patrón:</strong> <span id="ai-pattern">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Volatilidad:</strong> <span id="ai-volatility">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Inteligencia IA:</strong> <span id="ai-learning" style="color: var(--purple);">Aprendiendo...</span></div>
         </div>
 
         <div class="card">
             <h3>Predicciones y Niveles</h3>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Predicción:</strong> <span id="pred-direction">-</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Precio Previsto:</strong> <span id="pred-price">-</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Confianza Predicción:</strong> <span id="pred-confidence">-</span></div>
-            <div style="margin: 12px 0;"><strong style="color: #d4af37;">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: #d4af37; margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: #d4af37; margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción:</strong> <span id="pred-direction">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Confianza Predicción:</strong> <span id="pred-confidence">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: var(--gold); margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: var(--gold); margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
         </div>
 
         <div class="card">
             <h3>Predicción Avanzada de IA</h3>
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
-                <div><strong style="color: #d4af37;">Señal Combinada:</strong> <span id="adv-signal">-</span></div>
-                <div><strong style="color: #d4af37;">Score:</strong> <span id="adv-score">-</span></div>
-                <div><strong style="color: #d4af37;">Confianza:</strong> <span id="adv-confidence">-</span></div>
-                <div><strong style="color: #d4af37;">Tendencia:</strong> <span id="adv-trend">-</span></div>
-                <div><strong style="color: #d4af37;">RSI:</strong> <span id="adv-rsi">-</span></div>
-                <div><strong style="color: #d4af37;">MACD:</strong> <span id="adv-macd">-</span></div>
-                <div><strong style="color: #d4af37;">EMA 12/26:</strong> <span id="adv-ema">-</span></div>
-                <div><strong style="color: #d4af37;">Estocástico:</strong> <span id="adv-stoch">-</span></div>
-                <div><strong style="color: #d4af37;">ATR:</strong> <span id="adv-atr">-</span></div>
-                <div><strong style="color: #d4af37;">Soporte:</strong> <span id="adv-support">-</span></div>
-                <div><strong style="color: #d4af37;">Resistencia:</strong> <span id="adv-resistance">-</span></div>
-                <div><strong style="color: #d4af37;">Rango Esperado:</strong> <span id="adv-range">-</span></div>
-                <div><strong style="color: #d4af37;">Próximo Precio:</strong> <span id="adv-next">-</span></div>
+            <div style="margin-bottom: 16px;">
+                <button class="btn btn-purple" id="adv-btn" onclick="loadAdvancedPrediction()">Calcular Predicción Avanzada</button>
+                <span id="adv-loading" style="display:none; margin-left:12px; color:var(--purple); font-size:13px;">Calculando...</span>
+                <span id="adv-timestamp" style="margin-left:12px; color:var(--text-dim); font-size:12px;"></span>
+            </div>
+            <div id="adv-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; opacity:0.6;">
+                <div><strong style="color: var(--gold);">Señal Combinada:</strong> <span id="adv-signal">-</span></div>
+                <div><strong style="color: var(--gold);">Score:</strong> <span id="adv-score">-</span></div>
+                <div><strong style="color: var(--gold);">Confianza:</strong> <span id="adv-confidence">-</span></div>
+                <div><strong style="color: var(--gold);">Tendencia:</strong> <span id="adv-trend">-</span></div>
+                <div><strong style="color: var(--gold);">RSI:</strong> <span id="adv-rsi">-</span></div>
+                <div><strong style="color: var(--gold);">MACD:</strong> <span id="adv-macd">-</span></div>
+                <div><strong style="color: var(--gold);">EMA 12/26:</strong> <span id="adv-ema">-</span></div>
+                <div><strong style="color: var(--gold);">Estocástico:</strong> <span id="adv-stoch">-</span></div>
+                <div><strong style="color: var(--gold);">ATR:</strong> <span id="adv-atr">-</span></div>
+                <div><strong style="color: var(--gold);">Soporte:</strong> <span id="adv-support">-</span></div>
+                <div><strong style="color: var(--gold);">Resistencia:</strong> <span id="adv-resistance">-</span></div>
+                <div><strong style="color: var(--gold);">Rango Esperado:</strong> <span id="adv-range">-</span></div>
+                <div><strong style="color: var(--gold);">Próximo Precio:</strong> <span id="adv-next">-</span></div>
             </div>
         </div>
 
@@ -2046,9 +2085,9 @@ DASHBOARD_HTML = """
 
         <div class="card">
             <h3>Asistente de IA</h3>
-            <div id="chat-box" style="height: 240px; overflow-y: auto; background: rgba(15, 23, 42, 0.5); border: 1px solid #d4af37; border-radius: 8px; padding: 12px; margin-bottom: 15px; color: #cbd5e1;"></div>
+            <div id="chat-box" style="height: 240px; overflow-y: auto; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 15px; color: var(--text-dim);"></div>
             <div style="display: flex; gap: 10px;">
-                <input id="chat-input" type="text" placeholder="Escribe un comando o pregunta..." style="flex: 1; padding: 12px; background: #16213e; border: 1px solid #d4af37; border-radius: 6px; color: #e2e8f0; font-size: 14px;" />
+                <input id="chat-input" type="text" placeholder="Escribe un comando o pregunta..." style="flex: 1; padding: 12px; background: #0d0d0d; border: 1px solid var(--gold); border-radius: 8px; color: var(--text); font-size: 14px;" />
                 <button class="btn" onclick="sendChat()">Enviar</button>
             </div>
         </div>
@@ -2056,6 +2095,22 @@ DASHBOARD_HTML = """
 
     <script>
         let chart = null;
+        let currentSymbol = 'EURUSD';
+        let currentDecimals = 4;
+        const SYMBOL_DECIMALS = {
+            'XAUUSD': 2, 'EURUSD': 5, 'GBPUSD': 5, 'USDJPY': 3,
+            'US30': 1, 'NAS100': 1, 'BTCUSD': 2, 'USDCHF': 5,
+            'AUDUSD': 5, 'USOIL': 2
+        };
+
+        function getSymbolDecimals(symbol) {
+            return SYMBOL_DECIMALS[symbol] || 5;
+        }
+
+        function formatPrice(value, decimals) {
+            if (typeof value !== 'number') return value || '-';
+            return value.toFixed(decimals);
+        }
 
         function update() {
             fetch('/api/status')
@@ -2064,6 +2119,9 @@ DASHBOARD_HTML = """
                     if (d.error) {
                         console.warn('Status API returned error:', d.error);
                     }
+                    currentSymbol = d.symbol || currentSymbol;
+                    currentDecimals = typeof d.decimals === 'number' ? d.decimals : getSymbolDecimals(currentSymbol);
+
                     if (typeof d.balance === 'number') {
                         document.getElementById('balance').textContent = '$' + d.balance.toFixed(2);
                     }
@@ -2071,23 +2129,24 @@ DASHBOARD_HTML = """
                         document.getElementById('equity').textContent = '$' + d.equity.toFixed(2);
                     }
                     if (typeof d.price === 'number') {
-                        document.getElementById('price').textContent = d.price.toFixed(4);
+                        document.getElementById('price').textContent = formatPrice(d.price, currentDecimals);
                     }
                     document.getElementById('trades').textContent = d.trades_open || 0;
                     document.getElementById('auto-status').textContent = d.auto_enabled ? 'ON' : 'OFF';
-                    document.getElementById('auto-status').style.color = d.auto_enabled ? '#27ae60' : '#e74c3c';
+                    document.getElementById('auto-status').style.color = d.auto_enabled ? 'var(--green)' : 'var(--red)';
                     document.getElementById('prediction-status').textContent = d.use_prediction ? 'ON' : 'OFF';
-                    document.getElementById('prediction-status').style.color = d.use_prediction ? '#27ae60' : '#e74c3c';
+                    document.getElementById('prediction-status').style.color = d.use_prediction ? 'var(--green)' : 'var(--red)';
 
                     const simActive = d.simulation_mode !== false;
                     const simText = simActive ? 'SIMULACIÓN' : 'MT5 REAL';
-                    const simColor = simActive ? '#f39c12' : '#27ae60';
+                    const simColor = simActive ? 'var(--purple)' : 'var(--green)';
                     document.getElementById('sim-status').textContent = simText;
                     document.getElementById('sim-status').style.color = simColor;
                     document.getElementById('sim-btn').textContent = simActive ? 'Desactivar Simulación' : 'Activar Simulación';
 
                     if (d.mt5) {
                         document.getElementById('mt5-status').textContent = d.mt5.connected ? 'Conectado' : 'Desconectado';
+                        document.getElementById('mt5-status').style.color = d.mt5.connected ? 'var(--green)' : 'var(--red)';
                         document.getElementById('mt5-login').textContent = d.mt5.login || '-';
                         document.getElementById('mt5-balance').textContent = d.mt5.balance ? '$' + d.mt5.balance.toFixed(2) : '-';
                         document.getElementById('mt5-equity').textContent = d.mt5.equity ? '$' + d.mt5.equity.toFixed(2) : '-';
@@ -2096,12 +2155,12 @@ DASHBOARD_HTML = """
                     let html = '';
                     if (d.trades && d.trades.length > 0) {
                         d.trades.forEach(t => {
-                            const entryValue = typeof t.entry === 'number' ? t.entry.toFixed(4) : t.entry;
+                            const entryValue = typeof t.entry === 'number' ? formatPrice(t.entry, currentDecimals) : t.entry;
                             const plValue = typeof t.pl === 'number' ? t.pl.toFixed(2) : '0.00';
                             html += '<tr><td>#' + t.id + '</td><td>' + t.action + '</td><td>' + entryValue + '</td><td>' + plValue + '</td></tr>';
                         });
                     } else {
-                        html = '<tr><td colspan="4" style="text-align:center">-</td></tr>';
+                        html = '<tr><td colspan="4" style="text-align:center; padding:20px; color:var(--text-dim);">Sin operaciones abiertas</td></tr>';
                     }
                     document.getElementById('trades-list').innerHTML = html;
 
@@ -2117,17 +2176,17 @@ DASHBOARD_HTML = """
                         });
                         const labels = dataPoints.map(p => p.x);
 
-                        // If chart exists, update its data in-place to avoid recreating and losing state/hover
                         if (chart) {
                             try {
                                 chart.data.labels = labels;
                                 chart.data.datasets[0].data = dataPoints;
+                                chart.data.datasets[0].label = currentSymbol;
+                                chart.options.plugins.tooltip.callbacks.label = context => currentSymbol + ' ' + formatPrice(Number(context.parsed.y), currentDecimals);
                                 chart.update('none');
                             } catch (err) {
                                 console.warn('Error actualizando datos del gráfico:', err);
                             }
                         } else {
-                            // create chart for the first time
                             try {
                                 drawChart(raw);
                             } catch (err) {
@@ -2141,7 +2200,6 @@ DASHBOARD_HTML = """
                     loadSymbols();
                     updateAIAnalysis();
                     updatePrediction();
-                    updateAdvancedPrediction();
                 })
                 .catch(e => {
                     console.error('Error fetching dashboard status:', e);
@@ -2166,22 +2224,31 @@ DASHBOARD_HTML = """
 
             const labels = dataPoints.map(p => p.x);
 
+            const upColor = 'var(--green)';
+            const downColor = 'var(--red)';
             const chartConfig = {
                 type: 'line',
                 data: {
                     labels: labels,
                     datasets: [{
-                        label: 'EURUSD',
+                        label: currentSymbol,
                         data: dataPoints,
-                        borderColor: '#facc15',
-                        backgroundColor: 'rgba(250, 204, 21, 0.15)',
+                        borderColor: 'var(--gold)',
+                        backgroundColor: (context) => {
+                            const ctx = context.chart.ctx;
+                            const gradient = ctx.createLinearGradient(0, 0, 0, 320);
+                            gradient.addColorStop(0, 'rgba(139, 92, 246, 0.25)');
+                            gradient.addColorStop(1, 'rgba(139, 92, 246, 0)');
+                            return gradient;
+                        },
                         fill: true,
                         tension: 0.22,
                         pointRadius: 0,
                         pointHoverRadius: 5,
+                        pointHoverBackgroundColor: 'var(--gold)',
                         borderWidth: 2,
                         segment: {
-                            borderColor: ctx => ctx.p1.parsed.y > ctx.p0.parsed.y ? '#22c55e' : '#ef4444'
+                            borderColor: ctx => ctx.p1.parsed.y > ctx.p0.parsed.y ? upColor : downColor
                         }
                     }]
                 },
@@ -2192,17 +2259,20 @@ DASHBOARD_HTML = """
                         padding: { top: 14, right: 16, bottom: 10, left: 10 }
                     },
                     plugins: {
-                        legend: { display: false },
+                        legend: {
+                            display: true,
+                            labels: { color: 'var(--gold)', font: { family: 'SF Mono', size: 11 } }
+                        },
                         tooltip: {
                             mode: 'nearest',
                             intersect: false,
-                            backgroundColor: 'rgba(15, 23, 42, 0.96)',
-                            titleColor: '#f8fafc',
-                            bodyColor: '#e2e8f0',
-                            borderColor: 'rgba(212, 175, 55, 0.3)',
+                            backgroundColor: 'rgba(5, 5, 5, 0.96)',
+                            titleColor: 'var(--gold)',
+                            bodyColor: 'var(--text)',
+                            borderColor: 'rgba(255, 215, 0, 0.25)',
                             borderWidth: 1,
                             callbacks: {
-                                label: context => 'Precio: ' + Number(context.parsed.y).toFixed(4)
+                                label: context => currentSymbol + ' ' + formatPrice(Number(context.parsed.y), currentDecimals)
                             }
                         }
                     },
@@ -2210,19 +2280,19 @@ DASHBOARD_HTML = """
                         y: {
                             beginAtZero: false,
                             grid: {
-                                color: 'rgba(148, 163, 184, 0.14)',
-                                borderColor: 'rgba(148, 163, 184, 0.18)'
+                                color: 'rgba(255, 255, 255, 0.05)',
+                                borderColor: 'rgba(255, 255, 255, 0.08)'
                             },
                             ticks: {
-                                color: '#cbd5e1',
-                                font: { size: 11 }
+                                color: 'var(--text-dim)',
+                                font: { family: 'SF Mono', size: 11 }
                             }
                         },
                         x: {
                             display: true,
                             grid: { display: false },
                             ticks: {
-                                color: '#94a3b8',
+                                color: 'var(--text-dim)',
                                 font: { size: 10 },
                                 maxRotation: 0,
                                 autoSkip: true
@@ -2255,7 +2325,7 @@ DASHBOARD_HTML = """
                     if (!d.success) {
                         alert('Error al ejecutar compra: ' + (d.error || 'Respuesta inválida'));
                     } else {
-                        alert('Compra ejecutada a: ' + d.price.toFixed(4));
+                        alert('Compra ejecutada a: ' + formatPrice(d.price, currentDecimals));
                     }
                     update();
                 })
@@ -2272,7 +2342,7 @@ DASHBOARD_HTML = """
                     if (!d.success) {
                         alert('Error al ejecutar venta: ' + (d.error || 'Respuesta inválida'));
                     } else {
-                        alert('Venta ejecutada a: ' + d.price.toFixed(4));
+                        alert('Venta ejecutada a: ' + formatPrice(d.price, currentDecimals));
                     }
                     update();
                 })
@@ -2304,7 +2374,7 @@ DASHBOARD_HTML = """
                 .then(r => r.json())
                 .then(d => {
                     const estado = d.auto_enabled ? 'ACTIVA' : 'INACTIVA';
-                    const color = d.auto_enabled ? '#27ae60' : '#e74c3c';
+                    const color = d.auto_enabled ? 'var(--green)' : 'var(--red)';
                     document.getElementById('auto-status').textContent = estado;
                     document.getElementById('auto-status').style.color = color;
                     alert('IA Automática: ' + estado);
@@ -2317,7 +2387,7 @@ DASHBOARD_HTML = """
                 .then(r => r.json())
                 .then(d => {
                     const estado = d.use_prediction ? 'ON' : 'OFF';
-                    const color = d.use_prediction ? '#27ae60' : '#e74c3c';
+                    const color = d.use_prediction ? 'var(--green)' : 'var(--red)';
                     document.getElementById('prediction-status').textContent = estado;
                     document.getElementById('prediction-status').style.color = color;
                     alert('Uso de predicción automática: ' + estado);
@@ -2330,7 +2400,7 @@ DASHBOARD_HTML = """
                 .then(r => r.json())
                 .then(d => {
                     const estado = d.simulation_mode ? 'SIMULACIÓN' : 'MT5 REAL';
-                    const color = d.simulation_mode ? '#f39c12' : '#27ae60';
+                    const color = d.simulation_mode ? 'var(--purple)' : 'var(--green)';
                     document.getElementById('sim-status').textContent = estado;
                     document.getElementById('sim-status').style.color = color;
                     document.getElementById('sim-btn').textContent = d.simulation_mode ? 'Desactivar Simulación' : 'Activar Simulación';
@@ -2383,7 +2453,7 @@ DASHBOARD_HTML = """
                         const mt5info = d.mt5 || {};
                         const connected = mt5info.connected === true;
                         document.getElementById('mt5-status').textContent = connected ? 'Conectado' : 'Desconectado';
-                        document.getElementById('mt5-status').style.color = connected ? '#27ae60' : '#e74c3c';
+                        document.getElementById('mt5-status').style.color = connected ? 'var(--green)' : 'var(--red)';
                         document.getElementById('mt5-login').textContent = mt5info.login || '-';
                         document.getElementById('mt5-balance').textContent = mt5info.balance ? '$' + mt5info.balance.toFixed(2) : '-';
                         document.getElementById('mt5-equity').textContent = mt5info.equity ? '$' + mt5info.equity.toFixed(2) : '-';
@@ -2409,15 +2479,15 @@ DASHBOARD_HTML = """
                 el.style.padding = '10px';
                 el.style.borderRadius = '6px';
                 if (sender === 'IA' || sender === 'Sistema') {
-                    el.style.background = 'rgba(212, 175, 55, 0.15)';
-                    el.style.borderLeft = '3px solid #d4af37';
-                    el.style.color = '#f0e68c';
+                    el.style.background = 'rgba(255, 215, 0, 0.10)';
+                    el.style.borderLeft = '3px solid var(--gold)';
+                    el.style.color = 'var(--text)';
                 } else {
-                    el.style.background = 'rgba(52, 152, 219, 0.15)';
-                    el.style.borderLeft = '3px solid #3498db';
-                    el.style.color = '#85c1e9';
+                    el.style.background = 'rgba(139, 92, 246, 0.10)';
+                    el.style.borderLeft = '3px solid var(--purple)';
+                    el.style.color = 'var(--text)';
                 }
-                el.innerHTML = `<strong style="color: ${sender === 'IA' || sender === 'Sistema' ? '#d4af37' : '#3498db'};">${sender === 'IA' || sender === 'Sistema' ? 'Sistema' : 'Tú'}:</strong> ${text}`;
+                el.innerHTML = `<strong style="color: ${sender === 'IA' || sender === 'Sistema' ? 'var(--gold)' : 'var(--purple)'};">${sender === 'IA' || sender === 'Sistema' ? 'Sistema' : 'Tú'}:</strong> ${text}`;
                 box.appendChild(el);
             });
             box.scrollTop = box.scrollHeight;
@@ -2457,7 +2527,7 @@ DASHBOARD_HTML = """
                 .then(d => {
                     if (d.error) return;
                     const signal = d.signal || 'ESPERA';
-                    const color = signal === 'COMPRA' ? '#27ae60' : signal === 'VENTA' ? '#e74c3c' : '#f39c12';
+                    const color = signal === 'COMPRA' ? 'var(--green)' : signal === 'VENTA' ? 'var(--red)' : 'var(--gold)';
                     document.getElementById('ai-signal').textContent = signal;
                     document.getElementById('ai-signal').style.color = color;
                     const confidencePct = typeof d.confidence_percent === 'number' ? d.confidence_percent : ((d.confidence || 0) * 100);
@@ -2539,33 +2609,50 @@ DASHBOARD_HTML = """
             changeSymbol(symbol);
         }
 
-        function updateAdvancedPrediction() {
+        function updateAdvancedPredictionUI(d) {
+            if (!d.success) return;
+            const sigEl = document.getElementById('adv-signal');
+            sigEl.textContent = d.signal || '-';
+            sigEl.style.color = d.signal === 'COMPRA' ? 'var(--green)' : d.signal === 'VENTA' ? 'var(--red)' : 'var(--gold)';
+            document.getElementById('adv-score').textContent = (d.score || 0).toFixed(1);
+            document.getElementById('adv-confidence').textContent = ((d.confidence || 0) * 100).toFixed(1) + '%';
+            const ind = d.indicators || {};
+            document.getElementById('adv-trend').textContent = ind.trend || '-';
+            document.getElementById('adv-rsi').textContent = ind.rsi !== undefined ? ind.rsi.toFixed(2) : '-';
+            document.getElementById('adv-macd').textContent = ind.macd !== undefined ? ind.macd.toFixed(6) : '-';
+            document.getElementById('adv-ema').textContent = (ind.ema_fast !== undefined ? formatPrice(ind.ema_fast, currentDecimals) : '-') + ' / ' + (ind.ema_slow !== undefined ? formatPrice(ind.ema_slow, currentDecimals) : '-');
+            document.getElementById('adv-stoch').textContent = ind.stochastic !== undefined ? ind.stochastic.toFixed(2) : '-';
+            document.getElementById('adv-atr').textContent = ind.atr !== undefined ? ind.atr.toFixed(6) : '-';
+            const lvl = d.levels || {};
+            document.getElementById('adv-support').textContent = lvl.support !== undefined ? formatPrice(lvl.support, currentDecimals) : '-';
+            document.getElementById('adv-resistance').textContent = lvl.resistance !== undefined ? formatPrice(lvl.resistance, currentDecimals) : '-';
+            const pred = d.prediction || {};
+            document.getElementById('adv-next').textContent = pred.predicted_price !== undefined ? formatPrice(pred.predicted_price, currentDecimals) : '-';
+            const low = pred.expected_low !== undefined ? formatPrice(pred.expected_low, currentDecimals) : '-';
+            const high = pred.expected_high !== undefined ? formatPrice(pred.expected_high, currentDecimals) : '-';
+            document.getElementById('adv-range').textContent = low + ' - ' + high;
+            document.getElementById('adv-timestamp').textContent = d.timestamp ? new Date(d.timestamp).toLocaleTimeString() : '';
+            document.getElementById('adv-grid').style.opacity = '1';
+        }
+
+        function loadAdvancedPrediction() {
+            const btn = document.getElementById('adv-btn');
+            const loading = document.getElementById('adv-loading');
+            btn.disabled = true;
+            loading.style.display = 'inline';
             fetch('/api/advanced-prediction')
                 .then(r => r.json())
                 .then(d => {
-                    if (!d.success) return;
-                    const sigEl = document.getElementById('adv-signal');
-                    sigEl.textContent = d.signal || '-';
-                    sigEl.style.color = d.signal === 'COMPRA' ? '#27ae60' : d.signal === 'VENTA' ? '#e74c3c' : '#f39c12';
-                    document.getElementById('adv-score').textContent = (d.score || 0).toFixed(1);
-                    document.getElementById('adv-confidence').textContent = ((d.confidence || 0) * 100).toFixed(1) + '%';
-                    const ind = d.indicators || {};
-                    document.getElementById('adv-trend').textContent = ind.trend || '-';
-                    document.getElementById('adv-rsi').textContent = ind.rsi !== undefined ? ind.rsi.toFixed(2) : '-';
-                    document.getElementById('adv-macd').textContent = ind.macd !== undefined ? ind.macd.toFixed(6) : '-';
-                    document.getElementById('adv-ema').textContent = (ind.ema_fast !== undefined ? ind.ema_fast.toFixed(5) : '-') + ' / ' + (ind.ema_slow !== undefined ? ind.ema_slow.toFixed(5) : '-');
-                    document.getElementById('adv-stoch').textContent = ind.stochastic !== undefined ? ind.stochastic.toFixed(2) : '-';
-                    document.getElementById('adv-atr').textContent = ind.atr !== undefined ? ind.atr.toFixed(6) : '-';
-                    const lvl = d.levels || {};
-                    document.getElementById('adv-support').textContent = lvl.support !== undefined ? lvl.support.toFixed(5) : '-';
-                    document.getElementById('adv-resistance').textContent = lvl.resistance !== undefined ? lvl.resistance.toFixed(5) : '-';
-                    const pred = d.prediction || {};
-                    document.getElementById('adv-next').textContent = pred.predicted_price !== undefined ? pred.predicted_price.toFixed(5) : '-';
-                    const low = pred.expected_low !== undefined ? pred.expected_low.toFixed(5) : '-';
-                    const high = pred.expected_high !== undefined ? pred.expected_high.toFixed(5) : '-';
-                    document.getElementById('adv-range').textContent = low + ' - ' + high;
+                    updateAdvancedPredictionUI(d);
                 })
-                .catch(e => console.error('Error predicción avanzada:', e));
+                .catch(e => {
+                    console.error('Error predicción avanzada:', e);
+                    alert('Error al calcular predicción avanzada: ' + e.message);
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                    loading.style.display = 'none';
+                });
         }
 
         update();
