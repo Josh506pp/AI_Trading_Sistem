@@ -41,3 +41,12 @@ Thumbs.db
 # Local tools and caches
 .refact/
 .sixth/
+# Local logs / diagnostic output
+app_log.txt
+diagnose_out.txt
+search_mt5_results.txt
+tools/test_page_result.txt
+
+# Backup files
+*.bak
+*.bak2
