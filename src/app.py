@@ -153,6 +153,7 @@ TRADING_DATA = {
     'price_history': _initial_price_history,
     'price_updated_at': None,
     'price_source': None,
+    'recent_ticks': [],
     'market_candles': [],
     'liquidity': {'available': False, 'flow_bias': 'SIN DATOS'},
     'balance': 10000.0,
@@ -399,6 +400,7 @@ def reset_price_history(symbol):
             TRADING_DATA['price_history'] = [TRADING_DATA['price']] * 50
         TRADING_DATA['price_updated_at'] = None
         TRADING_DATA['price_source'] = None
+        TRADING_DATA['recent_ticks'] = []
         TRADING_DATA['market_candles'] = []
         TRADING_DATA['liquidity'] = {'available': False, 'flow_bias': 'SIN DATOS'}
         invalidate_prediction_cache(symbol)
@@ -764,10 +766,9 @@ def _build_prediction_signal_uncached(prices, periods):
 # ====================================================================
 
 def update_market_price_once():
-    """Obtiene un tick y actualiza de forma atómica la cotización del símbolo activo."""
+    """Actualiza tick, velas y serie de predicción desde una sola instantánea."""
     with PRICE_LOCK:
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
-        needs_history = TRADING_DATA.get('price_updated_at') is None
 
     updated = False
     if MARKET_DATA_AVAILABLE and market_data:
@@ -777,26 +778,58 @@ def update_market_price_once():
                 try:
                     latest_price = float(quote['price'])
                     if latest_price > 0 and math.isfinite(latest_price):
-                        quote_history = quote.get('history')
-                        if needs_history and quote_history:
-                            TRADING_DATA['price_history'] = quote_history[-200:]
-                        market_candles = quote.get('candles', [])
+                        clean_history = []
+                        for item in (quote.get('history') or [])[-1000:]:
+                            try:
+                                value = float(item)
+                            except (TypeError, ValueError):
+                                continue
+                            if value > 0 and math.isfinite(value):
+                                clean_history.append(value)
+                        if clean_history:
+                            clean_history[-1] = latest_price
+                            TRADING_DATA['price_history'] = clean_history
+                        elif TRADING_DATA['price_history']:
+                            TRADING_DATA['price_history'][-1] = latest_price
+
+                        market_candles = [
+                            dict(candle) for candle in quote.get('candles', [])
+                        ]
                         if market_candles:
+                            latest_candle = market_candles[-1]
+                            latest_candle['close'] = latest_price
+                            latest_candle['high'] = max(
+                                float(latest_candle['high']), latest_price
+                            )
+                            latest_candle['low'] = min(
+                                float(latest_candle['low']), latest_price
+                            )
                             TRADING_DATA['market_candles'] = market_candles
                             if calculate_liquidity_metrics:
                                 TRADING_DATA['liquidity'] = calculate_liquidity_metrics(
                                     market_candles, symbol
                                 )
+
                         TRADING_DATA['price'] = latest_price
                         TRADING_DATA['price_source'] = quote.get('source', 'Proveedor externo')
-                        history = TRADING_DATA['price_history']
-                        if not history or history[-1] != latest_price:
-                            history.append(latest_price)
-                            del history[:-200]
                         TRADING_DATA['price_updated_at'] = quote['timestamp']
+                        tick = {
+                            'timestamp': quote['timestamp'],
+                            'price': latest_price,
+                            'bid': quote.get('bid'),
+                            'ask': quote.get('ask'),
+                            'source': TRADING_DATA['price_source']
+                        }
+                        ticks = TRADING_DATA['recent_ticks']
+                        if not ticks or (
+                            ticks[-1]['timestamp'] != tick['timestamp'] or
+                            ticks[-1]['price'] != tick['price']
+                        ):
+                            ticks.append(tick)
+                            del ticks[:-2000]
                         updated = True
-                except (TypeError, ValueError):
-                    print(f'Precio de mercado inválido para {symbol}: {latest_price}')
+                except (KeyError, TypeError, ValueError):
+                    print(f'Precio de mercado inválido para {symbol}: {quote}')
 
     with PRICE_LOCK:
         try:
@@ -807,11 +840,13 @@ def update_market_price_once():
 
 
 def update_prices():
-    """Actualiza el mercado periódicamente y publica cada nueva cotización."""
+    """Mantiene el feed de MT5 casi en tiempo real y Yahoo como respaldo."""
     while True:
         try:
             update_market_price_once()
-            time.sleep(5)
+            with PRICE_LOCK:
+                poll_interval = 1 if TRADING_DATA.get('price_source') == 'MetaTrader 5' else 5
+            time.sleep(poll_interval)
         except Exception as e:
             print(f"Error en update_prices: {e}")
             time.sleep(5)
@@ -1535,6 +1570,7 @@ def api_status():
             'price': current_price,
             'price_updated_at': TRADING_DATA.get('price_updated_at'),
             'price_source': TRADING_DATA.get('price_source'),
+            'recent_tick_count': len(TRADING_DATA['recent_ticks']),
             'liquidity': copy.deepcopy(TRADING_DATA.get('liquidity', {'available': False})),
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],

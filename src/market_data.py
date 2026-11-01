@@ -16,7 +16,7 @@ except ImportError:
 
 try:
     import MetaTrader5
-except ImportError:
+except (ImportError, OSError):
     MetaTrader5 = None
 
 logger = logging.getLogger(__name__)
@@ -286,7 +286,7 @@ class MarketDataProvider:
             if time_msc else
             datetime.fromtimestamp(int(tick.time), tz=timezone.utc).isoformat()
         )
-        candles = self._mt5_candles(symbol, '1m', 200)
+        candles = self._mt5_candles(symbol, '1m', 1000)
         history = [candle['close'] for candle in candles]
         if not history or history[-1] != price:
             history.append(price)
@@ -294,9 +294,11 @@ class MarketDataProvider:
         return {
             'price': price,
             'timestamp': tick_time,
-            'history': history[-200:],
+            'history': history[-1000:],
             'candles': candles[-120:],
             'source': 'MetaTrader 5',
+            'bid': bid if bid > 0 else None,
+            'ask': ask if ask > 0 else None,
             'spread': ask - bid if bid > 0 and ask > 0 else None,
             'mt5_symbol': mt5_symbol
         }
@@ -362,7 +364,7 @@ class MarketDataProvider:
             return {
                 'price': latest['close'],
                 'timestamp': latest['time'],
-                'history': [candle['close'] for candle in valid_candles[-200:]],
+                'history': [candle['close'] for candle in valid_candles[-1000:]],
                 'candles': valid_candles[-120:],
                 'source': 'Yahoo Finance'
             }

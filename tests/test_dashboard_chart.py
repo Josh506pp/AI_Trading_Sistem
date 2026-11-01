@@ -61,6 +61,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_history = app_module.TRADING_DATA['price_history']
             previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
             previous_source = app_module.TRADING_DATA.get('price_source')
+            previous_ticks = app_module.TRADING_DATA['recent_ticks']
             app_module.TRADING_DATA['symbol'] = 'USDJPY'
             app_module.TRADING_DATA['price'] = 149.123
             app_module.TRADING_DATA['price_history'] = [149.0, 149.123]
@@ -88,6 +89,7 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['price_history'] = previous_history
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
                 app_module.TRADING_DATA['price_source'] = previous_source
+                app_module.TRADING_DATA['recent_ticks'] = previous_ticks
 
     def test_market_tick_publishes_liquidity_for_the_active_symbol(self):
         candle = {
@@ -106,6 +108,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_liquidity = app_module.TRADING_DATA['liquidity']
             previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
             previous_source = app_module.TRADING_DATA.get('price_source')
+            previous_ticks = app_module.TRADING_DATA['recent_ticks']
             app_module.TRADING_DATA['symbol'] = 'USDJPY'
             app_module.TRADING_DATA['price_history'] = [149.0]
 
@@ -134,6 +137,62 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['liquidity'] = previous_liquidity
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
                 app_module.TRADING_DATA['price_source'] = previous_source
+                app_module.TRADING_DATA['recent_ticks'] = previous_ticks
+
+    def test_incoming_ticks_refresh_the_current_bar_without_mixing_ticks_into_bar_history(self):
+        with app_module.PRICE_LOCK:
+            previous_symbol = app_module.TRADING_DATA['symbol']
+            previous_price = app_module.TRADING_DATA['price']
+            previous_history = app_module.TRADING_DATA['price_history']
+            previous_ticks = app_module.TRADING_DATA['recent_ticks']
+            previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
+            previous_source = app_module.TRADING_DATA.get('price_source')
+            previous_candles = app_module.TRADING_DATA['market_candles']
+            previous_liquidity = app_module.TRADING_DATA['liquidity']
+            app_module.TRADING_DATA['symbol'] = 'EURUSD'
+            app_module.TRADING_DATA['recent_ticks'] = []
+
+        base_candle = {
+            'time': 1730000000,
+            'open': 1.1,
+            'high': 1.101,
+            'low': 1.099,
+            'close': 1.1,
+            'volume': 10.0
+        }
+        quotes = [
+            {
+                'price': 1.1005, 'timestamp': '2026-10-30T16:59:01+00:00',
+                'history': [1.099, 1.1], 'candles': [dict(base_candle)],
+                'source': 'MetaTrader 5', 'bid': 1.1004, 'ask': 1.1006
+            },
+            {
+                'price': 1.1007, 'timestamp': '2026-10-30T16:59:02+00:00',
+                'history': [1.099, 1.1], 'candles': [dict(base_candle)],
+                'source': 'MetaTrader 5', 'bid': 1.1006, 'ask': 1.1008
+            }
+        ]
+        try:
+            with patch.object(app_module, 'MARKET_DATA_AVAILABLE', True), \
+                    patch.object(app_module.market_data, 'get_latest_quote', side_effect=quotes):
+                app_module.update_market_price_once()
+                app_module.update_market_price_once()
+
+            self.assertEqual(len(app_module.TRADING_DATA['price_history']), 2)
+            self.assertEqual(app_module.TRADING_DATA['price_history'][-1], 1.1007)
+            self.assertEqual(len(app_module.TRADING_DATA['recent_ticks']), 2)
+            self.assertEqual(app_module.TRADING_DATA['market_candles'][-1]['close'], 1.1007)
+            self.assertEqual(app_module.TRADING_DATA['market_candles'][-1]['high'], 1.101)
+        finally:
+            with app_module.PRICE_LOCK:
+                app_module.TRADING_DATA['symbol'] = previous_symbol
+                app_module.TRADING_DATA['price'] = previous_price
+                app_module.TRADING_DATA['price_history'] = previous_history
+                app_module.TRADING_DATA['recent_ticks'] = previous_ticks
+                app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
+                app_module.TRADING_DATA['price_source'] = previous_source
+                app_module.TRADING_DATA['market_candles'] = previous_candles
+                app_module.TRADING_DATA['liquidity'] = previous_liquidity
 
     def test_changing_symbol_updates_the_chart_to_that_symbols_latest_quote(self):
         with app_module.PRICE_LOCK:

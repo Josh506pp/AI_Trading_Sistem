@@ -81,7 +81,7 @@ python src/app.py
 ### Acceso a la Plataforma
 1. Abre [http://localhost:5000/dashboard](http://localhost:5000/dashboard)
 2. La plataforma carga automáticamente en modo demostración
-3. La dashboard consulta el último tick cada cinco segundos; Yahoo Finance entrega barras de un minuto y puede retrasarse. Fuera del horario de un mercado se conserva el último precio y se marca como atrasado.
+3. La app consulta MT5 cada segundo si hay una terminal conectada; Yahoo Finance se sondea cada cinco segundos y entrega barras de un minuto que pueden retrasarse. Fuera del horario se conserva y marca el último precio.
 
 #### Cotización MT5 opcional (Windows)
 Para recibir ticks del bróker en lugar de las barras retrasadas de Yahoo:
