@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MT5 Connection Test Script
+Legacy manual MT5 connection diagnostic (not part of unittest discovery).
 Run this to verify your MT5 setup is working correctly
 """
 

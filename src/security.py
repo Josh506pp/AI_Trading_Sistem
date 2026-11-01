@@ -54,8 +54,14 @@ class SecurityValidator:
     @staticmethod
     def validate_symbol(symbol):
         """Validar símbolo de trading"""
+        if not isinstance(symbol, str):
+            return False
+        normalized = symbol.strip()
         pattern = r'^[A-Z0-9]{2,10}$'
-        return re.match(pattern, symbol) is not None
+        return (
+            re.fullmatch(pattern, normalized) is not None and
+            any(character.isalpha() for character in normalized)
+        )
     
     @staticmethod
     def validate_number(value, min_val=None, max_val=None):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script to diagnose MT5 trading flow
+Legacy manual MT5 trading diagnostic (not part of unittest discovery).
 """
 
 import sys

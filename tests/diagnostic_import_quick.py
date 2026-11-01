@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quick import test - doesn't create system instance"""
+"""Legacy manual import diagnostic (not part of unittest discovery)."""
 import sys
 try:
     # Just test that the module parses correctly

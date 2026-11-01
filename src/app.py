@@ -876,7 +876,7 @@ def get_current_user():
     if not DB_AVAILABLE or 'user_id' not in session:
         return None
     try:
-        user = User.query.get(session['user_id'])
+        user = db.session.get(User, session['user_id'])
         if user and user.subscription_plan in ('PRO', 'PREMIUM') and user.subscription_expires:
             if datetime.utcnow() > user.subscription_expires:
                 user.subscription_plan = 'FREE'

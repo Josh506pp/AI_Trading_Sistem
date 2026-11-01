@@ -21,31 +21,50 @@ from datetime import datetime, timedelta
 # Import app and modules
 try:
     from src.app import app, db, User, LoginSession, BillingHistory
-    from src.security import SecurityValidator
+    from src.security import SecurityValidator, request_counts
 except ImportError:
     from app import app, db, User, LoginSession, BillingHistory
-    from security import SecurityValidator
+    from security import SecurityValidator, request_counts
+
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 
-class TestAuthentication(unittest.TestCase):
-    """Tests para autenticación"""
-    
+class IsolatedDatabaseTestCase(unittest.TestCase):
     def setUp(self):
-        """Setup para cada test"""
         self.app = app
-        self.app.config['TESTING'] = True
+        self.original_database_uri = self.app.config['SQLALCHEMY_DATABASE_URI']
+        self.original_testing = self.app.config.get('TESTING', False)
         self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-        self.client = self.app.test_client()
-        
+        self.app.config['TESTING'] = True
+        self.test_engine = create_engine(
+            'sqlite://',
+            connect_args={'check_same_thread': False},
+            poolclass=StaticPool
+        )
+        request_counts.clear()
         with self.app.app_context():
+            self.original_engine = db.engines[None]
+            db.engines[None] = self.test_engine
             db.create_all()
-    
+
     def tearDown(self):
-        """Cleanup después de cada test"""
         with self.app.app_context():
             db.session.remove()
             db.drop_all()
+            db.engines[None] = self.original_engine
+        self.test_engine.dispose()
+        self.app.config['SQLALCHEMY_DATABASE_URI'] = self.original_database_uri
+        self.app.config['TESTING'] = self.original_testing
+
+
+class TestAuthentication(IsolatedDatabaseTestCase):
+    """Tests para autenticación"""
     
+    def setUp(self):
+        super().setUp()
+        self.client = self.app.test_client()
+
     def test_register_user_success(self):
         """Test registro exitoso"""
         response = self.client.post('/api/auth/register', json={
@@ -120,18 +139,14 @@ class TestAuthentication(unittest.TestCase):
         self.assertFalse(data['success'])
 
 
-class TestSubscription(unittest.TestCase):
+class TestSubscription(IsolatedDatabaseTestCase):
     """Tests para suscripción"""
     
     def setUp(self):
-        """Setup para cada test"""
-        self.app = app
-        self.app.config['TESTING'] = True
-        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        super().setUp()
         self.client = self.app.test_client()
         
         with self.app.app_context():
-            db.create_all()
             # Crear usuario de test
             self.user = User(
                 email='test@example.com',
@@ -141,12 +156,6 @@ class TestSubscription(unittest.TestCase):
             self.user.set_password('password123')
             db.session.add(self.user)
             db.session.commit()
-    
-    def tearDown(self):
-        """Cleanup después de cada test"""
-        with self.app.app_context():
-            db.session.remove()
-            db.drop_all()
     
     def test_get_plans(self):
         """Test obtener planes disponibles"""
@@ -232,17 +241,14 @@ class TestSubscription(unittest.TestCase):
             self.assertEqual(resp_prem2.status_code, 200)
 
 
-class TestUserManagement(unittest.TestCase):
+class TestUserManagement(IsolatedDatabaseTestCase):
     """Tests para perfil, contraseñas y recuperación"""
     
     def setUp(self):
-        self.app = app
-        self.app.config['TESTING'] = True
-        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        super().setUp()
         self.client = self.app.test_client()
         
         with self.app.app_context():
-            db.create_all()
             self.user = User(
                 email='user@example.com',
                 username='profileuser',
@@ -252,11 +258,6 @@ class TestUserManagement(unittest.TestCase):
             db.session.add(self.user)
             db.session.commit()
             
-    def tearDown(self):
-        with self.app.app_context():
-            db.session.remove()
-            db.drop_all()
-
     def test_update_profile(self):
         """Test actualizar perfil de usuario"""
         with self.app.test_client() as c:
@@ -311,8 +312,11 @@ class TestSecurity(unittest.TestCase):
         """Test validación de símbolo"""
         self.assertTrue(SecurityValidator.validate_symbol('EURUSD'))
         self.assertTrue(SecurityValidator.validate_symbol('BTC'))
+        self.assertTrue(SecurityValidator.validate_symbol('US30'))
         self.assertFalse(SecurityValidator.validate_symbol('INVALID!'))
         self.assertFalse(SecurityValidator.validate_symbol('1234567890'))
+        self.assertFalse(SecurityValidator.validate_symbol('123'))
+        self.assertFalse(SecurityValidator.validate_symbol(None))
     
     def test_sanitize_string(self):
         """Test sanitización de strings"""
@@ -323,23 +327,11 @@ class TestSecurity(unittest.TestCase):
         self.assertNotIn('\n', clean)
 
 
-class TestUserModel(unittest.TestCase):
+class TestUserModel(IsolatedDatabaseTestCase):
     """Tests para modelo User"""
     
     def setUp(self):
-        """Setup para cada test"""
-        self.app = app
-        self.app.config['TESTING'] = True
-        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-        
-        with self.app.app_context():
-            db.create_all()
-    
-    def tearDown(self):
-        """Cleanup después de cada test"""
-        with self.app.app_context():
-            db.session.remove()
-            db.drop_all()
+        super().setUp()
     
     def test_password_hashing(self):
         """Test que contraseña se hashea"""
@@ -362,6 +354,7 @@ class TestUserModel(unittest.TestCase):
                 username='testuser',
                 subscription_plan='FREE'
             )
+            user.set_password('password123')
             db.session.add(user)
             db.session.commit()
             

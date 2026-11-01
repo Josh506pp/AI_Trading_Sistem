@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple test for database and device manager
+Legacy manual database/device diagnostic (not part of unittest discovery).
 """
 
 import sys

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct test of bot's new real-price trading loop"""
+"""Legacy manual real-price bot diagnostic (not part of unittest discovery)."""
 import sys
 import logging
 sys.path.insert(0, 'c:\\Users\\Joshua\\Desktop\\proyectos')

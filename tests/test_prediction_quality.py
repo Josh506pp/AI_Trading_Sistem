@@ -1,6 +1,7 @@
 import math
 import importlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.app import app, calculate_bollinger_bands, calculate_macd, calculate_rsi
@@ -163,19 +164,19 @@ class TestPredictionQuality(unittest.TestCase):
     def test_prediction_endpoints_share_one_calculation_within_cooldown(self):
         symbol = app_module.TRADING_DATA['symbol']
         app_module.invalidate_prediction_cache(symbol)
-        with app_module.app.app_context():
-            admin = app_module.User.query.filter_by(username='admin').one()
-            admin_id = admin.id
+        premium_user = SimpleNamespace(
+            subscription_plan='PREMIUM',
+            has_active_subscription=lambda: True
+        )
 
         with patch.dict(app_module.app.config, {'TESTING': True}), \
+                patch.object(app_module, 'get_current_user', return_value=premium_user), \
                 patch.object(
                     app_module.prediction_engine,
                     'get_prediction_signal',
                     wraps=app_module.prediction_engine.get_prediction_signal
                 ) as calculate:
             with app_module.app.test_client() as client:
-                with client.session_transaction() as state:
-                    state['user_id'] = admin_id
                 first = client.get('/api/predict')
                 second = client.get('/api/advanced-prediction')
                 third = client.get('/api/advanced-prediction')

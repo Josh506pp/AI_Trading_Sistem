@@ -149,8 +149,8 @@ python test_api.py
 # Test del dashboard
 python test_dashboard.py
 
-# Suite de tests
-python tests/test_platform.py
+# Suite automatizada completa
+python -m unittest discover -s tests -v
 ```
 
 ## Estructura del Proyecto
@@ -165,7 +165,10 @@ proyectos/
 │   ├── prediction_system.py   # Motor de predicciones IA
 │   └── market_symbols.py      # Configuración de símbolos
 ├── tests/
-│   └── test_platform.py       # Suite de tests
+│   ├── test_platform.py       # Autenticación, seguridad y suscripciones
+│   ├── test_market_data.py    # Datos de mercado y liquidez
+│   ├── test_dashboard_chart.py
+│   └── test_prediction_quality.py
 ├── requirements.txt           # Dependencias
 ├── verify_system.py          # Script de verificación
 └── README.md                 # Documentación

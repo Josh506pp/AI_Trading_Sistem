@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete Authentication Flow Test - Single Device Enforcement Demo
+Legacy manual authentication-flow diagnostic (not part of unittest discovery).
 Tests the full login, device validation, and single-device enforcement
 """
 

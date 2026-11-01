@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for Professional Trading System
+Legacy manual professional-system diagnostic (not part of unittest discovery).
 """
 
 import sys

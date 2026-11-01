@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test script to diagnose MT5 price data retrieval"""
+"""Legacy manual MT5 price diagnostic (not part of unittest discovery)."""
 
 import sys
 import os

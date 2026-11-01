@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SISTEMA DE CONTROL DE DISPOSITIVOS - Test y Demostración
+Legacy manual device-system diagnostic (not part of unittest discovery).
 Prueba completa del sistema de BD, dispositivos y single-device enforcement
 """
 
