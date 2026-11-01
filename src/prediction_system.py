@@ -344,8 +344,9 @@ class PredictionEngine:
             'periods': periods
         }
     
-    def get_prediction_signal(self, prices: List[float], rsi: float, 
-                             macd: float, bb_high: float, bb_low: float) -> Dict:
+    def get_prediction_signal(self, prices: List[float], rsi: float,
+                             macd: float, bb_high: float, bb_low: float,
+                             periods: int = 5) -> Dict:
         """
         Combina predicción con indicadores técnicos para generar señal
         
@@ -359,7 +360,7 @@ class PredictionEngine:
         Returns:
             Señal de trading combinada
         """
-        prediction = self.predict_next_price(prices, periods=5)
+        prediction = self.predict_next_price(prices, periods=periods)
         
         if len(prices) < 10 or prediction['direction'] == 'NEUTRAL':
             reasons = ['Modelos sin consenso suficiente']

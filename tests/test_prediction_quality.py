@@ -1,7 +1,7 @@
 import math
 import importlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.app import app, calculate_bollinger_bands, calculate_macd, calculate_rsi
 from src.prediction_system import PredictionEngine
@@ -128,6 +128,38 @@ class TestPredictionQuality(unittest.TestCase):
         app_module.invalidate_prediction_cache('CACHE_TEST')
         app_module.invalidate_prediction_cache('CACHE_TEST_OTHER')
 
+    def test_build_prediction_signal_uses_fifteen_minute_forecast_horizon(self):
+        app_module.invalidate_prediction_cache('HORIZON_TEST')
+        prices = [100.0 + index * 0.1 + math.sin(index) * 0.01 for index in range(60)]
+        with patch.object(
+            app_module.prediction_engine,
+            'get_prediction_signal',
+            wraps=app_module.prediction_engine.get_prediction_signal
+        ) as predict:
+            app_module.build_prediction_signal(prices, 'HORIZON_TEST', periods=15)
+
+        self.assertEqual(predict.call_args.kwargs['periods'], 15)
+        app_module.invalidate_prediction_cache('HORIZON_TEST')
+
+    def test_advanced_prediction_cooldown_is_plan_specific(self):
+        app_module._advanced_prediction_cache.clear()
+        calculate_pro = Mock(return_value={'success': True, 'symbol': 'BTCUSD'})
+        calculate_premium = Mock(return_value={'success': True, 'symbol': 'BTCUSD'})
+
+        pro_first = app_module.get_cached_advanced_prediction('PRO', 'BTCUSD', calculate_pro)
+        pro_cached = app_module.get_cached_advanced_prediction('PRO', 'BTCUSD', calculate_pro)
+        premium_first = app_module.get_cached_advanced_prediction(
+            'PREMIUM', 'BTCUSD', calculate_premium
+        )
+
+        self.assertEqual(calculate_pro.call_count, 1)
+        self.assertEqual(calculate_premium.call_count, 1)
+        self.assertEqual(pro_first['prediction_cache']['cooldown_seconds'], 300)
+        self.assertEqual(pro_cached['prediction_cache']['status'], 'cached')
+        self.assertEqual(pro_cached['prediction_cache']['remaining_seconds'], 300)
+        self.assertEqual(premium_first['prediction_cache']['cooldown_seconds'], 120)
+        app_module._advanced_prediction_cache.clear()
+
     def test_prediction_endpoints_share_one_calculation_within_cooldown(self):
         symbol = app_module.TRADING_DATA['symbol']
         app_module.invalidate_prediction_cache(symbol)
@@ -146,12 +178,17 @@ class TestPredictionQuality(unittest.TestCase):
                     state['user_id'] = admin_id
                 first = client.get('/api/predict')
                 second = client.get('/api/advanced-prediction')
+                third = client.get('/api/advanced-prediction')
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
+        self.assertEqual(third.status_code, 200)
         self.assertEqual(calculate.call_count, 1)
         self.assertEqual(first.get_json()['prediction_cache']['status'], 'calculated')
-        self.assertEqual(second.get_json()['prediction_cache']['status'], 'cached')
+        self.assertEqual(second.get_json()['prediction_cache']['status'], 'calculated')
+        self.assertEqual(third.get_json()['prediction_cache']['status'], 'cached')
+        self.assertEqual(first.get_json()['prediction']['periods'], 15)
+        self.assertEqual(third.get_json()['prediction_cache']['cooldown_seconds'], 120)
         app_module.invalidate_prediction_cache(symbol)
 
     def test_dashboard_has_a_native_canvas_chart_fallback(self):
@@ -164,6 +201,8 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertIn('function showChartTooltip(event)', DASHBOARD_HTML)
         self.assertIn('id="liquidity-bias"', DASHBOARD_HTML)
         self.assertIn('PREDICTION_COOLDOWN_MS = 15000', DASHBOARD_HTML)
+        self.assertIn('PREDICTION_HORIZON_MINUTES = 15', DASHBOARD_HTML)
+        self.assertIn('function startAdvancedCooldown(seconds)', DASHBOARD_HTML)
 
 
 if __name__ == '__main__':

@@ -608,16 +608,58 @@ def analyze_signal(prices, symbol=None):
 
 
 PREDICTION_COOLDOWN_SECONDS = 15
+PREDICTION_HORIZON_MINUTES = 15
+ADVANCED_PREDICTION_COOLDOWN_SECONDS = {'PRO': 300, 'PREMIUM': 120}
 _prediction_cache = {}
 _prediction_cache_lock = threading.Lock()
+_advanced_prediction_cache = {}
+_advanced_prediction_cache_lock = threading.Lock()
 
 
-def build_prediction_signal(prices, symbol=None):
+def get_cached_advanced_prediction(plan, symbol, calculate):
+    """Cachea el análisis avanzado según el cooldown propio de cada plan."""
+    plan = plan if plan in ADVANCED_PREDICTION_COOLDOWN_SECONDS else 'PRO'
+    cooldown = ADVANCED_PREDICTION_COOLDOWN_SECONDS[plan]
+    cache_key = (plan, symbol)
+    now = time.monotonic()
+
+    with _advanced_prediction_cache_lock:
+        cached = _advanced_prediction_cache.get(cache_key)
+        if cached and now - cached['created_at'] < cooldown:
+            result = copy.deepcopy(cached['result'])
+            result['prediction_cache'] = {
+                'status': 'cached',
+                'cooldown_seconds': cooldown,
+                'remaining_seconds': max(
+                    0, math.ceil(cooldown - (now - cached['created_at']))
+                ),
+                'calculated_at': cached['calculated_at']
+            }
+            return result
+
+        result = calculate()
+        calculated_at = datetime.utcnow().isoformat() + 'Z'
+        result['prediction_cache'] = {
+            'status': 'calculated',
+            'cooldown_seconds': cooldown,
+            'remaining_seconds': cooldown,
+            'calculated_at': calculated_at
+        }
+        _advanced_prediction_cache[cache_key] = {
+            'created_at': now,
+            'calculated_at': calculated_at,
+            'result': copy.deepcopy(result)
+        }
+        return result
+
+
+def build_prediction_signal(prices, symbol=None, periods=PREDICTION_HORIZON_MINUTES):
     """Reutiliza el análisis por símbolo durante el cooldown para evitar recálculos concurrentes."""
     cache_symbol = symbol or TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
     now = time.monotonic()
     with _prediction_cache_lock:
-        cached = _prediction_cache.get(cache_symbol)
+        cache_key = (cache_symbol, periods)
+        cached = _prediction_cache.get(cache_key)
         if cached and now - cached['created_at'] < PREDICTION_COOLDOWN_SECONDS:
             result = copy.deepcopy(cached['result'])
             result['cache_status'] = 'cached'
@@ -626,11 +668,11 @@ def build_prediction_signal(prices, symbol=None):
             )
             return result
 
-        result = _build_prediction_signal_uncached(prices)
+        result = _build_prediction_signal_uncached(prices, periods)
         result['cache_status'] = 'calculated'
         result['cooldown_seconds'] = PREDICTION_COOLDOWN_SECONDS
         result['calculated_at'] = datetime.utcnow().isoformat() + 'Z'
-        _prediction_cache[cache_symbol] = {
+        _prediction_cache[cache_key] = {
             'created_at': time.monotonic(),
             'result': copy.deepcopy(result)
         }
@@ -639,10 +681,14 @@ def build_prediction_signal(prices, symbol=None):
 
 def invalidate_prediction_cache(symbol):
     with _prediction_cache_lock:
-        _prediction_cache.pop(symbol, None)
+        for cache_key in [key for key in _prediction_cache if key[0] == symbol]:
+            _prediction_cache.pop(cache_key, None)
+    with _advanced_prediction_cache_lock:
+        for cache_key in [key for key in _advanced_prediction_cache if key[1] == symbol]:
+            _advanced_prediction_cache.pop(cache_key, None)
 
 
-def _build_prediction_signal_uncached(prices):
+def _build_prediction_signal_uncached(prices, periods):
     """Genera una recomendación conservadora con niveles de riesgo verificables."""
     if not PREDICTION_AVAILABLE or not prediction_engine:
         current = float(prices[-1]) if prices else 0.0
@@ -680,7 +726,9 @@ def _build_prediction_signal_uncached(prices):
                 'expected_high': current,
                 'expected_low': current,
                 'confidence': 0.0,
-                'direction': 'NEUTRAL'
+                'direction': 'NEUTRAL',
+                'periods': periods,
+                'horizon_minutes': periods
             },
             'levels': levels,
             'risk_reward': 0.0,
@@ -692,7 +740,7 @@ def _build_prediction_signal_uncached(prices):
     macd = calculate_macd(prices)['histogram']
     bands = calculate_bollinger_bands(prices)
     trade = prediction_engine.get_prediction_signal(
-        prices, rsi, macd, bands['upper'], bands['lower']
+        prices, rsi, macd, bands['upper'], bands['lower'], periods=periods
     )
     prediction = trade['prediction']
     trade['prediction_range'] = {
@@ -704,7 +752,8 @@ def _build_prediction_signal_uncached(prices):
         'volatility': prediction.get('volatility', 0.0),
         'walk_forward_accuracy': prediction.get('walk_forward_accuracy'),
         'walk_forward_samples': prediction.get('walk_forward_samples', 0),
-        'periods': prediction.get('periods', 5)
+        'periods': prediction.get('periods', periods),
+        'horizon_minutes': periods
     }
     return trade
 
@@ -1564,15 +1613,17 @@ def api_news_alerts():
 @login_required
 @check_subscription('PRO')
 def api_advanced_prediction():
-    """Panel de predicción avanzada con todos los indicadores."""
+    """Predicción avanzada 15m con cooldown por plan."""
     with PRICE_LOCK:
-        prices = TRADING_DATA['price_history']
+        prices = list(TRADING_DATA['price_history'])
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+
+    def calculate_advanced_prediction():
         analysis = analyze_signal(prices, symbol)
-        trade = build_prediction_signal(prices, symbol)
-        pred = trade['prediction_range']
-        levels = trade['levels']
-        return jsonify({
+        trade = build_prediction_signal(
+            prices, symbol, periods=PREDICTION_HORIZON_MINUTES
+        )
+        return {
             'success': True,
             'symbol': symbol,
             'signal': trade['signal'],
@@ -1582,11 +1633,6 @@ def api_advanced_prediction():
             'risk_reward': trade['risk_reward'],
             'reasons': trade['reasons'],
             'risk_note': trade['risk_note'],
-            'prediction_cache': {
-                'status': trade['cache_status'],
-                'cooldown_seconds': trade['cooldown_seconds'],
-                'calculated_at': trade['calculated_at']
-            },
             'indicators': {
                 'rsi': round(analysis['rsi'], 2),
                 'macd': round(analysis['macd'], 6),
@@ -1597,10 +1643,20 @@ def api_advanced_prediction():
                 'trend': analysis['trend'],
                 'bb': analysis['bb']
             },
-            'levels': {k: round(v, 6) if isinstance(v, float) else v for k, v in levels.items()},
-            'prediction': {k: round(v, 6) if isinstance(v, float) else v for k, v in pred.items()},
+            'levels': {
+                key: round(value, 6) if isinstance(value, float) else value
+                for key, value in trade['levels'].items()
+            },
+            'prediction': {
+                key: round(value, 6) if isinstance(value, float) else value
+                for key, value in trade['prediction_range'].items()
+            },
             'timestamp': datetime.now().isoformat()
-        })
+        }
+
+    plan = request.user.subscription_plan
+    result = get_cached_advanced_prediction(plan, symbol, calculate_advanced_prediction)
+    return jsonify(result)
 
 
 @app.route('/api/professional-analysis')
@@ -2464,7 +2520,7 @@ DASHBOARD_HTML = """
 
         <div class="card">
             <h3>Predicciones y Niveles</h3>
-            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción:</strong> <span id="pred-direction">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción (máx. 15 min):</strong> <span id="pred-direction">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Consenso de modelos:</strong> <span id="pred-confidence">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Backtest direccional:</strong> <span id="pred-backtest">-</span> <small id="pred-cooldown" style="color:var(--text-dim);"></small></div>
@@ -2483,6 +2539,7 @@ DASHBOARD_HTML = """
                 <button class="btn btn-purple" id="adv-btn" onclick="loadAdvancedPrediction()">Calcular Predicción Avanzada</button>
                 <span id="adv-loading" style="display:none; margin-left:12px; color:var(--purple); font-size:13px;">Calculando...</span>
                 <span id="adv-timestamp" style="margin-left:12px; color:var(--text-dim); font-size:12px;"></span>
+                <span id="adv-cooldown" style="margin-left:12px; color:var(--text-dim); font-size:12px;"></span>
             </div>
             <div id="adv-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; opacity:0.6;">
                 <div><strong style="color: var(--gold);">Señal Combinada:</strong> <span id="adv-signal">-</span></div>
@@ -2650,9 +2707,11 @@ DASHBOARD_HTML = """
         let currentSymbol = 'EURUSD';
         let currentDecimals = 4;
         const PREDICTION_COOLDOWN_MS = 15000;
+        const PREDICTION_HORIZON_MINUTES = 15;
         let lastPredictionRequestAt = 0;
         let predictionRequestInFlight = false;
         let lastAIRequestAt = 0;
+        let advancedCooldownInterval = null;
         const SYMBOL_DECIMALS = {
             'XAUUSD': 2, 'EURUSD': 5, 'GBPUSD': 5, 'USDJPY': 3,
             'US30': 1, 'NAS100': 1, 'BTCUSD': 2, 'USDCHF': 5,
@@ -3416,14 +3475,47 @@ DASHBOARD_HTML = """
             const cache = d.prediction_cache || {};
             document.getElementById('adv-timestamp').textContent = cache.calculated_at ?
                 'Actualizado ' + new Date(cache.calculated_at).toLocaleTimeString() +
-                    ' · cooldown ' + (cache.cooldown_seconds || PREDICTION_COOLDOWN_MS / 1000) + ' s' :
+                    ' · horizonte máx. ' + (pred.horizon_minutes || PREDICTION_HORIZON_MINUTES) + ' min' :
                 (d.timestamp ? new Date(d.timestamp).toLocaleTimeString() : '');
             document.getElementById('adv-grid').style.opacity = '1';
+        }
+
+        function startAdvancedCooldown(seconds) {
+            const btn = document.getElementById('adv-btn');
+            const status = document.getElementById('adv-cooldown');
+            if (advancedCooldownInterval) clearInterval(advancedCooldownInterval);
+            let remaining = Math.max(0, Math.ceil(Number(seconds) || 0));
+            if (!remaining) {
+                btn.disabled = false;
+                status.textContent = '';
+                advancedCooldownInterval = null;
+                return;
+            }
+
+            btn.disabled = true;
+            const updateCountdown = () => {
+                const minutes = Math.floor(remaining / 60);
+                const secondsLeft = remaining % 60;
+                status.textContent = 'Nueva predicción en ' +
+                    String(minutes).padStart(2, '0') + ':' +
+                    String(secondsLeft).padStart(2, '0');
+                remaining -= 1;
+                if (remaining < 0) {
+                    clearInterval(advancedCooldownInterval);
+                    advancedCooldownInterval = null;
+                    btn.disabled = false;
+                    btn.textContent = 'Calcular Predicción Avanzada';
+                    status.textContent = 'Disponible';
+                }
+            };
+            updateCountdown();
+            advancedCooldownInterval = setInterval(updateCountdown, 1000);
         }
 
         function loadAdvancedPrediction() {
             const btn = document.getElementById('adv-btn');
             const loading = document.getElementById('adv-loading');
+            if (btn.disabled) return;
             btn.disabled = true;
             loading.style.display = 'inline';
             fetch('/api/advanced-prediction')
@@ -3439,6 +3531,9 @@ DASHBOARD_HTML = """
                 })
                 .then(d => {
                     updateAdvancedPredictionUI(d);
+                    if (d.success && d.prediction_cache) {
+                        startAdvancedCooldown(d.prediction_cache.remaining_seconds);
+                    }
                 })
                 .catch(e => {
                     if (e.message !== 'Upgrade required') {
@@ -3446,7 +3541,7 @@ DASHBOARD_HTML = """
                     }
                 })
                 .finally(() => {
-                    btn.disabled = false;
+                    if (!advancedCooldownInterval) btn.disabled = false;
                     loading.style.display = 'none';
                 });
         }

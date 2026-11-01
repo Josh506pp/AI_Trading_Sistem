@@ -189,7 +189,8 @@ proyectos/
 **Filtro de operaciones**
 - Requiere consenso entre modelos e indicadores técnicos alineados
 - Solo muestra operaciones con riesgo/beneficio estimado de al menos 2:1
-- Contrasta la dirección con un backtest walk-forward reciente y aplica un cooldown de 15 segundos para reutilizar cálculos
+- Limita el horizonte de predicción a 15 velas de un minuto (máximo 15 minutos)
+- Aplica cooldown del análisis avanzado de 5 minutos en PRO y 2 minutos en PREMIUM; los endpoints básicos usan su caché breve
 - Solo permite una dirección si el backtest reciente tiene al menos 55% de aciertos con 8 o más muestras
 - El consenso del modelo y el backtest son referencias históricas, no probabilidades ni garantías de resultados
 - Las estimaciones no incluyen costos de operación ni garantizan ganancias
