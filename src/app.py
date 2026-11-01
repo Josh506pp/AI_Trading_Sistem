@@ -70,6 +70,21 @@ except ImportError:
     PREDICTION_AVAILABLE = False
 
 try:
+    from .technical_indicators import (
+        calculate_bollinger_bands,
+        calculate_macd,
+        calculate_rsi,
+    )
+    from .trading_signals import build_prediction_signal
+except ImportError:
+    from technical_indicators import (
+        calculate_bollinger_bands,
+        calculate_macd,
+        calculate_rsi,
+    )
+    from trading_signals import build_prediction_signal
+
+try:
     from .models import db, User, LoginSession, BillingHistory, PasswordResetToken, init_db
     DB_AVAILABLE = True
 except ImportError:
@@ -440,60 +455,6 @@ AI_LEARNING_DB = {
     'confidence_threshold': 0.65
 }
 
-def calculate_rsi(prices, period=14):
-    """Calcula RSI (Índice de Fuerza Relativa)"""
-    if len(prices) <= period:
-        return 50
-    
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    recent = deltas[-period:]
-    up = sum(delta for delta in recent if delta > 0) / period
-    down = sum(-delta for delta in recent if delta < 0) / period
-    if down == 0:
-        return 100.0 if up > 0 else 50.0
-    rs = up / down
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def calculate_macd(prices, fast=12, slow=26, signal=9):
-    """Calcula MACD (Moving Average Convergence Divergence)"""
-    if len(prices) < slow:
-        return {'macd': 0, 'signal': 0, 'histogram': 0}
-
-    def ema_series(values, period):
-        multiplier = 2 / (period + 1)
-        ema = float(values[0])
-        result = [ema]
-        for value in values[1:]:
-            ema = float(value) * multiplier + ema * (1 - multiplier)
-            result.append(ema)
-        return result
-
-    fast_ema = ema_series(prices, fast)
-    slow_ema = ema_series(prices, slow)
-    macd_series = [fast_value - slow_value for fast_value, slow_value in zip(fast_ema, slow_ema)]
-    macd = macd_series[-1]
-    signal_line = ema_series(macd_series, signal)[-1]
-    histogram = macd - signal_line
-
-    return {'macd': macd, 'signal': signal_line, 'histogram': histogram}
-
-def calculate_bollinger_bands(prices, period=20, std_dev=2):
-    """Calcula Bandas de Bollinger"""
-    if len(prices) < period:
-        return {'upper': 0, 'middle': 0, 'lower': 0}
-    
-    recent = prices[-period:]
-    middle = sum(recent) / len(recent)
-    variance = sum([(x - middle) ** 2 for x in recent]) / len(recent)
-    std = variance ** 0.5
-    
-    return {
-        'upper': middle + (std * std_dev),
-        'middle': middle,
-        'lower': middle - (std * std_dev)
-    }
-
 def _ema(prices, period):
     """Calcula EMA simple."""
     if len(prices) < period:
@@ -837,72 +798,8 @@ def invalidate_prediction_cache(symbol):
 
 def _build_prediction_signal_uncached(prices, periods):
     """Genera una recomendación conservadora con niveles de riesgo verificables."""
-    if not PREDICTION_AVAILABLE or not prediction_engine:
-        current = float(prices[-1]) if prices else 0.0
-        prediction = {
-            'current_price': current,
-            'predicted_price': current,
-            'price_change': 0.0,
-            'change_percent': 0.0,
-            'direction': 'NEUTRAL',
-            'confidence': 0.0,
-            'model_agreement': 0.0,
-            'expected_high': current,
-            'expected_low': current,
-            'walk_forward_accuracy': None,
-            'walk_forward_samples': 0,
-            'confidence_basis': 'model_unavailable'
-        }
-        levels = {
-            'entry': round(current, 6),
-            'stop_loss': None,
-            'take_profit': None,
-            'risk_reward': 0.0,
-            'direction': 'NEUTRAL'
-        }
-        return {
-            'signal': 'ESPERA',
-            'strength': 0.0,
-            'confidence': 0.0,
-            'model_agreement': 0.0,
-            'confidence_basis': 'model_unavailable',
-            'reasons': ['Motor de predicción no disponible'],
-            'prediction': prediction,
-            'prediction_range': {
-                'predicted_price': current,
-                'expected_high': current,
-                'expected_low': current,
-                'confidence': 0.0,
-                'direction': 'NEUTRAL',
-                'periods': periods,
-                'horizon_minutes': periods
-            },
-            'levels': levels,
-            'risk_reward': 0.0,
-            'trade_allowed': False,
-            'risk_note': 'El ratio estimado no incluye spread, comisiones ni deslizamiento; no garantiza ganancias.'
-        }
-
-    rsi = calculate_rsi(prices)
-    macd = calculate_macd(prices)['histogram']
-    bands = calculate_bollinger_bands(prices)
-    trade = prediction_engine.get_prediction_signal(
-        prices, rsi, macd, bands['upper'], bands['lower'], periods=periods
-    )
-    prediction = trade['prediction']
-    trade['prediction_range'] = {
-        'predicted_price': prediction['predicted_price'],
-        'expected_high': prediction['expected_high'],
-        'expected_low': prediction['expected_low'],
-        'confidence': prediction['confidence'],
-        'direction': prediction['direction'],
-        'volatility': prediction.get('volatility', 0.0),
-        'walk_forward_accuracy': prediction.get('walk_forward_accuracy'),
-        'walk_forward_samples': prediction.get('walk_forward_samples', 0),
-        'periods': prediction.get('periods', periods),
-        'horizon_minutes': periods
-    }
-    return trade
+    engine = prediction_engine if PREDICTION_AVAILABLE else None
+    return build_prediction_signal(prices, periods, engine)
 
 # ====================================================================
 # ACTUALIZACIÓN DE PRECIOS

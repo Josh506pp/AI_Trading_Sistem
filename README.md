@@ -89,7 +89,17 @@ Para recibir ticks del bróker en lugar de las barras retrasadas de Yahoo:
 2. Instala el puente oficial en el mismo entorno Python: `pip install MetaTrader5`.
 3. Reinicia la aplicación. Intentará leer cotizaciones y velas de MT5; si el terminal, la sesión o el símbolo no están disponibles, usará Yahoo Finance como respaldo.
 
-La integración MT5 lee cotizaciones y velas, pero no coloca ni modifica órdenes. La app permanece en modo simulación; no garantiza ganancias por operación ni un mínimo de USD 1.
+La integración normal de la app lee cotizaciones y velas, pero no opera cuentas ni garantiza ganancias por operación ni un mínimo de USD 1.
+
+#### Prueba manual aislada en MT5 demo
+El ejecutor de prueba no forma parte del servidor web y nunca admite cuentas reales. Por defecto solo valida la señal y hace `order_check`; requiere `--execute-demo-order` para enviar como máximo una orden por ejecución:
+
+```powershell
+python tools\run_demo_trade_test.py --symbol EURUSD
+python tools\run_demo_trade_test.py --symbol EURUSD --execute-demo-order
+```
+
+Solo usa EURUSD/XAUUSD, exige una señal confirmada con datos M1 recientes, cuenta demo USD y permisos MT5 activos. Busca un objetivo bruto estimado de USD 1, con pérdida estimada al stop de hasta USD 1 y volumen máximo de 0.10 lotes; spread, comisiones, deslizamiento y gaps pueden cambiar el resultado real. La prueba no promete alcanzar el TP ni el resultado neto. Una señal ESPERA, datos desfasados, otra posición u orden pendiente hacen que el ejecutor se abstenga.
 
 Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
 

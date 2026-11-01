@@ -1,0 +1,220 @@
+import unittest
+from types import SimpleNamespace
+
+from src.demo_trading import (
+    DEMO_MAX_LOSS_USD,
+    DEMO_TARGET_PROFIT_USD,
+    DemoTradeRejected,
+    prepare_demo_order,
+    send_demo_order,
+)
+
+
+class FakeMT5:
+    ACCOUNT_TRADE_MODE_DEMO = 0
+    SYMBOL_TRADE_MODE_FULL = 4
+    SYMBOL_TRADE_EXECUTION_MARKET = 2
+    TRADE_ACTION_DEAL = 1
+    ORDER_TYPE_BUY = 0
+    ORDER_TYPE_SELL = 1
+    ORDER_FILLING_FOK = 0
+    ORDER_FILLING_IOC = 1
+    ORDER_FILLING_RETURN = 2
+    ORDER_TIME_GTC = 0
+    TRADE_RETCODE_DONE = 10009
+    TRADE_RETCODE_DONE_PARTIAL = 10010
+
+    def __init__(self):
+        self.terminal = SimpleNamespace(
+            connected=True,
+            trade_allowed=True,
+            tradeapi_disabled=False
+        )
+        self.account = SimpleNamespace(
+            trade_mode=self.ACCOUNT_TRADE_MODE_DEMO,
+            trade_allowed=True,
+            currency='USD'
+        )
+        self.symbol = SimpleNamespace(
+            trade_mode=self.SYMBOL_TRADE_MODE_FULL,
+            visible=True,
+            filling_mode=3,
+            trade_exemode=self.SYMBOL_TRADE_EXECUTION_MARKET,
+            trade_stops_level=0,
+            point=0.00001,
+            digits=5,
+            volume_min=0.01,
+            volume_step=0.01,
+            volume_max=100
+        )
+        self.tick = SimpleNamespace(time=1000, bid=1.10000, ask=1.10010)
+        self.positions = ()
+        self.orders = ()
+        self.checked_requests = []
+        self.sent_requests = []
+        self.check_retcode = 0
+
+    def terminal_info(self):
+        return self.terminal
+
+    def account_info(self):
+        return self.account
+
+    def positions_get(self, symbol):
+        return self.positions
+
+    def orders_get(self, symbol):
+        return self.orders
+
+    def symbol_info(self, symbol):
+        return self.symbol
+
+    def symbol_info_tick(self, symbol):
+        return self.tick
+
+    def symbol_select(self, symbol, selected):
+        return True
+
+    def order_calc_profit(self, order_type, symbol, volume, entry, exit_price):
+        direction = 1 if order_type == self.ORDER_TYPE_BUY else -1
+        return (exit_price - entry) * direction * volume * 100000
+
+    def order_check(self, request):
+        self.checked_requests.append(dict(request))
+        return SimpleNamespace(retcode=self.check_retcode, comment='check')
+
+    def order_send(self, request):
+        self.sent_requests.append(dict(request))
+        return SimpleNamespace(
+            retcode=self.TRADE_RETCODE_DONE,
+            order=23,
+            deal=24,
+            comment='done'
+        )
+
+    def last_error(self):
+        return (0, 'ok')
+
+
+def valid_buy_signal():
+    return {
+        'signal': 'COMPRA',
+        'trade_allowed': True,
+        'stop_loss': 1.09960,
+        'take_profit': 1.10120,
+        'prediction': {
+            'walk_forward_accuracy': 0.60,
+            'walk_forward_samples': 20
+        }
+    }
+
+
+class TestDemoTrading(unittest.TestCase):
+    def setUp(self):
+        self.mt5 = FakeMT5()
+
+    def prepare(self, signal=None, latest_bar_time=1000):
+        return prepare_demo_order(
+            self.mt5,
+            'EURUSD',
+            signal or valid_buy_signal(),
+            latest_bar_time
+        )
+
+    def test_prepares_usd_bounded_bracketed_demo_order(self):
+        plan = self.prepare()
+
+        self.assertEqual(plan.request['volume'], 0.01)
+        self.assertEqual(plan.request['sl'], 1.09960)
+        self.assertEqual(plan.request['tp'], 1.10120)
+        self.assertGreaterEqual(plan.estimated_target_usd, DEMO_TARGET_PROFIT_USD)
+        self.assertLessEqual(plan.estimated_stop_loss_usd, DEMO_MAX_LOSS_USD)
+        self.assertEqual(len(self.mt5.checked_requests), 1)
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_rejects_live_account_before_order_check(self):
+        self.mt5.account.trade_mode = 1
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'solo permite cuentas demo'):
+            self.prepare()
+
+        self.assertEqual(self.mt5.checked_requests, [])
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_rejects_disabled_terminal_and_python_api(self):
+        self.mt5.terminal.trade_allowed = False
+        with self.assertRaisesRegex(DemoTradeRejected, 'Algo Trading'):
+            self.prepare()
+
+        self.mt5.terminal.trade_allowed = True
+        self.mt5.terminal.tradeapi_disabled = True
+        with self.assertRaisesRegex(DemoTradeRejected, 'trading desde Python'):
+            self.prepare()
+        self.assertEqual(self.mt5.checked_requests, [])
+
+    def test_rejects_wait_signal_and_stale_candles(self):
+        signal = valid_buy_signal()
+        signal['signal'] = 'ESPERA'
+        signal['trade_allowed'] = False
+        with self.assertRaisesRegex(DemoTradeRejected, 'no autorizó'):
+            self.prepare(signal)
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'desfasadas'):
+            self.prepare(latest_bar_time=700)
+        self.assertEqual(self.mt5.checked_requests, [])
+
+    def test_rejects_insufficient_walk_forward_validation(self):
+        signal = valid_buy_signal()
+        signal['prediction']['walk_forward_accuracy'] = 0.54
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'walk-forward'):
+            self.prepare(signal)
+        self.assertEqual(self.mt5.checked_requests, [])
+
+    def test_rejects_existing_position_or_pending_order(self):
+        self.mt5.positions = (SimpleNamespace(ticket=9),)
+        with self.assertRaisesRegex(DemoTradeRejected, 'posición abierta'):
+            self.prepare()
+
+        self.mt5.positions = ()
+        self.mt5.orders = (SimpleNamespace(ticket=10),)
+        with self.assertRaisesRegex(DemoTradeRejected, 'orden pendiente'):
+            self.prepare()
+        self.assertEqual(self.mt5.checked_requests, [])
+
+    def test_rejects_stop_loss_above_usd_cap(self):
+        signal = valid_buy_signal()
+        signal['stop_loss'] = 1.09500
+        signal['take_profit'] = 1.11000
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'pérdida máxima'):
+            self.prepare(signal)
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_rejects_unchecked_order(self):
+        self.mt5.check_retcode = 10016
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'comprobación previa'):
+            self.prepare()
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_sends_only_a_prechecked_order_on_demo(self):
+        plan = self.prepare()
+
+        result = send_demo_order(self.mt5, 'EURUSD', plan)
+
+        self.assertEqual(result.order, 23)
+        self.assertEqual(len(self.mt5.sent_requests), 1)
+
+    def test_rechecks_demo_mode_before_sending(self):
+        plan = self.prepare()
+        self.mt5.account.trade_mode = 1
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'solo permite cuentas demo'):
+            send_demo_order(self.mt5, 'EURUSD', plan)
+
+        self.assertEqual(self.mt5.sent_requests, [])
+
+
+if __name__ == '__main__':
+    unittest.main()
