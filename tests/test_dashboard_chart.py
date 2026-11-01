@@ -83,6 +83,50 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['price_history'] = previous_history
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
 
+    def test_market_tick_publishes_liquidity_for_the_active_symbol(self):
+        candle = {
+            'time': '2026-10-30T16:59:00-04:00',
+            'open': 149.0,
+            'high': 150.0,
+            'low': 148.0,
+            'close': 149.8,
+            'volume': 120.0
+        }
+        with app_module.PRICE_LOCK:
+            previous_symbol = app_module.TRADING_DATA['symbol']
+            previous_price = app_module.TRADING_DATA['price']
+            previous_history = app_module.TRADING_DATA['price_history']
+            previous_candles = app_module.TRADING_DATA['market_candles']
+            previous_liquidity = app_module.TRADING_DATA['liquidity']
+            previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
+            app_module.TRADING_DATA['symbol'] = 'USDJPY'
+            app_module.TRADING_DATA['price_history'] = [149.0]
+
+        try:
+            quote = {
+                'price': 149.8,
+                'timestamp': candle['time'],
+                'history': [149.0, 149.8],
+                'candles': [candle] * 12
+            }
+            with patch.object(app_module, 'MARKET_DATA_AVAILABLE', True), \
+                    patch.object(app_module.market_data, 'get_latest_quote', return_value=quote):
+                app_module.update_market_price_once()
+
+            response = app_module.app.test_client().get('/api/status')
+            liquidity = response.get_json()['liquidity']
+            self.assertTrue(liquidity['available'])
+            self.assertEqual(liquidity['window_candles'], 12)
+            self.assertEqual(liquidity['flow_bias'], 'PRESIÓN COMPRADORA')
+        finally:
+            with app_module.PRICE_LOCK:
+                app_module.TRADING_DATA['symbol'] = previous_symbol
+                app_module.TRADING_DATA['price'] = previous_price
+                app_module.TRADING_DATA['price_history'] = previous_history
+                app_module.TRADING_DATA['market_candles'] = previous_candles
+                app_module.TRADING_DATA['liquidity'] = previous_liquidity
+                app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
+
     def test_changing_symbol_updates_the_chart_to_that_symbols_latest_quote(self):
         with app_module.PRICE_LOCK:
             previous_symbol = app_module.TRADING_DATA['symbol']

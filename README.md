@@ -90,6 +90,7 @@ Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE
 #### Gráfico de Precios
 - Ver gráfico con colores dinámicos (dorado subida, morado bajada)
 - Cambiar símbolo: EURUSD, XAUUSD, BTCUSD, etc.
+- Indicadores estimados de presión compradora/vendedora, volumen relativo y zona de precio con mayor volumen
 - Ver la cotización actual de la divisa seleccionada, sincronizada con el último punto del gráfico
 - Consultar la hora del último tick y detectar cuando el proveedor no entrega datos recientes
 - Niveles de entrada, stop-loss y objetivo cuando hay una señal confirmada
@@ -188,7 +189,10 @@ proyectos/
 **Filtro de operaciones**
 - Requiere consenso entre modelos e indicadores técnicos alineados
 - Solo muestra operaciones con riesgo/beneficio estimado de al menos 2:1
+- Contrasta la dirección con un backtest walk-forward reciente y aplica un cooldown de 15 segundos para reutilizar cálculos
+- El consenso del modelo y el backtest son referencias históricas, no probabilidades ni garantías de resultados
 - Las estimaciones no incluyen costos de operación ni garantizan ganancias
+- La presión de compra/venta se estima de las velas OHLCV; no revela las posiciones ni órdenes de participantes institucionales
 
 ## Seguridad
 

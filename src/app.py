@@ -14,6 +14,7 @@ import socket
 import webbrowser
 import secrets
 import math
+import copy
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -43,14 +44,15 @@ except ImportError:
         SYMBOLS_AVAILABLE = False
 
 try:
-    from .market_data import market_data
+    from .market_data import market_data, calculate_liquidity_metrics
     MARKET_DATA_AVAILABLE = True
 except ImportError:
     try:
-        from market_data import market_data
+        from market_data import market_data, calculate_liquidity_metrics
         MARKET_DATA_AVAILABLE = True
     except ImportError:
         market_data = None
+        calculate_liquidity_metrics = None
         MARKET_DATA_AVAILABLE = False
 
 try:
@@ -150,6 +152,8 @@ TRADING_DATA = {
     'price': round(_initial_price, _initial_decimals),
     'price_history': _initial_price_history,
     'price_updated_at': None,
+    'market_candles': [],
+    'liquidity': {'available': False, 'flow_bias': 'SIN DATOS'},
     'balance': 10000.0,
     'equity': 10000.0,
     'trades_open': 0,
@@ -393,6 +397,9 @@ def reset_price_history(symbol):
             TRADING_DATA['price'] = round(default_price, decimals)
             TRADING_DATA['price_history'] = [TRADING_DATA['price']] * 50
         TRADING_DATA['price_updated_at'] = None
+        TRADING_DATA['market_candles'] = []
+        TRADING_DATA['liquidity'] = {'available': False, 'flow_bias': 'SIN DATOS'}
+        invalidate_prediction_cache(symbol)
         return decimals, volatility, TRADING_DATA['price'], default_volume
 
 PRICE_LOCK = threading.Lock()
@@ -600,7 +607,42 @@ def analyze_signal(prices, symbol=None):
     }
 
 
-def build_prediction_signal(prices):
+PREDICTION_COOLDOWN_SECONDS = 15
+_prediction_cache = {}
+_prediction_cache_lock = threading.Lock()
+
+
+def build_prediction_signal(prices, symbol=None):
+    """Reutiliza el análisis por símbolo durante el cooldown para evitar recálculos concurrentes."""
+    cache_symbol = symbol or TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+    now = time.monotonic()
+    with _prediction_cache_lock:
+        cached = _prediction_cache.get(cache_symbol)
+        if cached and now - cached['created_at'] < PREDICTION_COOLDOWN_SECONDS:
+            result = copy.deepcopy(cached['result'])
+            result['cache_status'] = 'cached'
+            result['cooldown_seconds'] = max(
+                0, math.ceil(PREDICTION_COOLDOWN_SECONDS - (now - cached['created_at']))
+            )
+            return result
+
+        result = _build_prediction_signal_uncached(prices)
+        result['cache_status'] = 'calculated'
+        result['cooldown_seconds'] = PREDICTION_COOLDOWN_SECONDS
+        result['calculated_at'] = datetime.utcnow().isoformat() + 'Z'
+        _prediction_cache[cache_symbol] = {
+            'created_at': time.monotonic(),
+            'result': copy.deepcopy(result)
+        }
+        return result
+
+
+def invalidate_prediction_cache(symbol):
+    with _prediction_cache_lock:
+        _prediction_cache.pop(symbol, None)
+
+
+def _build_prediction_signal_uncached(prices):
     """Genera una recomendación conservadora con niveles de riesgo verificables."""
     if not PREDICTION_AVAILABLE or not prediction_engine:
         current = float(prices[-1]) if prices else 0.0
@@ -612,6 +654,10 @@ def build_prediction_signal(prices):
             'direction': 'NEUTRAL',
             'confidence': 0.0,
             'model_agreement': 0.0,
+            'expected_high': current,
+            'expected_low': current,
+            'walk_forward_accuracy': None,
+            'walk_forward_samples': 0,
             'confidence_basis': 'model_unavailable'
         }
         levels = {
@@ -629,6 +675,13 @@ def build_prediction_signal(prices):
             'confidence_basis': 'model_unavailable',
             'reasons': ['Motor de predicción no disponible'],
             'prediction': prediction,
+            'prediction_range': {
+                'predicted_price': current,
+                'expected_high': current,
+                'expected_low': current,
+                'confidence': 0.0,
+                'direction': 'NEUTRAL'
+            },
             'levels': levels,
             'risk_reward': 0.0,
             'trade_allowed': False,
@@ -638,9 +691,22 @@ def build_prediction_signal(prices):
     rsi = calculate_rsi(prices)
     macd = calculate_macd(prices)['histogram']
     bands = calculate_bollinger_bands(prices)
-    return prediction_engine.get_prediction_signal(
+    trade = prediction_engine.get_prediction_signal(
         prices, rsi, macd, bands['upper'], bands['lower']
     )
+    prediction = trade['prediction']
+    trade['prediction_range'] = {
+        'predicted_price': prediction['predicted_price'],
+        'expected_high': prediction['expected_high'],
+        'expected_low': prediction['expected_low'],
+        'confidence': prediction['confidence'],
+        'direction': prediction['direction'],
+        'volatility': prediction.get('volatility', 0.0),
+        'walk_forward_accuracy': prediction.get('walk_forward_accuracy'),
+        'walk_forward_samples': prediction.get('walk_forward_samples', 0),
+        'periods': prediction.get('periods', 5)
+    }
+    return trade
 
 # ====================================================================
 # ACTUALIZACIÓN DE PRECIOS
@@ -663,6 +729,13 @@ def update_market_price_once():
                         quote_history = quote.get('history')
                         if needs_history and quote_history:
                             TRADING_DATA['price_history'] = quote_history[-200:]
+                        market_candles = quote.get('candles', [])
+                        if market_candles:
+                            TRADING_DATA['market_candles'] = market_candles
+                            if calculate_liquidity_metrics:
+                                TRADING_DATA['liquidity'] = calculate_liquidity_metrics(
+                                    market_candles, symbol
+                                )
                         TRADING_DATA['price'] = latest_price
                         history = TRADING_DATA['price_history']
                         if not history or history[-1] != latest_price:
@@ -1409,6 +1482,7 @@ def api_status():
         status = {
             'price': current_price,
             'price_updated_at': TRADING_DATA.get('price_updated_at'),
+            'liquidity': copy.deepcopy(TRADING_DATA.get('liquidity', {'available': False})),
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
@@ -1495,25 +1569,9 @@ def api_advanced_prediction():
         prices = TRADING_DATA['price_history']
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
         analysis = analyze_signal(prices, symbol)
-        trade = build_prediction_signal(prices)
-        pred = {'predicted_price': prices[-1], 'expected_high': prices[-1], 'expected_low': prices[-1], 'confidence': 0.0, 'direction': 'NEUTRAL', 'volatility': 0.0}
+        trade = build_prediction_signal(prices, symbol)
+        pred = trade['prediction_range']
         levels = trade['levels']
-        if PREDICTION_AVAILABLE and prediction_engine:
-            try:
-                pred = prediction_engine.predict_price_range(prices, periods=5)
-            except Exception as e:
-                print(f"Error predicción avanzada: {e}")
-        else:
-            if len(prices) >= 10:
-                atr = analysis.get('atr', 0.001) or 0.001
-                pred = {
-                    'predicted_price': prices[-1] + (prices[-1] - prices[-5]) if len(prices) >= 5 else prices[-1],
-                    'expected_high': prices[-1] + atr * 3,
-                    'expected_low': prices[-1] - atr * 3,
-                    'confidence': 0.0,
-                    'direction': 'NEUTRAL',
-                    'volatility': atr
-                }
         return jsonify({
             'success': True,
             'symbol': symbol,
@@ -1524,6 +1582,11 @@ def api_advanced_prediction():
             'risk_reward': trade['risk_reward'],
             'reasons': trade['reasons'],
             'risk_note': trade['risk_note'],
+            'prediction_cache': {
+                'status': trade['cache_status'],
+                'cooldown_seconds': trade['cooldown_seconds'],
+                'calculated_at': trade['calculated_at']
+            },
             'indicators': {
                 'rsi': round(analysis['rsi'], 2),
                 'macd': round(analysis['macd'], 6),
@@ -1557,7 +1620,7 @@ def api_professional_analysis():
         
         # Análisis inteligente
         analysis = analyze_signal(prices)
-        trade = build_prediction_signal(prices)
+        trade = build_prediction_signal(prices, TRADING_DATA.get('symbol', DEFAULT_SYMBOL))
         
         # Calcular indicadores avanzados
         rsi = analysis['rsi']
@@ -1574,6 +1637,11 @@ def api_professional_analysis():
             'risk_reward': trade['risk_reward'],
             'signal_reasons': trade['reasons'],
             'learning_progress': learning_pct,
+            'prediction_cache': {
+                'status': trade['cache_status'],
+                'cooldown_seconds': trade['cooldown_seconds'],
+                'calculated_at': trade['calculated_at']
+            },
             'indicators': {
                 'rsi': round(rsi, 2),
                 'trend': analysis['trend'],
@@ -1596,7 +1664,8 @@ def api_predict():
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            trade = build_prediction_signal(prices)
+            symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+            trade = build_prediction_signal(prices, symbol)
             pred = trade['prediction']
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -1606,7 +1675,12 @@ def api_predict():
             'prediction': pred,
             'recommendation': trade['signal'],
             'trade': trade,
-            'levels': trade['levels']
+            'levels': trade['levels'],
+            'prediction_cache': {
+                'status': trade['cache_status'],
+                'cooldown_seconds': trade['cooldown_seconds'],
+                'calculated_at': trade['calculated_at']
+            }
         })
 
 
@@ -1617,11 +1691,21 @@ def api_predict_levels():
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            levels = build_prediction_signal(prices)['levels']
+            trade = build_prediction_signal(
+                prices, TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+            )
+            levels = trade['levels']
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
-        return jsonify({'success': True, 'levels': levels})
+        return jsonify({
+            'success': True,
+            'levels': levels,
+            'prediction_cache': {
+                'status': trade['cache_status'],
+                'cooldown_seconds': trade['cooldown_seconds']
+            }
+        })
 
 
 @app.route('/api/predict/signal')
@@ -1631,11 +1715,20 @@ def api_predict_signal():
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            signal = build_prediction_signal(prices)
+            signal = build_prediction_signal(
+                prices, TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+            )
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
-        return jsonify({'success': True, 'prediction_signal': signal})
+        return jsonify({
+            'success': True,
+            'prediction_signal': signal,
+            'prediction_cache': {
+                'status': signal['cache_status'],
+                'cooldown_seconds': signal['cooldown_seconds']
+            }
+        })
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -2347,6 +2440,20 @@ DASHBOARD_HTML = """
         </div>
 
         <div class="card">
+            <h3>Liquidez y flujo estimado</h3>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-top:12px;">
+                <div><strong style="color:var(--gold);">Sesgo de flujo:</strong> <span id="liquidity-bias">Sin datos</span></div>
+                <div><strong style="color:var(--gold);">Presión compra/venta:</strong> <span id="liquidity-pressure">-</span></div>
+                <div><strong style="color:var(--gold);">Volumen relativo:</strong> <span id="liquidity-relative-volume">-</span></div>
+                <div><strong style="color:var(--gold);">Zona con más volumen:</strong> <span id="liquidity-zone">-</span></div>
+                <div><strong style="color:var(--gold);">Volumen analizado:</strong> <span id="liquidity-total">-</span></div>
+            </div>
+            <small id="liquidity-note" style="display:block; color:var(--text-dim); margin-top:12px;">
+                Presión inferida de velas y volumen del proveedor; no representa órdenes institucionales ni garantiza flujo real.
+            </small>
+        </div>
+
+        <div class="card">
             <h3>Análisis Inteligente de IA</h3>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Señal:</strong> <span id="ai-signal" style="color: var(--green);">ESPERA</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Confianza:</strong> <span id="ai-confidence" style="color: var(--gold);">0%</span></div>
@@ -2360,6 +2467,8 @@ DASHBOARD_HTML = """
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción:</strong> <span id="pred-direction">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Consenso de modelos:</strong> <span id="pred-confidence">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Backtest direccional:</strong> <span id="pred-backtest">-</span> <small id="pred-cooldown" style="color:var(--text-dim);"></small></div>
+            <small style="color:var(--text-dim);">El acierto es una prueba histórica reciente, no una probabilidad ni garantía de resultados futuros.</small>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Operación sugerida:</strong> <span id="pred-signal">ESPERA</span> <strong style="color: var(--gold); margin-left:12px;">Riesgo/beneficio:</strong> <span id="pred-risk-reward">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: var(--gold); margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: var(--gold); margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Filtro:</strong> <span id="pred-reasons">Calculando...</span></div>
@@ -2540,6 +2649,10 @@ DASHBOARD_HTML = """
         let chartHoverData = null;
         let currentSymbol = 'EURUSD';
         let currentDecimals = 4;
+        const PREDICTION_COOLDOWN_MS = 15000;
+        let lastPredictionRequestAt = 0;
+        let predictionRequestInFlight = false;
+        let lastAIRequestAt = 0;
         const SYMBOL_DECIMALS = {
             'XAUUSD': 2, 'EURUSD': 5, 'GBPUSD': 5, 'USDJPY': 3,
             'US30': 1, 'NAS100': 1, 'BTCUSD': 2, 'USDCHF': 5,
@@ -2585,6 +2698,7 @@ DASHBOARD_HTML = """
                         d.chart_prices : (Array.isArray(d.candles) && d.candles.length > 0 ?
                             d.candles : (Array.isArray(d.prices) ? d.prices : []));
                     drawChart(chartDataArr);
+                    updateLiquidityUI(d.liquidity || {});
                     
                     // Actualizar otros elementos
                     try {
@@ -3136,6 +3250,8 @@ DASHBOARD_HTML = """
         }
 
         function updateAIAnalysis() {
+            if (Date.now() - lastAIRequestAt < PREDICTION_COOLDOWN_MS) return;
+            lastAIRequestAt = Date.now();
             fetch('/api/professional-analysis')
                 .then(r => r.json())
                 .then(d => {
@@ -3155,6 +3271,12 @@ DASHBOARD_HTML = """
         }
 
         function updatePrediction() {
+            if (
+                predictionRequestInFlight ||
+                Date.now() - lastPredictionRequestAt < PREDICTION_COOLDOWN_MS
+            ) return;
+            predictionRequestInFlight = true;
+            lastPredictionRequestAt = Date.now();
             fetch('/api/predict')
                 .then(r => r.json())
                 .then(d => {
@@ -3167,6 +3289,13 @@ DASHBOARD_HTML = """
                         formatPrice(p.predicted_price, currentDecimals) : '-';
                     document.getElementById('pred-confidence').textContent = typeof p.confidence === 'number' ?
                         (p.confidence * 100).toFixed(1) + '%' : '-';
+                    document.getElementById('pred-backtest').textContent =
+                        typeof p.walk_forward_accuracy === 'number' ?
+                            (p.walk_forward_accuracy * 100).toFixed(1) + '% (' +
+                                (p.walk_forward_samples || 0) + ' pruebas)' : 'Muestra insuficiente';
+                    document.getElementById('pred-cooldown').textContent =
+                        ' · Actualizado ' + new Date(d.prediction_cache.calculated_at).toLocaleTimeString() +
+                        ' · cooldown ' + PREDICTION_COOLDOWN_MS / 1000 + ' s';
                     const signal = trade.signal || d.recommendation || 'ESPERA';
                     const signalElement = document.getElementById('pred-signal');
                     signalElement.textContent = signal;
@@ -3183,7 +3312,39 @@ DASHBOARD_HTML = """
                     document.getElementById('pred-tp').textContent = levels.take_profit ?
                         formatPrice(levels.take_profit, currentDecimals) : '-';
                 })
-                .catch(e => console.error('Error fetching predict:', e));
+                .catch(e => console.error('Error fetching predict:', e))
+                .finally(() => { predictionRequestInFlight = false; });
+        }
+
+        function updateLiquidityUI(liquidity) {
+            const bias = document.getElementById('liquidity-bias');
+            const note = document.getElementById('liquidity-note');
+            if (!liquidity.available) {
+                bias.textContent = 'Sin datos de volumen';
+                document.getElementById('liquidity-pressure').textContent = '-';
+                document.getElementById('liquidity-relative-volume').textContent = '-';
+                document.getElementById('liquidity-zone').textContent = '-';
+                document.getElementById('liquidity-total').textContent = '-';
+                if (note && liquidity.flow_note) note.textContent = liquidity.flow_note;
+                return;
+            }
+
+            bias.textContent = liquidity.flow_bias || 'Flujo mixto';
+            bias.style.color = liquidity.flow_bias === 'PRESIÓN COMPRADORA' ? 'var(--green)' :
+                liquidity.flow_bias === 'PRESIÓN VENDEDORA' ? 'var(--red)' : 'var(--gold)';
+            document.getElementById('liquidity-pressure').textContent =
+                Number(liquidity.buy_pressure_pct).toFixed(1) + '% compra / ' +
+                Number(liquidity.sell_pressure_pct).toFixed(1) + '% venta';
+            document.getElementById('liquidity-relative-volume').textContent =
+                typeof liquidity.relative_volume === 'number' ?
+                    liquidity.relative_volume.toFixed(2) + '× promedio' : 'Sin referencia';
+            const zone = liquidity.active_price_zone;
+            document.getElementById('liquidity-zone').textContent = zone ?
+                formatPrice(zone.low, currentDecimals) + ' - ' + formatPrice(zone.high, currentDecimals) : '-';
+            const volumeFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+            document.getElementById('liquidity-total').textContent =
+                volumeFormat.format(liquidity.volume_total) + ' ' + liquidity.volume_unit;
+            if (note && liquidity.flow_note) note.textContent = liquidity.flow_note;
         }
 
         function loadSymbols() {
@@ -3211,6 +3372,8 @@ DASHBOARD_HTML = """
                 .then(d => {
                     if (d.success) {
                         currentSymbol = d.symbol;
+                        lastPredictionRequestAt = 0;
+                        lastAIRequestAt = 0;
                         if (chart) {
                             try { chart.destroy(); } catch(e) {}
                             chart = null;
@@ -3250,7 +3413,11 @@ DASHBOARD_HTML = """
             const low = pred.expected_low !== undefined ? formatPrice(pred.expected_low, currentDecimals) : '-';
             const high = pred.expected_high !== undefined ? formatPrice(pred.expected_high, currentDecimals) : '-';
             document.getElementById('adv-range').textContent = low + ' - ' + high;
-            document.getElementById('adv-timestamp').textContent = d.timestamp ? new Date(d.timestamp).toLocaleTimeString() : '';
+            const cache = d.prediction_cache || {};
+            document.getElementById('adv-timestamp').textContent = cache.calculated_at ?
+                'Actualizado ' + new Date(cache.calculated_at).toLocaleTimeString() +
+                    ' · cooldown ' + (cache.cooldown_seconds || PREDICTION_COOLDOWN_MS / 1000) + ' s' :
+                (d.timestamp ? new Date(d.timestamp).toLocaleTimeString() : '');
             document.getElementById('adv-grid').style.opacity = '1';
         }
 

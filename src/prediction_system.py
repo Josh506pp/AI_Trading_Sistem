@@ -40,6 +40,11 @@ class PredictionEngine:
                 'confidence': 0.0,
                 'model_agreement': 0.0,
                 'confidence_basis': 'model_agreement_not_probability',
+                'expected_high': current_price,
+                'expected_low': current_price,
+                'volatility': 0.0,
+                'walk_forward_accuracy': None,
+                'walk_forward_samples': 0,
                 'method': 'insufficient_data'
             }
         
@@ -77,12 +82,23 @@ class PredictionEngine:
         model_agreement = max(up_votes, down_votes) / len(model_prices)
         atr = self._calculate_atr(clean_prices[-50:])
         minimum_move = max(atr * 0.25, current_price * 0.0001)
+        walk_forward_accuracy, walk_forward_samples = self._walk_forward_accuracy(
+            clean_prices, periods
+        )
         
         votes_match_forecast = (
             (up_votes >= 3 and price_change > 0) or
             (down_votes >= 3 and price_change < 0)
         )
-        if abs(price_change) < minimum_move or model_agreement < 0.75 or not votes_match_forecast:
+        backtest_rejects_signal = (
+            walk_forward_samples >= 8 and
+            walk_forward_accuracy is not None and
+            walk_forward_accuracy < 0.50
+        )
+        if (
+            abs(price_change) < minimum_move or model_agreement < 0.75 or
+            not votes_match_forecast or backtest_rejects_signal
+        ):
             direction = 'NEUTRAL'
             confidence = 0.0
         elif price_change > 0:
@@ -91,15 +107,29 @@ class PredictionEngine:
         else:
             direction = 'BAJISTA'
             confidence = min(0.90, model_agreement)
+
+        recent_returns = np.diff(clean_prices[-31:]) / np.array(clean_prices[-31:-1])
+        volatility = float(np.std(recent_returns)) if len(recent_returns) else 0.0
+        range_margin = max(
+            current_price * volatility * math.sqrt(periods),
+            atr * math.sqrt(periods)
+        )
         
         return {
             'current_price': current_price,
             'predicted_price': final_prediction,
+            'expected_high': round(final_prediction + range_margin, 6),
+            'expected_low': round(max(0.0, final_prediction - range_margin), 6),
+            'volatility': round(volatility * 100, 4),
             'price_change': round(float(price_change), 6),
             'change_percent': round(float(change_percent), 4),
             'direction': direction,
             'confidence': round(confidence, 2),
             'model_agreement': round(model_agreement, 2),
+            'walk_forward_accuracy': (
+                round(walk_forward_accuracy, 3) if walk_forward_accuracy is not None else None
+            ),
+            'walk_forward_samples': walk_forward_samples,
             'confidence_basis': 'model_agreement_not_probability',
             'methods': {
                 'ema': round(float(ema_prediction['price']), 6),
@@ -110,6 +140,32 @@ class PredictionEngine:
             'periods': periods,
             'timestamp': __import__('datetime').datetime.now().isoformat()
         }
+
+    def _walk_forward_accuracy(self, prices: List[float], periods: int, max_windows: int = 40):
+        if len(prices) < 40:
+            return None, 0
+
+        start = max(30, len(prices) - max_windows - periods)
+        correct = 0
+        samples = 0
+        for index in range(start, len(prices) - periods):
+            history = prices[:index]
+            forecasts = (
+                self._ema_prediction(history, periods)['price'] * 0.30 +
+                self._linear_regression_prediction(history, periods)['price'] * 0.25 +
+                self._momentum_prediction(history, periods)['price'] * 0.25 +
+                self._volatility_adjusted_prediction(history, periods)['price'] * 0.20
+            )
+            current = history[-1]
+            atr = self._calculate_atr(history[-50:])
+            if abs(forecasts - current) < max(atr * 0.25, current * 0.0001):
+                continue
+            actual_change = prices[index + periods] - current
+            samples += 1
+            if (forecasts - current) * actual_change > 0:
+                correct += 1
+
+        return (correct / samples, samples) if samples else (None, 0)
     
     def _ema_prediction(self, prices: List[float], periods: int) -> Dict:
         """Predicción usando Media Móvil Exponencial"""
@@ -272,25 +328,17 @@ class PredictionEngine:
             Rango esperado con máximo y mínimo
         """
         prediction = self.predict_next_price(prices, periods)
-        
-        # Calcular volatilidad para determinar el rango
-        returns = np.diff(prices) / prices[:-1] if len(prices) > 1 else [0]
-        volatility = float(np.std(returns)) if len(returns) > 0 else 0.001
-        
-        predicted_price = prediction['predicted_price']
-        current_price = float(prices[-1])
-        
-        # El rango se expande con la volatilidad
-        margin = current_price * (volatility * periods * 10)
-        margin = max(margin, current_price * 0.001)  # Mínimo 0.1%
-        
+        returns = np.diff(prices[-31:]) / np.array(prices[-31:-1]) if len(prices) > 1 else [0]
+        volatility = float(np.std(returns)) if len(returns) > 0 else 0.0
         return {
-            'predicted_price': round(predicted_price, 6),
-            'expected_high': round(predicted_price + margin, 6),
-            'expected_low': round(predicted_price - margin, 6),
+            'predicted_price': prediction['predicted_price'],
+            'expected_high': prediction['expected_high'],
+            'expected_low': prediction['expected_low'],
             'confidence': prediction['confidence'],
             'direction': prediction['direction'],
             'volatility': round(volatility * 100, 2),
+            'walk_forward_accuracy': prediction['walk_forward_accuracy'],
+            'walk_forward_samples': prediction['walk_forward_samples'],
             'periods': periods
         }
     
@@ -312,7 +360,11 @@ class PredictionEngine:
         prediction = self.predict_next_price(prices, periods=5)
         
         if len(prices) < 10 or prediction['direction'] == 'NEUTRAL':
-            return self._no_trade_signal(prediction, prices, ['Modelos sin consenso suficiente'])
+            reasons = ['Modelos sin consenso suficiente']
+            if prediction.get('walk_forward_samples', 0) >= 8 and prediction.get('walk_forward_accuracy') is not None:
+                if prediction['walk_forward_accuracy'] < 0.50:
+                    reasons = ['El backtest direccional reciente no supera el 50% de aciertos']
+            return self._no_trade_signal(prediction, prices, reasons)
 
         current = float(prices[-1])
         predicted = prediction['predicted_price']
