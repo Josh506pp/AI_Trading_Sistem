@@ -2168,6 +2168,19 @@ DASHBOARD_HTML = """
             background: var(--surface-2);
             box-shadow: inset 0 0 0 1px rgba(255,215,0,0.08), 0 12px 40px rgba(0,0,0,0.5);
         }
+        .chart-tooltip {
+            position: absolute;
+            display: none;
+            z-index: 2;
+            padding: 8px 10px;
+            border: 1px solid rgba(212,175,55,0.55);
+            border-radius: 6px;
+            background: rgba(10,10,10,0.96);
+            color: #F5F5F5;
+            font: 12px 'SF Mono', Consolas, monospace;
+            pointer-events: none;
+            white-space: nowrap;
+        }
         .alert-list {
             max-height: 320px;
             overflow-y: auto;
@@ -2270,6 +2283,7 @@ DASHBOARD_HTML = """
             width: 100% !important;
             height: 100% !important;
             display: block;
+            cursor: crosshair;
         }
     </style>
 </head>
@@ -2306,6 +2320,7 @@ DASHBOARD_HTML = """
             </div>
             <div class="chart-container">
                 <canvas id="chart"></canvas>
+                <div id="chart-tooltip" class="chart-tooltip"></div>
             </div>
         </div>
 
@@ -2500,6 +2515,7 @@ DASHBOARD_HTML = """
 
     <script>
         let chart = null;
+        let chartHoverData = null;
         let currentSymbol = 'EURUSD';
         let currentDecimals = 4;
         const SYMBOL_DECIMALS = {
@@ -2569,6 +2585,11 @@ DASHBOARD_HTML = """
         function drawFallbackChart(dataPoints) {
             const canvas = document.getElementById('chart');
             if (!canvas || !canvas.parentElement) return;
+            if (!canvas.dataset.hoverBound) {
+                canvas.addEventListener('mousemove', showChartTooltip);
+                canvas.addEventListener('mouseleave', hideChartTooltip);
+                canvas.dataset.hoverBound = 'true';
+            }
             const bounds = canvas.parentElement.getBoundingClientRect();
             const width = Math.max(bounds.width, 320);
             const height = Math.max(bounds.height, 260);
@@ -2581,6 +2602,8 @@ DASHBOARD_HTML = """
             context.clearRect(0, 0, width, height);
 
             if (!dataPoints.length) {
+                chartHoverData = null;
+                hideChartTooltip();
                 context.fillStyle = '#A0A0A0';
                 context.font = '14px sans-serif';
                 context.textAlign = 'center';
@@ -2591,6 +2614,14 @@ DASHBOARD_HTML = """
             const padding = { top: 24, right: 76, bottom: 30, left: 16 };
             const plotWidth = width - padding.left - padding.right;
             const plotHeight = height - padding.top - padding.bottom;
+            chartHoverData = {
+                values: dataPoints.slice(),
+                left: padding.left,
+                right: padding.left + plotWidth,
+                top: padding.top,
+                bottom: padding.top + plotHeight,
+                plotWidth
+            };
             const low = Math.min(...dataPoints);
             const high = Math.max(...dataPoints);
             const range = high - low || Math.max(Math.abs(high) * 0.001, 0.000001);
@@ -2649,6 +2680,38 @@ DASHBOARD_HTML = """
             context.fillText('1', padding.left, height - 6);
             context.textAlign = 'right';
             context.fillText(String(dataPoints.length), width - padding.right, height - 6);
+        }
+
+        function showChartTooltip(event) {
+            const canvas = event.currentTarget;
+            const tooltip = document.getElementById('chart-tooltip');
+            if (!chartHoverData || !tooltip || chartHoverData.values.length === 0) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = event.clientY - rect.top;
+            if (x < chartHoverData.left || x > chartHoverData.right ||
+                y < chartHoverData.top || y > chartHoverData.bottom) {
+                hideChartTooltip();
+                return;
+            }
+
+            const relativeX = (x - chartHoverData.left) / chartHoverData.plotWidth;
+            const index = Math.round(relativeX * (chartHoverData.values.length - 1));
+            const price = chartHoverData.values[index];
+            tooltip.textContent = currentSymbol + ': ' + formatPrice(price, currentDecimals);
+            tooltip.style.display = 'block';
+
+            const containerRect = canvas.parentElement.getBoundingClientRect();
+            const left = event.clientX - containerRect.left + 12;
+            const top = event.clientY - containerRect.top - tooltip.offsetHeight - 8;
+            tooltip.style.left = Math.max(8, Math.min(left, containerRect.width - tooltip.offsetWidth - 8)) + 'px';
+            tooltip.style.top = Math.max(8, Math.min(top, containerRect.height - tooltip.offsetHeight - 8)) + 'px';
+        }
+
+        function hideChartTooltip() {
+            const tooltip = document.getElementById('chart-tooltip');
+            if (tooltip) tooltip.style.display = 'none';
         }
 
         function drawChart(chartData) {

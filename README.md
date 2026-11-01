@@ -89,6 +89,7 @@ python src/app.py
 - Ver gráfico con colores dinámicos (dorado subida, morado bajada)
 - Cambiar símbolo: EURUSD, XAUUSD, BTCUSD, etc.
 - Niveles de entrada, stop-loss y objetivo cuando hay una señal confirmada
+- Ver símbolo y precio del punto al pasar el cursor sobre el gráfico
 
 #### Análisis de IA
 - **Señal**: COMPRA/VENTA/ESPERA

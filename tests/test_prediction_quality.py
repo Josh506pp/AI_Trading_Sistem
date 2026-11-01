@@ -91,6 +91,8 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertIn('function drawFallbackChart(dataPoints)', DASHBOARD_HTML)
         self.assertIn('Esperando datos de mercado...', DASHBOARD_HTML)
         self.assertNotIn('cdn.jsdelivr.net/npm/chart.js', DASHBOARD_HTML)
+        self.assertIn('id="chart-tooltip"', DASHBOARD_HTML)
+        self.assertIn('function showChartTooltip(event)', DASHBOARD_HTML)
 
 
 if __name__ == '__main__':
