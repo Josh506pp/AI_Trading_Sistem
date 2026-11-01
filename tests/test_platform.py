@@ -17,6 +17,8 @@ if src_path not in sys.path:
 
 import unittest
 from datetime import datetime, timedelta
+import importlib
+from unittest.mock import patch
 
 # Import app and modules
 try:
@@ -29,33 +31,43 @@ except ImportError:
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
+app_module = importlib.import_module('src.app')
+
 
 class IsolatedDatabaseTestCase(unittest.TestCase):
-    def setUp(self):
-        self.app = app
-        self.original_database_uri = self.app.config['SQLALCHEMY_DATABASE_URI']
-        self.original_testing = self.app.config.get('TESTING', False)
-        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-        self.app.config['TESTING'] = True
-        self.test_engine = create_engine(
+    @classmethod
+    def setUpClass(cls):
+        app.config['TESTING'] = True
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        cls._test_engine = create_engine(
             'sqlite://',
             connect_args={'check_same_thread': False},
             poolclass=StaticPool
         )
+        with app.app_context():
+            cls._original_engine = db.engines[None]
+            db.engines[None] = cls._test_engine
+            db.create_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        with app.app_context():
+            db.session.remove()
+            db.drop_all()
+            db.engines[None] = cls._original_engine
+        cls._test_engine.dispose()
+
+    def setUp(self):
+        self.app = app
         request_counts.clear()
         with self.app.app_context():
-            self.original_engine = db.engines[None]
-            db.engines[None] = self.test_engine
-            db.create_all()
+            db.session.remove()
 
     def tearDown(self):
         with self.app.app_context():
             db.session.remove()
             db.drop_all()
-            db.engines[None] = self.original_engine
-        self.test_engine.dispose()
-        self.app.config['SQLALCHEMY_DATABASE_URI'] = self.original_database_uri
-        self.app.config['TESTING'] = self.original_testing
+            db.create_all()
 
 
 class TestAuthentication(IsolatedDatabaseTestCase):
@@ -99,7 +111,40 @@ class TestAuthentication(IsolatedDatabaseTestCase):
         data = response.get_json()
         self.assertFalse(data['success'])
         self.assertIn('ya está registrado', data['error'])
-    
+
+    def test_registration_rejects_sql_injection_shaped_username(self):
+        response = self.client.post('/api/auth/register', json={
+            'email': 'attack@example.com',
+            'username': "admin' OR '1'='1",
+            'password': 'password123'
+        })
+
+        self.assertEqual(response.status_code, 400)
+        with self.app.app_context():
+            self.assertIsNone(User.query.filter_by(email='attack@example.com').first())
+
+    def test_registration_requires_eight_character_password(self):
+        response = self.client.post('/api/auth/register', json={
+            'email': 'short@example.com',
+            'username': 'shortpass',
+            'password': '1234567'
+        })
+
+        self.assertEqual(response.status_code, 400)
+        with self.app.app_context():
+            self.assertIsNone(User.query.filter_by(email='short@example.com').first())
+
+    def test_registration_rejects_sql_injection_shaped_username(self):
+        response = self.client.post('/api/auth/register', json={
+            'email': 'attack@example.com',
+            'username': "admin' OR '1'='1",
+            'password': 'password123'
+        })
+
+        self.assertEqual(response.status_code, 400)
+        with self.app.app_context():
+            self.assertIsNone(User.query.filter_by(email='attack@example.com').first())
+
     def test_login_success(self):
         """Test login exitoso"""
         # Registrar
@@ -156,6 +201,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             self.user.set_password('password123')
             db.session.add(self.user)
             db.session.commit()
+            self.user_id = self.user.id
     
     def test_get_plans(self):
         """Test obtener planes disponibles"""
@@ -240,6 +286,139 @@ class TestSubscription(IsolatedDatabaseTestCase):
             resp_prem2 = c.get('/api/professional-analysis')
             self.assertEqual(resp_prem2.status_code, 200)
 
+    def test_free_plan_gets_cached_basic_analysis_but_no_chat_or_advanced_features(self):
+        with self.client:
+            login = self.client.post('/api/auth/login', json={
+                'email': 'test@example.com',
+                'password': 'password123'
+            })
+            self.assertEqual(login.status_code, 200)
+            analysis_key = (
+                self.user_id, app_module.TRADING_DATA['symbol'], 'FREE'
+            )
+            app_module._basic_analysis_cache.pop(analysis_key, None)
+
+            with patch.object(
+                app_module, 'analyze_signal', wraps=app_module.analyze_signal
+            ) as calculate:
+                first = self.client.get('/api/analysis')
+                second = self.client.get('/api/analysis')
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.get_json()['analysis_cache']['cooldown_seconds'], 900)
+            self.assertEqual(second.get_json()['analysis_cache']['status'], 'cached')
+            self.assertEqual(calculate.call_count, 1)
+            self.assertEqual(self.client.get('/api/advanced-prediction').status_code, 403)
+            self.assertEqual(self.client.get('/api/predict').status_code, 403)
+            self.assertEqual(self.client.get('/api/predict/levels').status_code, 403)
+            self.assertEqual(self.client.get('/api/predict/signal').status_code, 403)
+            self.assertEqual(self.client.post(
+                '/api/chat', json={'message': 'analiza el mercado'}
+            ).status_code, 403)
+            self.assertEqual(self.client.post(
+                '/api/chat/command', json={'command': '/status'}
+            ).status_code, 403)
+            self.assertEqual(self.client.get('/api/chat/history').status_code, 403)
+            self.assertEqual(self.client.get('/api/news-alerts').status_code, 403)
+            app_module._basic_analysis_cache.pop(analysis_key, None)
+
+    def test_paid_basic_analysis_uses_five_minute_cooldown(self):
+        symbol = app_module.TRADING_DATA['symbol']
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            user.upgrade_subscription('PRO')
+            db.session.commit()
+
+        cache_key = (self.user_id, symbol, 'PRO')
+        app_module._basic_analysis_cache.pop(cache_key, None)
+        client = self.app.test_client()
+        client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        response = client.get('/api/analysis')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['analysis_cache']['cooldown_seconds'], 300)
+        app_module._basic_analysis_cache.pop(cache_key, None)
+
+    def test_pro_plan_can_use_chat(self):
+        with self.client:
+            login = self.client.post('/api/auth/login', json={
+                'email': 'test@example.com',
+                'password': 'password123'
+            })
+            self.assertEqual(login.status_code, 200)
+            upgrade = self.client.post('/api/subscription/upgrade', json={'plan': 'PRO'})
+            self.assertEqual(upgrade.status_code, 200)
+            response = self.client.post('/api/chat', json={'message': 'precio'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+    def test_premium_professional_analysis_is_cached_for_five_minutes(self):
+        user_id = self.user_id
+        symbol = app_module.TRADING_DATA['symbol']
+        app_module._professional_analysis_cache.pop((user_id, symbol), None)
+        with self.app.app_context():
+            user = db.session.get(User, user_id)
+            user.upgrade_subscription('PREMIUM')
+            db.session.commit()
+
+        with self.client:
+            login = self.client.post('/api/auth/login', json={
+                'email': 'test@example.com',
+                'password': 'password123'
+            })
+            self.assertEqual(login.status_code, 200)
+            with patch.object(
+                app_module, 'analyze_signal', wraps=app_module.analyze_signal
+            ) as calculate:
+                first = self.client.get('/api/professional-analysis')
+                second = self.client.get('/api/professional-analysis')
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()['analysis_cache']['cooldown_seconds'], 300)
+        self.assertEqual(second.get_json()['analysis_cache']['status'], 'cached')
+        self.assertEqual(calculate.call_count, 1)
+        app_module._professional_analysis_cache.pop((user_id, symbol), None)
+
+    def test_chat_history_is_isolated_between_users(self):
+        with self.app.app_context():
+            other_user = User(
+                email='other@example.com',
+                username='othertrader',
+                subscription_plan='PRO',
+                subscription_status='active',
+                subscription_expires=datetime.utcnow() + timedelta(days=30)
+            )
+            other_user.set_password('password123')
+            db.session.add(other_user)
+            db.session.commit()
+            other_user_id = other_user.id
+
+        app_module.CHAT_HISTORY_BY_USER.pop(self.user_id, None)
+        app_module.CHAT_HISTORY_BY_USER.pop(other_user_id, None)
+        first_client = self.app.test_client()
+        second_client = self.app.test_client()
+        first_client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        first_client.post('/api/subscription/upgrade', json={'plan': 'PRO'})
+        second_client.post('/api/auth/login', json={
+            'email': 'other@example.com',
+            'password': 'password123'
+        })
+
+        first_response = first_client.post('/api/chat', json={'message': 'mi nota privada'})
+        second_history = second_client.get('/api/chat/history').get_json()['history']
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertNotIn('mi nota privada', str(second_history))
+        app_module.CHAT_HISTORY_BY_USER.pop(self.user_id, None)
+        app_module.CHAT_HISTORY_BY_USER.pop(other_user_id, None)
+
 
 class TestUserManagement(IsolatedDatabaseTestCase):
     """Tests para perfil, contraseñas y recuperación"""
@@ -307,6 +486,8 @@ class TestSecurity(unittest.TestCase):
         """Test validación de contraseña"""
         self.assertTrue(SecurityValidator.validate_password('password123'))
         self.assertFalse(SecurityValidator.validate_password('short'))  # muy corta
+        self.assertFalse(SecurityValidator.validate_password('1234567'))
+        self.assertFalse(SecurityValidator.validate_password(None))
     
     def test_symbol_validation(self):
         """Test validación de símbolo"""
@@ -315,6 +496,8 @@ class TestSecurity(unittest.TestCase):
         self.assertTrue(SecurityValidator.validate_symbol('US30'))
         self.assertFalse(SecurityValidator.validate_symbol('INVALID!'))
         self.assertFalse(SecurityValidator.validate_symbol('1234567890'))
+        self.assertFalse(SecurityValidator.validate_symbol('123'))
+        self.assertFalse(SecurityValidator.validate_symbol(None))
         self.assertFalse(SecurityValidator.validate_symbol('123'))
         self.assertFalse(SecurityValidator.validate_symbol(None))
     

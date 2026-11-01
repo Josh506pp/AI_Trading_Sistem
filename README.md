@@ -89,9 +89,11 @@ Para recibir ticks del bróker en lugar de las barras retrasadas de Yahoo:
 2. Instala el puente oficial en el mismo entorno Python: `pip install MetaTrader5`.
 3. Reinicia la aplicación. Intentará leer cotizaciones y velas de MT5; si el terminal, la sesión o el símbolo no están disponibles, usará Yahoo Finance como respaldo.
 
-La integración es de solo lectura y no envía órdenes. MT5 no aporta una cotización por sí solo: la rapidez y disponibilidad dependen del servidor del bróker y de que el terminal siga conectado.
+La integración MT5 lee cotizaciones y velas, pero no coloca ni modifica órdenes. La app permanece en modo simulación; no garantiza ganancias por operación ni un mínimo de USD 1.
 
 Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
+
+Los usuarios se registran desde `/register`; las contraseñas se guardan con hash y las consultas de la app usan SQLAlchemy ORM parametrizado. El plan FREE recibe análisis técnico básico cada 15 minutos, sin chat con IA, noticias PRO ni predicciones. PRO habilita chat y predicción avanzada cada cinco minutos; PREMIUM mantiene el análisis profesional cada cinco minutos y la predicción avanzada cada dos minutos.
 
 ### Funcionalidades
 
@@ -206,6 +208,16 @@ proyectos/
 - El consenso del modelo y el backtest son referencias históricas, no probabilidades ni garantías de resultados
 - Las estimaciones no incluyen costos de operación ni garantizan ganancias
 - La presión de compra/venta se estima de las velas OHLCV; no revela las posiciones ni órdenes de participantes institucionales
+
+## Contribuir y pruebas
+
+La suite automatizada activa se ejecuta con:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Los archivos `tests/diagnostic_*.py` son comprobaciones manuales de integraciones opcionales/legacy y no forman parte del descubrimiento de unittest.
 
 ## Seguridad
 

@@ -92,7 +92,7 @@ class TestMarketDataProvider(unittest.TestCase):
         }, index=[timestamp])
 
         with patch('src.market_data.yf.download', return_value=data) as download:
-            quote = MarketDataProvider().get_latest_quote('XAUUSD')
+            quote = MarketDataProvider(mt5_client=False).get_latest_quote('XAUUSD')
 
         self.assertEqual(quote, {
             'price': 3898.9,
@@ -113,7 +113,7 @@ class TestMarketDataProvider(unittest.TestCase):
 
     def test_latest_quote_returns_none_when_market_has_no_recent_data(self):
         with patch('src.market_data.yf.download', return_value=pd.DataFrame()):
-            quote = MarketDataProvider().get_latest_quote('XAUUSD')
+            quote = MarketDataProvider(mt5_client=False).get_latest_quote('XAUUSD')
 
         self.assertIsNone(quote)
 

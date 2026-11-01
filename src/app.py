@@ -164,10 +164,17 @@ TRADING_DATA = {
     'auto_enabled': False,
     'use_prediction': True,
     'signal': {'action': 'HOLD', 'confidence': 0.0},
-    'chat_history': [{'sender': 'IA', 'text': 'Hola! Bienvenido al sistema de trading. Soy tu asistente de IA.'}],
     'alerts': [],
     'news': []
 }
+CHAT_HISTORY_BY_USER = {}
+
+
+def get_chat_history(user_id):
+    return CHAT_HISTORY_BY_USER.setdefault(
+        user_id,
+        [{'sender': 'IA', 'text': 'Hola! Bienvenido al sistema de trading. Soy tu asistente de IA.'}]
+    )
 
 # Configuración de alertas de volatilidad
 ALERT_CONFIG = {
@@ -612,19 +619,146 @@ def analyze_signal(prices, symbol=None):
 
 
 PREDICTION_COOLDOWN_SECONDS = 15
+FREE_ANALYSIS_COOLDOWN_SECONDS = 900
+PAID_ANALYSIS_COOLDOWN_SECONDS = 300
 PREDICTION_HORIZON_MINUTES = 15
+PREMIUM_ANALYSIS_COOLDOWN_SECONDS = 300
 ADVANCED_PREDICTION_COOLDOWN_SECONDS = {'PRO': 300, 'PREMIUM': 120}
 _prediction_cache = {}
 _prediction_cache_lock = threading.Lock()
 _advanced_prediction_cache = {}
 _advanced_prediction_cache_lock = threading.Lock()
+_user_prediction_cache = {}
+_user_prediction_cache_lock = threading.Lock()
+_basic_analysis_cache = {}
+_basic_analysis_cache_lock = threading.Lock()
+_professional_analysis_cache = {}
+_professional_analysis_cache_lock = threading.Lock()
 
 
-def get_cached_advanced_prediction(plan, symbol, calculate):
+def get_cached_analysis(user_id, symbol, prices, plan='FREE'):
+    """Cachea el análisis básico usando la cuota de refresco del plan."""
+    cache_key = (user_id, symbol, plan)
+    cooldown = (
+        FREE_ANALYSIS_COOLDOWN_SECONDS
+        if plan == 'FREE'
+        else PAID_ANALYSIS_COOLDOWN_SECONDS
+    )
+    now = time.monotonic()
+    with _basic_analysis_cache_lock:
+        cached = _basic_analysis_cache.get(cache_key)
+        if cached and now - cached['created_at'] < cooldown:
+            result = copy.deepcopy(cached['result'])
+            result['analysis_cache'] = {
+                'status': 'cached',
+                'cooldown_seconds': cooldown,
+                'remaining_seconds': max(
+                    0, math.ceil(cooldown - (now - cached['created_at']))
+                ),
+                'calculated_at': cached['calculated_at']
+            }
+            return result
+
+        analysis = analyze_signal(prices, symbol)
+        calculated_at = datetime.utcnow().isoformat() + 'Z'
+        response = {
+            'success': True,
+            'available': True,
+            'symbol': symbol,
+            'signal': analysis['action'],
+            'confidence': analysis['confidence'],
+            'confidence_percent': round(analysis['confidence'] * 100, 1),
+            'pattern': analysis['trend'],
+            'volatility': (
+                'ALTA' if analysis['atr'] / max(abs(prices[-1]), 1e-12) >= 0.001
+                else 'BAJA'
+            ) if prices else 'SIN DATOS',
+            'learning_progress': 0.0,
+            'indicators': {
+                'rsi': round(analysis['rsi'], 2),
+                'trend': analysis['trend'],
+                'momentum': 'FUERTE' if abs(prices[-1] - prices[-5]) > 0.002 else 'DÉBIL',
+                'bb_range': analysis['bb'],
+                'macd_histogram': round(analysis['macd'], 6)
+            },
+            'analysis_cache': {
+                'status': 'calculated',
+                'cooldown_seconds': cooldown,
+                'remaining_seconds': cooldown,
+                'calculated_at': calculated_at
+            }
+        }
+        _basic_analysis_cache[cache_key] = {
+            'created_at': now,
+            'calculated_at': calculated_at,
+            'result': copy.deepcopy(response)
+        }
+        return response
+
+
+def get_cached_professional_analysis(user_id, symbol, calculate):
+    """Cachea el análisis PREMIUM por usuario durante el cooldown de cinco minutos."""
+    cache_key = (user_id, symbol)
+    now = time.monotonic()
+    cooldown = PREMIUM_ANALYSIS_COOLDOWN_SECONDS
+    with _professional_analysis_cache_lock:
+        cached = _professional_analysis_cache.get(cache_key)
+        if cached and now - cached['created_at'] < cooldown:
+            response = copy.deepcopy(cached['response'])
+            response['analysis_cache'] = {
+                'status': 'cached',
+                'cooldown_seconds': cooldown,
+                'remaining_seconds': max(
+                    0, math.ceil(cooldown - (now - cached['created_at']))
+                ),
+                'calculated_at': cached['calculated_at']
+            }
+            return response
+
+        response = calculate()
+        calculated_at = datetime.utcnow().isoformat() + 'Z'
+        response['analysis_cache'] = {
+            'status': 'calculated',
+            'cooldown_seconds': cooldown,
+            'remaining_seconds': cooldown,
+            'calculated_at': calculated_at
+        }
+        _professional_analysis_cache[cache_key] = {
+            'created_at': now,
+            'calculated_at': calculated_at,
+            'response': copy.deepcopy(response)
+        }
+        return response
+
+
+def get_cached_user_prediction(user, symbol, prices, periods=PREDICTION_HORIZON_MINUTES):
+    cooldown = PREDICTION_COOLDOWN_SECONDS
+    cache_key = (user.id, symbol, periods)
+    now = time.monotonic()
+    with _user_prediction_cache_lock:
+        cached = _user_prediction_cache.get(cache_key)
+        if cached and now - cached['created_at'] < cooldown:
+            result = copy.deepcopy(cached['result'])
+            result['cache_status'] = 'cached'
+            result['cooldown_seconds'] = max(
+                0, math.ceil(cooldown - (now - cached['created_at']))
+            )
+            return result
+
+        result = build_prediction_signal(prices, symbol, periods)
+        result['cooldown_seconds'] = cooldown
+        _user_prediction_cache[cache_key] = {
+            'created_at': time.monotonic(),
+            'result': copy.deepcopy(result)
+        }
+        return result
+
+
+def get_cached_advanced_prediction(plan, symbol, calculate, user_id=None):
     """Cachea el análisis avanzado según el cooldown propio de cada plan."""
     plan = plan if plan in ADVANCED_PREDICTION_COOLDOWN_SECONDS else 'PRO'
     cooldown = ADVANCED_PREDICTION_COOLDOWN_SECONDS[plan]
-    cache_key = (plan, symbol)
+    cache_key = (user_id, plan, symbol)
     now = time.monotonic()
 
     with _advanced_prediction_cache_lock:
@@ -688,8 +822,17 @@ def invalidate_prediction_cache(symbol):
         for cache_key in [key for key in _prediction_cache if key[0] == symbol]:
             _prediction_cache.pop(cache_key, None)
     with _advanced_prediction_cache_lock:
-        for cache_key in [key for key in _advanced_prediction_cache if key[1] == symbol]:
+        for cache_key in [key for key in _advanced_prediction_cache if key[2] == symbol]:
             _advanced_prediction_cache.pop(cache_key, None)
+    with _user_prediction_cache_lock:
+        for cache_key in [key for key in _user_prediction_cache if key[1] == symbol]:
+            _user_prediction_cache.pop(cache_key, None)
+    with _basic_analysis_cache_lock:
+        for cache_key in [key for key in _basic_analysis_cache if key[1] == symbol]:
+            _basic_analysis_cache.pop(cache_key, None)
+    with _professional_analysis_cache_lock:
+        for cache_key in [key for key in _professional_analysis_cache if key[1] == symbol]:
+            _professional_analysis_cache.pop(cache_key, None)
 
 
 def _build_prediction_signal_uncached(prices, periods):
@@ -937,21 +1080,31 @@ def api_register():
     if not DB_AVAILABLE:
         return jsonify({'success': False, 'error': 'Sistema de usuarios no disponible'}), 503
     
-    data = request.get_json() or {}
-    email = data.get('email', '').strip().lower()
-    username = data.get('username', '').strip()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'error': 'Datos de registro no válidos'}), 400
+    email = data.get('email', '')
+    username = data.get('username', '')
     password = data.get('password', '')
-    full_name = data.get('full_name', '').strip()
+    full_name = data.get('full_name', '')
+    if not all(isinstance(value, str) for value in (email, username, password, full_name)):
+        return jsonify({'success': False, 'error': 'Datos de registro no válidos'}), 400
+    email = email.strip().lower()
+    username = username.strip()
+    full_name = SecurityValidator.sanitize_string(full_name.strip(), 255)
     
     # Validaciones
     if not email or not username or not password:
         return jsonify({'success': False, 'error': 'Email, usuario y contraseña requeridos'}), 400
-    
-    if len(password) < 6:
-        return jsonify({'success': False, 'error': 'Contraseña debe tener al menos 6 caracteres'}), 400
-    
-    if len(username) < 3:
-        return jsonify({'success': False, 'error': 'Usuario debe tener al menos 3 caracteres'}), 400
+
+    if not SecurityValidator.validate_email(email):
+        return jsonify({'success': False, 'error': 'Email no válido'}), 400
+
+    if not SecurityValidator.validate_username(username):
+        return jsonify({'success': False, 'error': 'Usuario no válido'}), 400
+
+    if len(password) < 8:
+        return jsonify({'success': False, 'error': 'Contraseña debe tener al menos 8 caracteres'}), 400
     
     # Verificar si existe
     if User.query.filter_by(email=email).first():
@@ -1007,9 +1160,14 @@ def api_login():
     if not DB_AVAILABLE:
         return jsonify({'success': False, 'error': 'Sistema de usuarios no disponible'}), 503
     
-    data = request.get_json() or {}
-    email_or_user = data.get('email') or data.get('username', '').strip()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'error': 'Datos de acceso no válidos'}), 400
+    email_or_user = data.get('email') or data.get('username', '')
     password = data.get('password', '')
+    if not isinstance(email_or_user, str) or not isinstance(password, str):
+        return jsonify({'success': False, 'error': 'Datos de acceso no válidos'}), 400
+    email_or_user = email_or_user.strip()
     
     if not email_or_user or not password:
         return jsonify({'success': False, 'error': 'Email/usuario y contraseña requeridos'}), 400
@@ -1132,8 +1290,8 @@ def api_change_password():
     if not user.check_password(current_password):
         return jsonify({'success': False, 'error': 'La contraseña actual es incorrecta'}), 401
         
-    if len(new_password) < 6:
-        return jsonify({'success': False, 'error': 'La nueva contraseña debe tener al menos 6 caracteres'}), 400
+    if not SecurityValidator.validate_password(new_password):
+        return jsonify({'success': False, 'error': 'La nueva contraseña debe tener al menos 8 caracteres'}), 400
         
     try:
         user.set_password(new_password)
@@ -1198,8 +1356,8 @@ def api_reset_password():
     if not token_str or not new_password:
         return jsonify({'success': False, 'error': 'Token y nueva contraseña requeridos'}), 400
         
-    if len(new_password) < 6:
-        return jsonify({'success': False, 'error': 'La contraseña debe tener al menos 6 caracteres'}), 400
+    if not SecurityValidator.validate_password(new_password):
+        return jsonify({'success': False, 'error': 'La contraseña debe tener al menos 8 caracteres'}), 400
         
     try:
         reset_token = PasswordResetToken.query.filter_by(token=token_str).first()
@@ -1505,6 +1663,12 @@ def view_login():
 @app.route('/register', methods=['GET', 'POST'])
 def view_register():
     """Vista de registro de usuario"""
+    if not DB_AVAILABLE:
+        return render_template_string(
+            REGISTER_HTML,
+            error='Registro no disponible: revisa la base de datos.'
+        ), 503
+
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         username = request.form.get('username', '').strip()
@@ -1513,6 +1677,14 @@ def view_register():
         
         if not email or not username or not password:
             return render_template_string(REGISTER_HTML, error='Campos requeridos incompletos')
+
+        if not SecurityValidator.validate_email(email):
+            return render_template_string(REGISTER_HTML, error='Email no válido')
+        if not SecurityValidator.validate_username(username):
+            return render_template_string(REGISTER_HTML, error='Usuario no válido')
+        if len(password) < 8:
+            return render_template_string(REGISTER_HTML, error='La contraseña debe tener al menos 8 caracteres')
+        full_name = SecurityValidator.sanitize_string(full_name, 255)
             
         if User.query.filter_by(email=email).first():
             return render_template_string(REGISTER_HTML, error='El email ya está registrado')
@@ -1576,8 +1748,7 @@ def api_status():
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
             'prices': TRADING_DATA['price_history'][-30:],
-            'chart_prices': chart_prices,
-            'chat_history': TRADING_DATA['chat_history'][-20:]
+            'chart_prices': chart_prices
         }
 
     status['candles'] = [
@@ -1598,6 +1769,7 @@ def api_symbols():
 
 
 @app.route('/api/symbol', methods=['POST'])
+@login_required
 def api_set_symbol():
     """Cambia el símbolo activo."""
     global TRADING_SYMBOL, DEFAULT_VOLUME
@@ -1621,8 +1793,6 @@ def api_set_symbol():
                     DEFAULT_VOLUME = vol
             except Exception:
                 pass
-        msg = f'Símbolo cambiado a {symbol}, volumen {TRADING_DATA["volume"]}'
-        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
         return jsonify({'success': True, 'symbol': symbol, 'volume': TRADING_DATA['volume'], 'price': TRADING_DATA['price']})
 
 
@@ -1695,7 +1865,9 @@ def api_advanced_prediction():
         }
 
     plan = request.user.subscription_plan
-    result = get_cached_advanced_prediction(plan, symbol, calculate_advanced_prediction)
+    result = get_cached_advanced_prediction(
+        plan, symbol, calculate_advanced_prediction, request.user.id
+    )
     return jsonify(result)
 
 
@@ -1703,29 +1875,34 @@ def api_advanced_prediction():
 @login_required
 @check_subscription('PREMIUM')
 def api_professional_analysis():
-    """Análisis profesional inteligente con indicadores técnicos avanzados y aprendizaje"""
+    """Análisis profesional con cooldown server-side de cinco minutos."""
+    user_id = request.user.id
     with PRICE_LOCK:
-        prices = TRADING_DATA['price_history']
-        
+        prices = list(TRADING_DATA['price_history'])
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+        current_price = TRADING_DATA['price']
+        learning_pct = min(100.0, AI_LEARNING_DB['learning_score'] * 10)
+        successful_trades = len([
+            trade for trade in AI_LEARNING_DB['trade_history']
+            if trade.get('pl', 0) > 0
+        ])
+        total_trades = len(AI_LEARNING_DB['trade_history'])
+
+    def calculate_professional_analysis():
         if len(prices) < 20:
-            return jsonify({
+            return {
                 'available': False,
                 'reason': 'Insuficientes datos históricos (se necesitan 20+ precios)',
-                'learning_progress': 0.0
-            })
-        
-        # Análisis inteligente
-        analysis = analyze_signal(prices)
-        trade = build_prediction_signal(prices, TRADING_DATA.get('symbol', DEFAULT_SYMBOL))
-        
-        # Calcular indicadores avanzados
-        rsi = analysis['rsi']
-        learning_pct = min(100.0, AI_LEARNING_DB['learning_score'] * 10)
-        
-        volatility = 'ALTA' if abs(prices[-1] - prices[-5]) > 0.002 else 'BAJA'
-        return jsonify({
+                'learning_progress': 0.0,
+                'symbol': symbol
+            }
+
+        analysis = analyze_signal(prices, symbol)
+        trade = build_prediction_signal(prices, symbol)
+        return {
             'available': True,
-            'current_price': TRADING_DATA['price'],
+            'symbol': symbol,
+            'current_price': current_price,
             'signal': trade['signal'],
             'confidence': trade['confidence'],
             'confidence_percent': round(trade['confidence'] * 100, 1),
@@ -1733,35 +1910,47 @@ def api_professional_analysis():
             'risk_reward': trade['risk_reward'],
             'signal_reasons': trade['reasons'],
             'learning_progress': learning_pct,
-            'prediction_cache': {
-                'status': trade['cache_status'],
-                'cooldown_seconds': trade['cooldown_seconds'],
-                'calculated_at': trade['calculated_at']
-            },
             'indicators': {
-                'rsi': round(rsi, 2),
+                'rsi': round(analysis['rsi'], 2),
                 'trend': analysis['trend'],
                 'momentum': 'FUERTE' if abs(prices[-1] - prices[-5]) > 0.002 else 'DÉBIL',
                 'bb_range': analysis['bb'],
                 'macd_histogram': round(analysis['macd'], 6)
             },
-            'volatility': volatility,
+            'volatility': 'ALTA' if analysis['atr'] > 0 else 'SIN DATOS',
             'pattern': analysis['trend'],
-            'successful_trades': len([t for t in AI_LEARNING_DB['trade_history'] if t.get('pl', 0) > 0]),
-            'total_trades': len(AI_LEARNING_DB['trade_history']),
+            'successful_trades': successful_trades,
+            'total_trades': total_trades,
             'timestamp': datetime.now().isoformat()
-        })
+        }
+
+    return jsonify(get_cached_professional_analysis(
+        user_id, symbol, calculate_professional_analysis
+    ))
+
+
+@app.route('/api/analysis')
+@login_required
+def api_basic_analysis():
+    """FREE: análisis técnico básico cada 15 min; planes pagos: cada 5 min."""
+    with PRICE_LOCK:
+        prices = list(TRADING_DATA['price_history'])
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+    return jsonify(get_cached_analysis(
+        request.user.id, symbol, prices, request.user.subscription_plan
+    ))
 
 
 @app.route('/api/predict')
 @login_required
+@check_subscription('PRO')
 def api_predict():
     """Predicción de precio futuro y dirección usando PredictionEngine."""
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
             symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
-            trade = build_prediction_signal(prices, symbol)
+            trade = get_cached_user_prediction(request.user, symbol, list(prices))
             pred = trade['prediction']
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -1782,13 +1971,16 @@ def api_predict():
 
 @app.route('/api/predict/levels')
 @login_required
+@check_subscription('PRO')
 def api_predict_levels():
     """Devuelve niveles clave (soportes/resistencias, entry, SL, TP)."""
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            trade = build_prediction_signal(
-                prices, TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+            trade = get_cached_user_prediction(
+                request.user,
+                TRADING_DATA.get('symbol', DEFAULT_SYMBOL),
+                list(prices)
             )
             levels = trade['levels']
         except Exception as e:
@@ -1806,13 +1998,16 @@ def api_predict_levels():
 
 @app.route('/api/predict/signal')
 @login_required
+@check_subscription('PRO')
 def api_predict_signal():
     """Combina predicción y indicadores para una señal operativa recomendada."""
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            signal = build_prediction_signal(
-                prices, TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+            signal = get_cached_user_prediction(
+                request.user,
+                TRADING_DATA.get('symbol', DEFAULT_SYMBOL),
+                list(prices)
             )
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -1829,35 +2024,49 @@ def api_predict_signal():
 
 @app.route('/api/chat', methods=['POST'])
 @login_required
+@check_subscription('PRO')
 def api_chat():
     """Procesar mensajes del chat"""
-    data = request.get_json()
-    message = data.get('message', '').strip().lower()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or not isinstance(data.get('message'), str):
+        return jsonify({'success': False, 'error': 'Mensaje no válido'}), 400
+    original_message = data['message'].strip()
+    if not original_message or len(original_message) > 2000:
+        return jsonify({
+            'success': False,
+            'error': 'El mensaje debe tener entre 1 y 2000 caracteres'
+        }), 400
+    message = original_message.lower()
     
     response = process_chat_message(message)
     
     with PRICE_LOCK:
-        TRADING_DATA['chat_history'].append({'sender': 'Yo', 'text': data.get('message', '')})
-        TRADING_DATA['chat_history'].append({'sender': 'IA', 'text': response})
+        history = get_chat_history(request.user.id)
+        history.append({'sender': 'Yo', 'text': original_message})
+        history.append({'sender': 'IA', 'text': response})
     
-    return jsonify({'response': response})
+    return jsonify({'success': True, 'response': response})
 
 
 @app.route('/api/chat/command', methods=['POST'])
+@login_required
+@check_subscription('PRO')
 def api_chat_command():
     """Procesar comando de chat"""
-    data = request.get_json()
-    if not data or 'command' not in data:
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or not isinstance(data.get('command'), str):
         return jsonify({'error': 'Missing command'}), 400
     
     command = data['command'].strip()
+    if not command or len(command) > 2000:
+        return jsonify({'error': 'Command must be between 1 and 2000 characters'}), 400
     
     # Procesar comando
     response = process_chat_message(command.lower())
     
     # Agregar al historial
     with PRICE_LOCK:
-        TRADING_DATA['chat_history'].append({
+        get_chat_history(request.user.id).append({
             'timestamp': datetime.now().isoformat(),
             'command': command,
             'response': response
@@ -1867,11 +2076,13 @@ def api_chat_command():
 
 
 @app.route('/api/chat/history')
+@login_required
+@check_subscription('PRO')
 def api_chat_history():
     """Obtener historial de chat"""
     with PRICE_LOCK:
         return jsonify({
-            'history': TRADING_DATA['chat_history']
+            'history': list(get_chat_history(request.user.id))
         })
 
 
@@ -2034,7 +2245,7 @@ LOGIN_HTML = """
             <div id="forgot-step-2" style="display:none; margin-top:15px;">
                 <p style="font-size:12px; color:var(--gold); margin-bottom:10px;" id="forgot-msg"></p>
                 <input id="reset-token-input" type="text" placeholder="Token de recuperación" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:10px;">
-                <input id="reset-new-pass" type="password" placeholder="Nueva Contraseña" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:12px;">
+                <input id="reset-new-pass" type="password" placeholder="Nueva Contraseña (mínimo 8 caracteres)" minlength="8" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:12px;">
                 <button onclick="submitResetPassword()" style="width:100%;">Restablecer Contraseña</button>
             </div>
             <button onclick="closeForgotModal()" style="background:transparent; color:var(--text-dim); border:1px solid var(--text-dim); margin-top:12px; width:100%;">Cancelar</button>
@@ -2180,7 +2391,7 @@ REGISTER_HTML = """
             </div>
             <div class="form-group">
                 <label>Contraseña *</label>
-                <input type="password" name="password" placeholder="Mínimo 6 caracteres" required>
+                <input type="password" name="password" placeholder="Mínimo 8 caracteres" required minlength="8">
             </div>
             <button type="submit">Registrarme</button>
         </form>
@@ -2560,6 +2771,11 @@ DASHBOARD_HTML = """
 
         <div class="card">
             <h3>Predicciones y Niveles</h3>
+            <div id="predictions-plan-locked" style="display:none; color:var(--text-dim);">
+                Las predicciones están disponibles desde el plan PRO.
+                <button class="btn btn-purple" onclick="openPlansModal()" style="margin-left:8px;">Ver planes</button>
+            </div>
+            <div id="predictions-content">
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción (máx. 15 min):</strong> <span id="pred-direction">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Consenso de modelos:</strong> <span id="pred-confidence">-</span></div>
@@ -2569,12 +2785,17 @@ DASHBOARD_HTML = """
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: var(--gold); margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: var(--gold); margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Filtro:</strong> <span id="pred-reasons">Calculando...</span></div>
             <small style="color:var(--text-dim);">Filtro mínimo 2:1. Las estimaciones no incluyen costos ni garantizan ganancias.</small>
+            </div>
         </div>
 
 
 
         <div class="card">
             <h3>Predicción Avanzada de IA</h3>
+            <div id="advanced-plan-locked" style="display:none; color:var(--text-dim); margin-bottom:12px;">
+                La predicción avanzada requiere plan PRO o PREMIUM.
+                <button class="btn btn-purple" onclick="openPlansModal()" style="margin-left:8px;">Ver planes</button>
+            </div>
             <div style="margin-bottom: 16px;">
                 <button class="btn btn-purple" id="adv-btn" onclick="loadAdvancedPrediction()">Calcular Predicción Avanzada</button>
                 <span id="adv-loading" style="display:none; margin-left:12px; color:var(--purple); font-size:13px;">Calculando...</span>
@@ -2600,6 +2821,11 @@ DASHBOARD_HTML = """
 
         <div class="card">
             <h3>Noticias y Alertas de Volatilidad</h3>
+            <div id="news-plan-locked" style="display:none; color:var(--text-dim);">
+                Alertas de volatilidad y noticias están disponibles desde el plan PRO.
+                <button class="btn btn-purple" onclick="openPlansModal()" style="margin-left:8px;">Ver planes</button>
+            </div>
+            <div id="news-content">
             <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;">
                 <button class="btn btn-purple" id="news-btn" onclick="loadNewsAlerts()">Actualizar Noticias/Alertas</button>
                 <span id="news-loading" style="display:none; color:var(--purple); font-size:13px; align-self:center;">Cargando...</span>
@@ -2613,6 +2839,7 @@ DASHBOARD_HTML = """
                             <div class="alert-meta">Ahora</div>
                             <div class="alert-msg">Se monitorean movimientos bruscos, ATR elevado y oportunidades de entrada.</div>
                         </div>
+                    </div>
                     </div>
                 </div>
                 <div>
@@ -2640,12 +2867,18 @@ DASHBOARD_HTML = """
 
 
 
-        <div class="card">
+        <div class="card" id="chat-card">
             <h3>Asistente de IA</h3>
-            <div id="chat-box" style="height: 240px; overflow-y: auto; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 15px; color: var(--text-dim);"></div>
-            <div style="display: flex; gap: 10px;">
-                <input id="chat-input" type="text" placeholder="Escribe un comando o pregunta..." style="flex: 1; padding: 12px; background: #0d0d0d; border: 1px solid var(--gold); border-radius: 8px; color: var(--text); font-size: 14px;" />
-                <button class="btn" onclick="sendChat()">Enviar</button>
+            <div id="chat-plan-locked" style="display:none; color:var(--text-dim);">
+                El chat con la IA está disponible desde el plan PRO.
+                <button class="btn btn-purple" onclick="openPlansModal()" style="margin-left:8px;">Ver planes</button>
+            </div>
+            <div id="chat-content">
+                <div id="chat-box" style="height: 240px; overflow-y: auto; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 15px; color: var(--text-dim);"></div>
+                <div style="display: flex; gap: 10px;">
+                    <input id="chat-input" type="text" placeholder="Escribe un comando o pregunta..." style="flex: 1; padding: 12px; background: #0d0d0d; border: 1px solid var(--gold); border-radius: 8px; color: var(--text); font-size: 14px;" />
+                    <button class="btn" onclick="sendChat()">Enviar</button>
+                </div>
             </div>
         </div>
     </div>
@@ -2666,7 +2899,9 @@ DASHBOARD_HTML = """
                     <ul style="text-align:left; font-size:13px; color:var(--text-dim); margin-bottom:20px; list-style:none; line-height:1.8;">
                         <li>✓ Precios en tiempo real</li>
                         <li>✓ Gráficos y datos reales</li>
-                        <li>✓ Predicciones básicas</li>
+                        <li>✓ Análisis técnico básico cada 15 minutos</li>
+                        <li>✗ Chat con IA</li>
+                        <li>✗ Predicciones</li>
                         <li>✗ Predicción Avanzada (PRO)</li>
                         <li>✗ Análisis Profesional (PREMIUM)</li>
                     </ul>
@@ -2678,7 +2913,9 @@ DASHBOARD_HTML = """
                     <div style="font-size:28px; font-weight:700; color:var(--gold); margin-bottom:15px;">$9.99 <span style="font-size:13px; color:var(--text-dim);">/mes</span></div>
                     <ul style="text-align:left; font-size:13px; color:var(--text-dim); margin-bottom:20px; list-style:none; line-height:1.8;">
                         <li>✓ Todo de FREE</li>
-                        <li>✓ Predicciones Avanzadas</li>
+                        <li>✓ Análisis cada 5 minutos</li>
+                        <li>✓ Predicción Avanzada (cooldown 5 min)</li>
+                        <li>✓ Chat con IA</li>
                         <li>✓ Alertas de Volatilidad</li>
                         <li>✓ Indicadores RSI, MACD, BB</li>
                         <li>✗ Análisis Profesional</li>
@@ -2691,10 +2928,10 @@ DASHBOARD_HTML = """
                     <div style="font-size:28px; font-weight:700; color:var(--gold); margin-bottom:15px;">$19.99 <span style="font-size:13px; color:var(--text-dim);">/mes</span></div>
                     <ul style="text-align:left; font-size:13px; color:var(--text-dim); margin-bottom:20px; list-style:none; line-height:1.8;">
                         <li>✓ Todo de PRO</li>
-                        <li>✓ Análisis Profesional IA</li>
+                        <li>✓ Análisis Profesional IA (cooldown 5 min)</li>
+                        <li>✓ Chat con IA</li>
                         <li>✓ Acceso Prioritario</li>
                         <li>✓ Soporte 24/7</li>
-                        <li>✓ Máxima precisión</li>
                     </ul>
                     <button onclick="changePlan('PREMIUM')" class="btn" style="width:100%; margin:0; background:var(--gold); color:#000;">Mejorar a PREMIUM</button>
                 </div>
@@ -2734,7 +2971,7 @@ DASHBOARD_HTML = """
                 <h4 style="color:var(--text); font-size:13px; margin-bottom:8px;">Cambiar Contraseña</h4>
                 <div style="margin-bottom:10px;">
                     <input id="pass-current" type="password" placeholder="Contraseña Actual" style="width:100%; padding:8px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:8px;">
-                    <input id="pass-new" type="password" placeholder="Nueva Contraseña (mín 6 car.)" style="width:100%; padding:8px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px;">
+                    <input id="pass-new" type="password" placeholder="Nueva Contraseña (mín 8 car.)" minlength="8" style="width:100%; padding:8px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px;">
                 </div>
                 <button onclick="changePassword()" class="btn btn-purple" style="width:100%; margin:0;">Actualizar Contraseña</button>
             </div>
@@ -2746,7 +2983,10 @@ DASHBOARD_HTML = """
         let chartHoverData = null;
         let currentSymbol = 'EURUSD';
         let currentDecimals = 4;
+        let currentSubscriptionPlan = 'FREE';
         const PREDICTION_COOLDOWN_MS = 15000;
+        const BASIC_ANALYSIS_COOLDOWN_MS = 300000;
+        const FREE_ANALYSIS_COOLDOWN_MS = 900000;
         const PREDICTION_HORIZON_MINUTES = 15;
         let lastPredictionRequestAt = 0;
         let predictionRequestInFlight = false;
@@ -2802,9 +3042,9 @@ DASHBOARD_HTML = """
                     updateLiquidityUI(d.liquidity || {});
                     
                     // Actualizar otros elementos
-                    try {
+                    if (currentSubscriptionPlan === 'PRO' || currentSubscriptionPlan === 'PREMIUM') {
                         loadChat();
-                    } catch (e) { console.error('Error en loadChat:', e); }
+                    }
                     
                     try {
                         loadSymbols();
@@ -3142,7 +3382,7 @@ DASHBOARD_HTML = """
         }
 
         function loadCurrentUser() {
-            fetch('/api/auth/me')
+            return fetch('/api/auth/me')
                 .then(r => {
                     if (r.status === 401) {
                         window.location.href = '/login';
@@ -3153,12 +3393,43 @@ DASHBOARD_HTML = """
                 .then(d => {
                     if (!d || !d.success) return;
                     const u = d.user;
+                    const previousPlan = currentSubscriptionPlan;
+                    currentSubscriptionPlan = u.subscription_plan || 'FREE';
+                    if (previousPlan !== currentSubscriptionPlan) {
+                        lastPredictionRequestAt = 0;
+                        lastAIRequestAt = 0;
+                    }
                     document.getElementById('nav-user-name').textContent = 'Usuario: ' + (u.full_name || u.username);
-                    document.getElementById('nav-plan-badge').textContent = 'Plan: ' + u.subscription_plan;
+                    document.getElementById('nav-plan-badge').textContent = 'Plan: ' + currentSubscriptionPlan;
+                    applyPlanFeatureAccess();
                     if (document.getElementById('profile-fullname')) {
                         document.getElementById('profile-fullname').value = u.full_name || '';
                     }
-                });
+                    return u;
+                })
+                .catch(e => console.error('Error cargando usuario:', e));
+        }
+
+        function applyPlanFeatureAccess() {
+            const canUseChat = currentSubscriptionPlan === 'PRO' || currentSubscriptionPlan === 'PREMIUM';
+            const chatContent = document.getElementById('chat-content');
+            const chatLocked = document.getElementById('chat-plan-locked');
+            const predictionsContent = document.getElementById('predictions-content');
+            const predictionsLocked = document.getElementById('predictions-plan-locked');
+            const newsContent = document.getElementById('news-content');
+            const newsLocked = document.getElementById('news-plan-locked');
+            const advancedButton = document.getElementById('adv-btn');
+            const advancedLocked = document.getElementById('advanced-plan-locked');
+            const advancedGrid = document.getElementById('adv-grid');
+            if (predictionsContent) predictionsContent.style.display = canUseChat ? '' : 'none';
+            if (predictionsLocked) predictionsLocked.style.display = canUseChat ? 'none' : 'block';
+            if (newsContent) newsContent.style.display = canUseChat ? '' : 'none';
+            if (newsLocked) newsLocked.style.display = canUseChat ? 'none' : 'block';
+            if (chatContent) chatContent.style.display = canUseChat ? '' : 'none';
+            if (chatLocked) chatLocked.style.display = canUseChat ? 'none' : 'block';
+            if (advancedButton) advancedButton.style.display = canUseChat ? '' : 'none';
+            if (advancedLocked) advancedLocked.style.display = canUseChat ? 'none' : 'block';
+            if (advancedGrid) advancedGrid.style.display = canUseChat ? 'grid' : 'none';
         }
 
         function openPlansModal() {
@@ -3196,7 +3467,7 @@ DASHBOARD_HTML = """
                 .then(d => {
                     if (d.success) {
                         alert(d.message);
-                        loadCurrentUser();
+                        loadCurrentUser().then(() => update());
                         loadBillingHistory();
                     } else {
                         alert(d.error || 'Error cambiando plan');
@@ -3211,7 +3482,7 @@ DASHBOARD_HTML = """
                 .then(d => {
                     if (d.success) {
                         alert(d.message);
-                        loadCurrentUser();
+                        loadCurrentUser().then(() => update());
                         loadBillingHistory();
                     } else {
                         alert(d.error || 'Error cancelando suscripción');
@@ -3225,7 +3496,7 @@ DASHBOARD_HTML = """
                 .then(d => {
                     if (d.success) {
                         alert(d.message);
-                        loadCurrentUser();
+                        loadCurrentUser().then(() => update());
                         loadBillingHistory();
                     } else {
                         alert(d.error || 'Error renovando suscripción');
@@ -3316,13 +3587,18 @@ DASHBOARD_HTML = """
                     el.style.borderLeft = '3px solid var(--purple)';
                     el.style.color = 'var(--text)';
                 }
-                el.innerHTML = `<strong style="color: ${sender === 'IA' || sender === 'Sistema' ? 'var(--gold)' : 'var(--purple)'};">${sender === 'IA' || sender === 'Sistema' ? 'Sistema' : 'Tú'}:</strong> ${text}`;
+                const title = document.createElement('strong');
+                title.style.color = sender === 'IA' || sender === 'Sistema' ? 'var(--gold)' : 'var(--purple)';
+                title.textContent = (sender === 'IA' || sender === 'Sistema' ? 'Sistema' : 'Tú') + ': ';
+                el.appendChild(title);
+                el.appendChild(document.createTextNode(text));
                 box.appendChild(el);
             });
             box.scrollTop = box.scrollHeight;
         }
 
         function loadChat() {
+            if (currentSubscriptionPlan === 'FREE') return;
             fetch('/api/chat/history')
                 .then(r => r.json())
                 .then(d => {
@@ -3334,6 +3610,7 @@ DASHBOARD_HTML = """
         }
 
         function sendChat() {
+            if (currentSubscriptionPlan === 'FREE') return;
             const input = document.getElementById('chat-input');
             const message = input.value.trim();
             if (!message) return;
@@ -3351,30 +3628,39 @@ DASHBOARD_HTML = """
         }
 
         function updateAIAnalysis() {
-            if (Date.now() - lastAIRequestAt < PREDICTION_COOLDOWN_MS) return;
+            const analysisCooldownMs = currentSubscriptionPlan === 'FREE' ?
+                FREE_ANALYSIS_COOLDOWN_MS : BASIC_ANALYSIS_COOLDOWN_MS;
+            if (Date.now() - lastAIRequestAt < analysisCooldownMs) return;
             lastAIRequestAt = Date.now();
-            fetch('/api/professional-analysis')
+            const analysisEndpoint = currentSubscriptionPlan === 'PREMIUM' ?
+                '/api/professional-analysis' : '/api/analysis';
+            fetch(analysisEndpoint)
                 .then(r => r.json())
                 .then(d => {
-                    if (d.error) return;
+                    if (d.success === false || d.available === false) return;
                     const signal = d.signal || 'ESPERA';
                     const color = signal === 'COMPRA' ? 'var(--green)' : signal === 'VENTA' ? 'var(--red)' : 'var(--gold)';
                     document.getElementById('ai-signal').textContent = signal;
                     document.getElementById('ai-signal').style.color = color;
                     const confidencePct = typeof d.confidence_percent === 'number' ? d.confidence_percent : ((d.confidence || 0) * 100);
                     document.getElementById('ai-confidence').textContent = confidencePct.toFixed(1) + '%';
-                    document.getElementById('ai-pattern').textContent = d.pattern || '-';
+                    const analysisCooldownSeconds = d.analysis_cache?.cooldown_seconds ||
+                        (currentSubscriptionPlan === 'FREE' ? 900 : 300);
+                    document.getElementById('ai-pattern').textContent = (d.pattern || '-') +
+                        ' · Actualizado cada ' + Math.round(analysisCooldownSeconds / 60) + ' min';
                     document.getElementById('ai-volatility').textContent = d.volatility || '-';
-                    const learning = (d.learning_progress || 0).toFixed(1) + '%';
-                    document.getElementById('ai-learning').textContent = 'Aprendida: ' + learning;
+                    document.getElementById('ai-learning').textContent =
+                        'Cooldown: ' + Math.ceil(analysisCooldownSeconds / 60) + ' min';
                 })
                 .catch(e => console.error('Error en análisis de IA:', e));
         }
 
         function updatePrediction() {
+            if (currentSubscriptionPlan === 'FREE') return;
+            const predictionCooldownMs = PREDICTION_COOLDOWN_MS;
             if (
                 predictionRequestInFlight ||
-                Date.now() - lastPredictionRequestAt < PREDICTION_COOLDOWN_MS
+                Date.now() - lastPredictionRequestAt < predictionCooldownMs
             ) return;
             predictionRequestInFlight = true;
             lastPredictionRequestAt = Date.now();
@@ -3396,7 +3682,7 @@ DASHBOARD_HTML = """
                                 (p.walk_forward_samples || 0) + ' pruebas)' : 'Muestra insuficiente';
                     document.getElementById('pred-cooldown').textContent =
                         ' · Actualizado ' + new Date(d.prediction_cache.calculated_at).toLocaleTimeString() +
-                        ' · cooldown ' + PREDICTION_COOLDOWN_MS / 1000 + ' s';
+                        ' · cooldown ' + d.prediction_cache.cooldown_seconds + ' s';
                     const signal = trade.signal || d.recommendation || 'ESPERA';
                     const signalElement = document.getElementById('pred-signal');
                     signalElement.textContent = signal;
@@ -3634,6 +3920,7 @@ DASHBOARD_HTML = """
         }
 
         function loadNewsAlerts(forceLoading = true) {
+            if (currentSubscriptionPlan === 'FREE') return;
             const btn = document.getElementById('news-btn');
             const loading = document.getElementById('news-loading');
             if (forceLoading && btn) btn.disabled = true;
@@ -3653,10 +3940,15 @@ DASHBOARD_HTML = """
                 });
         }
 
-        loadCurrentUser();
-        update();
-        setInterval(() => loadNewsAlerts(false), 5000);
-        setInterval(update, 5000);
+        loadCurrentUser().then(() => {
+            update();
+            setInterval(update, 5000);
+            setInterval(() => {
+                if (currentSubscriptionPlan === 'PRO' || currentSubscriptionPlan === 'PREMIUM') {
+                    loadNewsAlerts(false);
+                }
+            }, 5000);
+        });
     </script>
 </body>
 </html>

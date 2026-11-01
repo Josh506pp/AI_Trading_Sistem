@@ -129,6 +129,23 @@ class TestPredictionQuality(unittest.TestCase):
         app_module.invalidate_prediction_cache('CACHE_TEST')
         app_module.invalidate_prediction_cache('CACHE_TEST_OTHER')
 
+    def test_free_user_cannot_call_prediction_routes(self):
+        with app_module.app.app_context():
+            free_user = app_module.User.query.filter_by(username='demo').one()
+            user_id = free_user.id
+
+        with patch.dict(app_module.app.config, {'TESTING': True}):
+            with app_module.app.test_client() as client:
+                with client.session_transaction() as state:
+                    state['user_id'] = user_id
+                for endpoint in (
+                    '/api/predict',
+                    '/api/predict/levels',
+                    '/api/predict/signal'
+                ):
+                    self.assertEqual(client.get(endpoint).status_code, 403, endpoint)
+
+
     def test_build_prediction_signal_uses_fifteen_minute_forecast_horizon(self):
         app_module.invalidate_prediction_cache('HORIZON_TEST')
         prices = [100.0 + index * 0.1 + math.sin(index) * 0.01 for index in range(60)]
@@ -165,6 +182,7 @@ class TestPredictionQuality(unittest.TestCase):
         symbol = app_module.TRADING_DATA['symbol']
         app_module.invalidate_prediction_cache(symbol)
         premium_user = SimpleNamespace(
+            id=987654,
             subscription_plan='PREMIUM',
             has_active_subscription=lambda: True
         )
@@ -204,6 +222,8 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertIn('PREDICTION_COOLDOWN_MS = 15000', DASHBOARD_HTML)
         self.assertIn('PREDICTION_HORIZON_MINUTES = 15', DASHBOARD_HTML)
         self.assertIn('function startAdvancedCooldown(seconds)', DASHBOARD_HTML)
+        self.assertIn('id="predictions-plan-locked"', DASHBOARD_HTML)
+        self.assertIn('id="chat-plan-locked"', DASHBOARD_HTML)
 
 
 if __name__ == '__main__':

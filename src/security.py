@@ -24,12 +24,16 @@ class SecurityValidator:
     @staticmethod
     def validate_email(email):
         """Validar formato de email"""
+        if not isinstance(email, str):
+            return False
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email) is not None
+        return re.fullmatch(pattern, email.strip()) is not None
     
     @staticmethod
     def validate_username(username):
         """Validar username"""
+        if not isinstance(username, str):
+            return False
         if len(username) < 3 or len(username) > 32:
             return False
         pattern = r'^[a-zA-Z0-9_-]+$'
@@ -38,7 +42,7 @@ class SecurityValidator:
     @staticmethod
     def validate_password(password):
         """Validar contraseña"""
-        if len(password) < 6:
+        if not isinstance(password, str) or len(password) < 8:
             return False
         return True
     

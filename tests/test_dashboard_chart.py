@@ -202,7 +202,12 @@ class TestDashboardChart(unittest.TestCase):
             previous_trading_symbol = app_module.TRADING_SYMBOL
 
         try:
-            with patch.object(app_module.market_data, 'get_intraday_prices', return_value=[1.084, 1.0852]):
+            unauthorized = app_module.app.test_client().post(
+                '/api/symbol', json={'symbol': 'EURUSD'}
+            )
+            self.assertEqual(unauthorized.status_code, 401)
+            with patch.object(app_module, 'get_current_user', return_value=object()), \
+                    patch.object(app_module.market_data, 'get_intraday_prices', return_value=[1.084, 1.0852]):
                 client = app_module.app.test_client()
                 change_response = client.post('/api/symbol', json={'symbol': 'EURUSD'})
                 status_response = client.get('/api/status')

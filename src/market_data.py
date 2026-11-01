@@ -142,7 +142,9 @@ class MarketDataProvider:
         self.cache = {}
         self.last_update = {}
         self.cache_duration = 60  # segundos
-        self.mt5 = mt5_client if mt5_client is not None else MetaTrader5
+        self.mt5 = None if mt5_client is False else (
+            mt5_client if mt5_client is not None else MetaTrader5
+        )
         self.mt5_retry_seconds = mt5_retry_seconds
         self._mt5_initialized = False
         self._mt5_last_attempt = 0.0
