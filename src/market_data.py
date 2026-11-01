@@ -7,6 +7,7 @@ Provides live OHLCV data for multiple assets
 import yfinance as yf
 from datetime import datetime, timedelta
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +41,34 @@ class MarketDataProvider:
     
     def get_latest_price(self, symbol):
         """Obtener el último precio de mercado"""
+        quote = self.get_latest_quote(symbol)
+        return quote['price'] if quote else None
+
+    def get_latest_quote(self, symbol):
+        """Obtener precio y hora del último tick disponible del proveedor."""
         try:
             ticker = self.get_yf_ticker(symbol)
-            data = yf.download(ticker, period='1d', interval='1m', progress=False)
+            data = yf.download(ticker, period='7d', interval='1m', progress=False)
             if data.empty:
                 logger.warning(f"No data for {symbol}")
                 return None
-            val = data['Close'].values.flatten()[-1]
-            return float(val)
+            close = data['Close'].values.flatten()
+            valid_quotes = [
+                (float(value), timestamp)
+                for value, timestamp in zip(close, data.index)
+                if math.isfinite(float(value)) and float(value) > 0
+            ]
+            if not valid_quotes:
+                logger.warning(f"No valid recent prices for {symbol}")
+                return None
+            price, timestamp = valid_quotes[-1]
+            return {
+                'price': price,
+                'timestamp': timestamp.isoformat(),
+                'history': [value for value, _ in valid_quotes[-200:]]
+            }
         except Exception as e:
-            logger.error(f"Error getting price for {symbol}: {e}")
+            logger.error(f"Error getting latest quote for {symbol}: {e}")
             return None
     
     def get_historical_data(self, symbol, period='1mo', interval='1h'):

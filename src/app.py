@@ -13,6 +13,7 @@ import threading
 import socket
 import webbrowser
 import secrets
+import math
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -148,6 +149,7 @@ TRADING_DATA = {
     'volume': 0.01,
     'price': round(_initial_price, _initial_decimals),
     'price_history': _initial_price_history,
+    'price_updated_at': None,
     'balance': 10000.0,
     'equity': 10000.0,
     'trades_open': 0,
@@ -374,22 +376,24 @@ def get_symbol_format(symbol):
 def reset_price_history(symbol):
     """Reinicia el historial de precios para un símbolo con datos reales de mercado."""
     decimals, pip_size, volatility, default_price, default_volume = get_symbol_format(symbol)
-    TRADING_DATA['symbol'] = symbol
-    TRADING_DATA['volume'] = default_volume
-    
+    intraday = []
     if MARKET_DATA_AVAILABLE and market_data:
         try:
             intraday = market_data.get_intraday_prices(symbol, count=50)
-            if intraday and len(intraday) > 0:
-                TRADING_DATA['price_history'] = intraday
-                TRADING_DATA['price'] = intraday[-1]
-                return decimals, volatility, TRADING_DATA['price'], default_volume
         except Exception as e:
             print(f"Error fetching real prices for reset: {e}")
-            
-    TRADING_DATA['price'] = round(default_price, decimals)
-    TRADING_DATA['price_history'] = [default_price] * 50
-    return decimals, volatility, default_price, default_volume
+
+    with PRICE_LOCK:
+        TRADING_DATA['symbol'] = symbol
+        TRADING_DATA['volume'] = default_volume
+        if intraday:
+            TRADING_DATA['price_history'] = intraday
+            TRADING_DATA['price'] = intraday[-1]
+        else:
+            TRADING_DATA['price'] = round(default_price, decimals)
+            TRADING_DATA['price_history'] = [TRADING_DATA['price']] * 50
+        TRADING_DATA['price_updated_at'] = None
+        return decimals, volatility, TRADING_DATA['price'], default_volume
 
 PRICE_LOCK = threading.Lock()
 
@@ -642,43 +646,66 @@ def build_prediction_signal(prices):
 # ACTUALIZACIÓN DE PRECIOS
 # ====================================================================
 
+def update_market_price_once():
+    """Obtiene un tick y actualiza de forma atómica la cotización del símbolo activo."""
+    with PRICE_LOCK:
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+        needs_history = TRADING_DATA.get('price_updated_at') is None
+
+    updated = False
+    if MARKET_DATA_AVAILABLE and market_data:
+        quote = market_data.get_latest_quote(symbol)
+        with PRICE_LOCK:
+            if symbol == TRADING_DATA.get('symbol') and quote:
+                try:
+                    latest_price = float(quote['price'])
+                    if latest_price > 0 and math.isfinite(latest_price):
+                        quote_history = quote.get('history')
+                        if needs_history and quote_history:
+                            TRADING_DATA['price_history'] = quote_history[-200:]
+                        TRADING_DATA['price'] = latest_price
+                        history = TRADING_DATA['price_history']
+                        if not history or history[-1] != latest_price:
+                            history.append(latest_price)
+                            del history[:-200]
+                        TRADING_DATA['price_updated_at'] = quote['timestamp']
+                        updated = True
+                except (TypeError, ValueError):
+                    print(f'Precio de mercado inválido para {symbol}: {latest_price}')
+
+    with PRICE_LOCK:
+        try:
+            check_market_alerts()
+        except Exception as e:
+            print(f'Error en alertas: {e}')
+    return updated
+
+
 def update_prices():
-    """Actualiza precios desde datos reales de mercado (yfinance)"""
-    update_counter = 0
+    """Actualiza el mercado periódicamente y publica cada nueva cotización."""
     while True:
         try:
-            with PRICE_LOCK:
-                symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
-                
-                # Obtener datos intradiarios reales del proveedor
-                if MARKET_DATA_AVAILABLE and market_data:
-                    try:
-                        intraday_prices = market_data.get_intraday_prices(symbol, count=50)
-                        if intraday_prices and len(intraday_prices) > 0:
-                            TRADING_DATA['price_history'] = intraday_prices
-                            TRADING_DATA['price'] = intraday_prices[-1]
-                    except Exception as e:
-                        print(f'Error trayendo datos reales: {e}')
-                
-                # Sistema de alertas
-                try:
-                    check_market_alerts()
-                except Exception as e:
-                    print(f'Error en alertas: {e}')
-            
-            update_counter += 1
-            time.sleep(5)  # Actualizar cada 5 segundos
+            update_market_price_once()
+            time.sleep(5)
         except Exception as e:
             print(f"Error en update_prices: {e}")
             time.sleep(5)
 
 price_thread = None
+_price_thread_lock = threading.Lock()
 
 def start_background_services():
     global price_thread
-    if price_thread is None or not price_thread.is_alive():
-        price_thread = threading.Thread(target=update_prices, daemon=True)
-        price_thread.start()
+    with _price_thread_lock:
+        if price_thread is None or not price_thread.is_alive():
+            price_thread = threading.Thread(target=update_prices, daemon=True)
+            price_thread.start()
+
+
+@app.before_request
+def ensure_market_data_service():
+    if not app.config.get('TESTING', False):
+        start_background_services()
 
 # ====================================================================
 # AUTENTICACIÓN Y AUTORIZACIÓN
@@ -1381,6 +1408,7 @@ def api_status():
             chart_prices.append(current_price)
         status = {
             'price': current_price,
+            'price_updated_at': TRADING_DATA.get('price_updated_at'),
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
@@ -1419,9 +1447,9 @@ def api_set_symbol():
         if not cfg:
             return jsonify({'success': False, 'error': f'Símbolo {symbol} no soportado'}), 400
     symbol = symbol.upper()
+    reset_price_history(symbol)
     with PRICE_LOCK:
         TRADING_SYMBOL = symbol
-        reset_price_history(symbol)
         if volume is not None:
             try:
                 vol = float(volume)
@@ -2296,6 +2324,7 @@ DASHBOARD_HTML = """
                 <h3>Gráfico de Precios</h3>
                 <div style="display: flex; gap: 10px; align-items: center;">
                         <span id="chart-current-quote" style="color:var(--gold); font:12px 'SF Mono',Consolas,monospace; white-space:nowrap;">XAUUSD: -</span>
+                        <span id="chart-update-time" style="color:var(--text-dim); font-size:11px; white-space:nowrap;">Conectando fuente...</span>
                         <label style="color:var(--gold); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Divisa:</label>
                     <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 6px 12px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:6px; font-family:'SF Mono',Consolas,monospace; font-size:12px;">
                         <option value="XAUUSD">XAUUSD (Oro)</option>
@@ -2540,6 +2569,17 @@ DASHBOARD_HTML = """
                     const quoteElement = document.getElementById('chart-current-quote');
                     if (quoteElement && typeof d.price === 'number') {
                         quoteElement.textContent = currentSymbol + ': ' + formatPrice(d.price, currentDecimals);
+                    }
+                    const updateTimeElement = document.getElementById('chart-update-time');
+                    if (updateTimeElement) {
+                        if (d.price_updated_at) {
+                            const quoteTime = new Date(d.price_updated_at);
+                            const stale = Date.now() - quoteTime.getTime() > 180000;
+                            updateTimeElement.textContent = (stale ? 'Último tick ' : 'Tick ') +
+                                quoteTime.toLocaleTimeString() + (stale ? ' · dato atrasado' : '');
+                        } else {
+                            updateTimeElement.textContent = 'Sin cotización del mercado';
+                        }
                     }
                     const chartDataArr = Array.isArray(d.chart_prices) && d.chart_prices.length > 0 ?
                         d.chart_prices : (Array.isArray(d.candles) && d.candles.length > 0 ?

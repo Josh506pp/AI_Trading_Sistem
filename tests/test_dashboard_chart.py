@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 
 app_module = importlib.import_module('src.app')
+app_module.app.config['TESTING'] = True
 
 
 class TestDashboardChart(unittest.TestCase):
@@ -47,8 +48,40 @@ class TestDashboardChart(unittest.TestCase):
         from src.app import DASHBOARD_HTML
 
         self.assertIn('id="chart-current-quote"', DASHBOARD_HTML)
+        self.assertIn('id="chart-update-time"', DASHBOARD_HTML)
         self.assertIn("currentSymbol + ': ' + formatPrice(d.price, currentDecimals)", DASHBOARD_HTML)
         self.assertIn("d.chart_prices", DASHBOARD_HTML)
+
+    def test_market_tick_updates_the_quote_and_chart_history(self):
+        with app_module.PRICE_LOCK:
+            previous_symbol = app_module.TRADING_DATA['symbol']
+            previous_price = app_module.TRADING_DATA['price']
+            previous_history = app_module.TRADING_DATA['price_history']
+            previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
+            app_module.TRADING_DATA['symbol'] = 'USDJPY'
+            app_module.TRADING_DATA['price'] = 149.123
+            app_module.TRADING_DATA['price_history'] = [149.0, 149.123]
+
+        try:
+            with patch.object(app_module, 'MARKET_DATA_AVAILABLE', True), \
+                    patch.object(app_module.market_data, 'get_latest_quote', return_value={
+                        'price': 149.127,
+                        'timestamp': '2026-10-30T16:59:00-04:00',
+                        'history': [149.0, 149.123]
+                    }), \
+                    patch.object(app_module.market_data, 'get_intraday_prices', return_value=[]):
+                updated = app_module.update_market_price_once()
+
+            self.assertTrue(updated)
+            self.assertEqual(app_module.TRADING_DATA['price'], 149.127)
+            self.assertEqual(app_module.TRADING_DATA['price_history'][-1], 149.127)
+            self.assertEqual(app_module.TRADING_DATA['price_updated_at'], '2026-10-30T16:59:00-04:00')
+        finally:
+            with app_module.PRICE_LOCK:
+                app_module.TRADING_DATA['symbol'] = previous_symbol
+                app_module.TRADING_DATA['price'] = previous_price
+                app_module.TRADING_DATA['price_history'] = previous_history
+                app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
 
     def test_changing_symbol_updates_the_chart_to_that_symbols_latest_quote(self):
         with app_module.PRICE_LOCK:

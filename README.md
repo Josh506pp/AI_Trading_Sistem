@@ -81,7 +81,7 @@ python src/app.py
 ### Acceso a la Plataforma
 1. Abre [http://localhost:5000/dashboard](http://localhost:5000/dashboard)
 2. La plataforma carga automáticamente en modo demostración
-3. Los precios se actualizan cada cinco segundos
+3. La dashboard consulta el último tick cada cinco segundos; Yahoo Finance entrega barras de un minuto y puede retrasarse. Fuera del horario de un mercado se conserva el último precio y se marca como atrasado.
 
 Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
 
@@ -91,6 +91,7 @@ Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE
 - Ver gráfico con colores dinámicos (dorado subida, morado bajada)
 - Cambiar símbolo: EURUSD, XAUUSD, BTCUSD, etc.
 - Ver la cotización actual de la divisa seleccionada, sincronizada con el último punto del gráfico
+- Consultar la hora del último tick y detectar cuando el proveedor no entrega datos recientes
 - Niveles de entrada, stop-loss y objetivo cuando hay una señal confirmada
 - Ver símbolo y precio del punto al pasar el cursor sobre el gráfico
 
