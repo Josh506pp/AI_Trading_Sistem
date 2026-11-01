@@ -41,6 +41,9 @@ Thumbs.db
 # Local tools and caches
 .refact/
 .sixth/
+*.db
+*.sqlite
+*.sqlite3
 # Local logs / diagnostic output
 app_log.txt
 diagnose_out.txt

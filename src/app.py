@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-TRADING SYSTEM - APLICACIÓN WEB SIMPLE Y FUNCIONAL
-Versión limpia sin dependencias complicadas
+TRADING SYSTEM - PLATAFORMA DE TRADING CON IA
+Versión 2.0: Datos reales, usuarios, planes
 """
 
 from flask import Flask, render_template_string, request, redirect, jsonify, session
@@ -13,7 +13,8 @@ import threading
 import socket
 import webbrowser
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 
 # Asegurar que el directorio src esté en el path para imports absolutos
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,13 +24,6 @@ try:
     load_dotenv()
 except ImportError:
     pass
-
-try:
-    import MetaTrader5 as mt5
-    MT5_AVAILABLE = True
-except ImportError:
-    mt5 = None
-    MT5_AVAILABLE = False
 
 try:
     from .market_symbols import (
@@ -48,6 +42,17 @@ except ImportError:
         SYMBOLS_AVAILABLE = False
 
 try:
+    from .market_data import market_data
+    MARKET_DATA_AVAILABLE = True
+except ImportError:
+    try:
+        from market_data import market_data
+        MARKET_DATA_AVAILABLE = True
+    except ImportError:
+        market_data = None
+        MARKET_DATA_AVAILABLE = False
+
+try:
     from .professional_trading_system import AIAnalyzer as ProAIAnalyzer
     PROFESSIONAL_AVAILABLE = True
 except ImportError:
@@ -55,57 +60,71 @@ except ImportError:
     PROFESSIONAL_AVAILABLE = False
 
 try:
-    from .mt5_integration import BotAITrader
-    INTEGRATION_AVAILABLE = True
-except ImportError:
-    BotAITrader = None
-    INTEGRATION_AVAILABLE = False
-
-try:
-    from .mt5_config import (
-        MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH,
-        TRADING_SYMBOL, DEFAULT_VOLUME, USE_REAL_ACCOUNT
-    )
-except ImportError:
-    MT5_LOGIN = None
-    MT5_PASSWORD = None
-
-try:
     from .prediction_system import prediction_engine
     PREDICTION_AVAILABLE = True
 except ImportError:
     prediction_engine = None
     PREDICTION_AVAILABLE = False
-    MT5_SERVER = None
-    MT5_PATH = None
-    TRADING_SYMBOL = 'EURUSD'
-    DEFAULT_VOLUME = 0.01
-    USE_REAL_ACCOUNT = False
 
-MT5_LOGIN = os.environ.get('MT5_LOGIN', MT5_LOGIN)
-MT5_PASSWORD = os.environ.get('MT5_PASSWORD', MT5_PASSWORD)
-MT5_SERVER = os.environ.get('MT5_SERVER', MT5_SERVER)
-MT5_PATH = os.environ.get('MT5_PATH', MT5_PATH)
-TRADING_SYMBOL = os.environ.get('TRADING_SYMBOL', TRADING_SYMBOL)
-DEFAULT_VOLUME = float(os.environ.get('DEFAULT_VOLUME', DEFAULT_VOLUME))
-USE_REAL_ACCOUNT = os.environ.get('USE_REAL_ACCOUNT', str(USE_REAL_ACCOUNT)).lower() in ('1', 'true', 'yes')
+try:
+    from .models import db, User, LoginSession, BillingHistory, PasswordResetToken, init_db
+    DB_AVAILABLE = True
+except ImportError:
+    try:
+        from models import db, User, LoginSession, BillingHistory, PasswordResetToken, init_db
+        DB_AVAILABLE = True
+    except ImportError:
+        db = None
+        DB_AVAILABLE = False
 
-MT5_CREDENTIALS = {}
-if all([MT5_LOGIN, MT5_PASSWORD, MT5_SERVER]):
-    MT5_CREDENTIALS = {
-        'login': MT5_LOGIN,
-        'password': MT5_PASSWORD,
-        'server': MT5_SERVER,
-        'path': MT5_PATH
-    }
+try:
+    from .security import (
+        SecurityValidator, rate_limit, setup_cors, 
+        log_security_event, CryptographyHelper
+    )
+    SECURITY_AVAILABLE = True
+except ImportError:
+    try:
+        from security import (
+            SecurityValidator, rate_limit, setup_cors,
+            log_security_event, CryptographyHelper
+        )
+        SECURITY_AVAILABLE = True
+    except ImportError:
+        SECURITY_AVAILABLE = False
+        SecurityValidator = None
+        rate_limit = lambda x: lambda f: f  # dummy decorator
+
+
+# Configuración global
+TRADING_SYMBOL = os.environ.get('TRADING_SYMBOL', 'EURUSD')
+DEFAULT_VOLUME = float(os.environ.get('DEFAULT_VOLUME', 0.01))
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'trading-system-secret-2026')
+
+# Configuración de base de datos
+db_path = os.path.join(os.path.dirname(__file__), '..', 'trading_platform.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+if DB_AVAILABLE:
+    db.init_app(app)
+    with app.app_context():
+        try:
+            init_db(app)
+        except Exception as e:
+            print(f"Error inicializando BD: {e}")
+
 app.config.update({
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
     'SESSION_COOKIE_SECURE': os.environ.get('FLASK_ENV') == 'production'
 })
+
+# Configurar CORS y seguridad
+if SECURITY_AVAILABLE:
+    setup_cors(app)
 
 # ====================================================================
 # DATOS GLOBALES
@@ -348,21 +367,28 @@ def get_symbol_format(symbol):
 
 
 def reset_price_history(symbol):
-    """Reinicia el historial de precios para un símbolo."""
+    """Reinicia el historial de precios para un símbolo con datos reales de mercado."""
     decimals, pip_size, volatility, default_price, default_volume = get_symbol_format(symbol)
     TRADING_DATA['symbol'] = symbol
     TRADING_DATA['volume'] = default_volume
+    
+    if MARKET_DATA_AVAILABLE and market_data:
+        try:
+            intraday = market_data.get_intraday_prices(symbol, count=50)
+            if intraday and len(intraday) > 0:
+                TRADING_DATA['price_history'] = intraday
+                TRADING_DATA['price'] = intraday[-1]
+                return decimals, volatility, TRADING_DATA['price'], default_volume
+        except Exception as e:
+            print(f"Error fetching real prices for reset: {e}")
+            
     TRADING_DATA['price'] = round(default_price, decimals)
-    TRADING_DATA['price_history'] = [round(default_price + i * (volatility * 0.1) + random.uniform(-volatility * 5, volatility * 5), decimals) for i in range(50)]
+    TRADING_DATA['price_history'] = [default_price] * 50
     return decimals, volatility, default_price, default_volume
 
 PRICE_LOCK = threading.Lock()
-MT5_CONNECTED = False
-MT5_ACCOUNT_INFO = None
 
-# Modo simulación: cuando está activo, las operaciones se ejecutan localmente
-# aunque el paquete MetaTrader5 esté instalado. Se desactiva automáticamente
-# al conectar una cuenta MT5 real.
+# Modo simulación: todas las operaciones se ejecutan localmente
 SIMULATION_MODE = True
 
 # IA Profesional Mejorada
@@ -371,21 +397,7 @@ if PROFESSIONAL_AVAILABLE:
 else:
     PRO_AI_ANALYZER = None
 
-# ======== BOT + IA + MT5 INTEGRADO ========
-BOT_TRADER = None
-BOT_THREAD = None
 
-def initialize_bot_trader():
-    """Inicializa el sistema integrado Bot + IA + MT5"""
-    global BOT_TRADER
-    if INTEGRATION_AVAILABLE and BotAITrader:
-        try:
-            BOT_TRADER = BotAITrader(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
-            return True
-        except Exception as e:
-            print(f"Error inicializando BotAITrader: {e}")
-            return False
-    return False
 
 
 # ====================================================================
@@ -573,483 +585,61 @@ def analyze_signal(prices, symbol=None):
 # ====================================================================
 
 def update_prices():
-    """Actualiza precios en tiempo real con análisis inteligente"""
+    """Actualiza precios desde datos reales de mercado (yfinance)"""
+    update_counter = 0
     while True:
         try:
             with PRICE_LOCK:
                 symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
-                decimals, pip_size, volatility, default_price, _ = get_symbol_format(symbol)
-                last = TRADING_DATA['price_history'][-1]
-                # Movimientos realistas con volatilidad variable según símbolo
-                change = random.uniform(-volatility, volatility)
-                new_price = max(default_price * 0.5, last + change)
-                new_price = round(new_price, decimals)
-                TRADING_DATA['price_history'].append(new_price)
-                if len(TRADING_DATA['price_history']) > 200:
-                    TRADING_DATA['price_history'].pop(0)
-                TRADING_DATA['price'] = new_price
                 
-                # Sistema de alertas de volatilidad/noticias
+                # Obtener datos intradiarios reales del proveedor
+                if MARKET_DATA_AVAILABLE and market_data:
+                    try:
+                        intraday_prices = market_data.get_intraday_prices(symbol, count=50)
+                        if intraday_prices and len(intraday_prices) > 0:
+                            TRADING_DATA['price_history'] = intraday_prices
+                            TRADING_DATA['price'] = intraday_prices[-1]
+                    except Exception as e:
+                        print(f'Error trayendo datos reales: {e}')
+                
+                # Sistema de alertas
                 try:
                     check_market_alerts()
                 except Exception as e:
-                    print(f'Error en alertas de mercado: {e}')
-
-                # Sistema automático de trading inteligente
-                if TRADING_DATA['auto_enabled'] and len(TRADING_DATA['price_history']) >= 50:
-                    # Análisis inteligente con múltiples indicadores
-                    analysis = analyze_signal(TRADING_DATA['price_history'])
-                    TRADING_DATA['signal'] = {'action': analysis['action'], 'confidence': analysis['confidence']}
-
-                    # Registrar análisis para aprendizaje
-                    AI_LEARNING_DB['learning_score'] += analysis['confidence'] * 0.01
-                    if analysis['action'] != 'ESPERA':
-                        AI_LEARNING_DB['successful_patterns'].append(analysis['pattern'])
-
-                    # Obtener señal predictiva si está disponible
-                    prediction_signal = None
-                    try:
-                        if TRADING_DATA.get('use_prediction', True) and PREDICTION_AVAILABLE and prediction_engine:
-                            pred_sig = prediction_engine.get_prediction_signal(
-                                TRADING_DATA['price_history'],
-                                analysis['rsi'],
-                                analysis['macd'],
-                                float(analysis['bb'].split('-')[1]),
-                                float(analysis['bb'].split('-')[0])
-                            )
-                            prediction_signal = pred_sig
-                        else:
-                            prediction_signal = None
-                    except Exception:
-                        prediction_signal = None
-
-                    # Combinar señales: si concuerdan, subir confianza; si no, reducir
-                    combined_confidence = analysis['confidence']
-                    combined_source = 'ANALYSIS'
-                    action_to_execute = analysis['action']
-
-                    if prediction_signal:
-                        # Map prediction direction to action
-                        pred_dir = prediction_signal.get('direction', '').upper()
-                        pred_action = 'COMPRA' if pred_dir in ('ALCISTA','ALCISTA','ALTA') or 'ALC' in pred_dir else None
-                        if not pred_action:
-                            # fallback: map signal text
-                            sigtxt = prediction_signal.get('signal','').upper()
-                            if 'COMPRA' in sigtxt: pred_action = 'COMPRA'
-                            elif 'VENTA' in sigtxt: pred_action = 'VENTA'
-
-                        pred_conf = float(prediction_signal.get('confidence', 0) or 0)
-                        # If prediction agrees with analysis action
-                        if pred_action and pred_action == analysis['action']:
-                            combined_confidence = min(0.99, (analysis['confidence'] + pred_conf) / 2)
-                            combined_source = 'MIX'
-                        else:
-                            # Discrepancia: penalizar confianza
-                            combined_confidence = min(0.99, min(analysis['confidence'], pred_conf) * 0.6)
-                            combined_source = 'MIX_DISCORD'
-
-                    # Ejecutar operación automática solo si la confianza combinada supera el umbral
-                    if analysis['action'] != 'ESPERA' and combined_confidence > AI_LEARNING_DB['confidence_threshold']:
-                        trade_info = None
-                        # Priorizar ejecución por MT5 cuando esté disponible
-                        if MT5_AVAILABLE and ensure_mt5_connected():
-                            result = place_mt5_order(analysis['action'])
-                            if result.get('success'):
-                                trade_info = {
-                                    'id': len(TRADING_DATA['trades']) + len(TRADING_DATA['closed_trades']) + 1,
-                                    'action': analysis['action'],
-                                    'entry': result['price'],
-                                    'size': result['volume'],
-                                    'pl': 0,
-                                    'confidence': combined_confidence,
-                                    'ticket': result.get('ticket'),
-                                    'source': 'MT5',
-                                    'note': combined_source
-                                }
-                        if trade_info is None:
-                            trade_info = {
-                                'id': len(TRADING_DATA['trades']) + len(TRADING_DATA['closed_trades']) + 1,
-                                'action': analysis['action'],
-                                'entry': TRADING_DATA['price'],
-                                'size': 0.1,
-                                'pl': 0,
-                                'confidence': combined_confidence,
-                                'source': 'SIM',
-                                'note': combined_source
-                            }
-                        TRADING_DATA['trades'].append(trade_info)
-                        TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-                        AI_LEARNING_DB['trade_history'].append(trade_info)
-
-                        # Registrar en histórico
-                        TRADING_DATA['chat_history'].append({
-                            'timestamp': datetime.now().isoformat(),
-                            'sender': 'IA',
-                            'text': f'Operación automática: {analysis["action"]} a {trade_info["entry"]:.4f} (Confianza combinada: {combined_confidence:.1%}). Fuente: {combined_source}'
-                        })
+                    print(f'Error en alertas: {e}')
             
-            time.sleep(1)
+            update_counter += 1
+            time.sleep(5)  # Actualizar cada 5 segundos
         except Exception as e:
-            print(f"Error actualizando precios: {e}")
-            pass
-
-
-def find_mt5_terminal():
-    """Busca terminal64.exe en rutas comunes de instalación."""
-    candidates = [
-        r'C:\Program Files\MetaTrader 5\terminal64.exe',
-        r'C:\Program Files (x86)\MetaTrader 5\terminal64.exe',
-        r'D:\Program Files\MetaTrader 5\terminal64.exe',
-        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'MetaQuotes\Terminal\terminal64.exe'),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def _mt5_terminal_running():
-    """Verifica si el proceso terminal64.exe está activo."""
-    try:
-        import psutil
-        for proc in psutil.process_iter(['name']):
-            if proc.info.get('name', '').lower() in ('terminal64.exe', 'metaeditor64.exe'):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _mt5_init_worker(path, queue):
-    """Worker que ejecuta mt5.initialize en un proceso separado."""
-    try:
-        import MetaTrader5 as mt5
-        if path:
-            result = mt5.initialize(path=path)
-        else:
-            result = mt5.initialize()
-        queue.put(('success', result))
-    except Exception as e:
-        queue.put(('error', str(e)))
-
-
-def _mt5_initialize_with_timeout(path=None, timeout=15):
-    """Ejecuta mt5.initialize en un proceso separado con timeout para no bloquear el servidor."""
-    import multiprocessing
-    queue = multiprocessing.Queue()
-    process = multiprocessing.Process(target=_mt5_init_worker, args=(path, queue))
-    process.start()
-    process.join(timeout=timeout)
-
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=2)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=2)
-        return False, 'Timeout: MT5 no respondió a tiempo. Abre MetaTrader 5 manualmente, inicia sesión y vuelve a conectar.'
-
-    try:
-        status, value = queue.get_nowait()
-        if status == 'error':
-            return False, value
-        return bool(value), None
-    except Exception:
-        return False, 'No se pudo obtener respuesta del proceso de inicialización de MT5'
-
-
-def initialize_mt5(login=None, password=None, server=None, path=None):
-    """Inicializa y conecta MetaTrader5 con credenciales dadas o con las guardadas."""
-    global MT5_CONNECTED, MT5_ACCOUNT_INFO, MT5_CREDENTIALS
-    if not MT5_AVAILABLE:
-        return {'success': False, 'error': 'MetaTrader5 package no instalado'}
-
-    if login and password and server:
-        MT5_CREDENTIALS = {
-            'login': str(login).strip(),
-            'password': str(password).strip(),
-            'server': str(server).strip(),
-            'path': str(path).strip() if path else (MT5_PATH or find_mt5_terminal())
-        }
-    elif not MT5_CREDENTIALS.get('path'):
-        MT5_CREDENTIALS['path'] = MT5_PATH or find_mt5_terminal()
-
-    if not MT5_CREDENTIALS.get('login') or not MT5_CREDENTIALS.get('password') or not MT5_CREDENTIALS.get('server'):
-        return {'success': False, 'error': 'MT5 credentials no configuradas. Envía login, password y server.'}
-
-    if MT5_CONNECTED:
-        # Si ya está conectado y las credenciales no cambiaron, no re-inicializamos
-        return {'success': True, 'message': 'MT5 ya está conectado'}
-
-    try:
-        # Reinicia cualquier sesión MT5 anterior para evitar estados inválidos
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-
-        mt5_path = MT5_CREDENTIALS.get('path') or find_mt5_terminal()
-        if mt5_path:
-            if not os.path.isfile(mt5_path):
-                return {
-                    'success': False,
-                    'error': f'Ruta MT5 no encontrada: {mt5_path}. Ajusta MT5_PATH o ingresa la ruta correcta.'
-                }
-        if not _mt5_terminal_running():
-            return {
-                'success': False,
-                'error': 'MetaTrader 5 no está abierto. Abre MT5, inicia sesión con tu cuenta y vuelve a conectar.'
-            }
-        if mt5_path:
-            result_init, init_error = _mt5_initialize_with_timeout(path=mt5_path, timeout=20)
-        else:
-            result_init, init_error = _mt5_initialize_with_timeout(timeout=20)
-
-        if not result_init:
-            last_error = mt5.last_error()
-            if isinstance(last_error, tuple):
-                last_error = ' - '.join(map(str, last_error))
-            msg = 'Error inicializando MT5.'
-            if init_error:
-                msg += f' {init_error}'
-            elif last_error:
-                msg += f' {last_error}'
-            if 'IPC timeout' in msg or '10005' in msg:
-                msg += ' Abre MetaTrader 5 manualmente, inicia sesión con tu cuenta y vuelve a conectar.'
-            elif not mt5_path:
-                msg += ' Si MT5 está instalado, configura MT5_PATH con la ruta completa a terminal64.exe.'
-            return {'success': False, 'error': msg}
-
-        try:
-            login_value = int(MT5_CREDENTIALS['login'])
-        except ValueError:
-            mt5.shutdown()
-            return {'success': False, 'error': 'Login MT5 inválido. Debe ser un número.'}
-
-        if not mt5.login(login=login_value, password=MT5_CREDENTIALS['password'], server=MT5_CREDENTIALS['server']):
-            last_error = mt5.last_error()
-            mt5.shutdown()
-            msg = f'Login MT5 fallido. Verifica credenciales y servidor. {last_error}' if last_error else 'Login MT5 fallido. Verifica credenciales y servidor.'
-            return {'success': False, 'error': msg}
-
-        account_info = mt5.account_info()
-        if account_info is None:
-            last_error = mt5.last_error()
-            mt5.shutdown()
-            msg = f'No se pudo obtener info de cuenta MT5. {last_error}' if last_error else 'No se pudo obtener info de cuenta MT5'
-            return {'success': False, 'error': msg}
-
-        MT5_CONNECTED = True
-        MT5_ACCOUNT_INFO = account_info
-        return {'success': True, 'message': f'Conectado a MT5 cuenta {account_info.login}'}
-    except Exception as e:
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-        return {'success': False, 'error': f'Error MT5: {str(e)}'}
-
-
-def ensure_mt5_connected():
-    """Verifica el estado MT5 y reconecta si es necesario usando credenciales configuradas."""
-    global MT5_CONNECTED, MT5_ACCOUNT_INFO
-
-    if not MT5_AVAILABLE:
-        return False
-
-    if MT5_CONNECTED:
-        try:
-            info = mt5.account_info()
-            if info is not None:
-                MT5_ACCOUNT_INFO = info
-                return True
-        except Exception:
-            pass
-        MT5_CONNECTED = False
-        MT5_ACCOUNT_INFO = None
-
-    if not MT5_CREDENTIALS.get('login') or not MT5_CREDENTIALS.get('password') or not MT5_CREDENTIALS.get('server'):
-        return False
-
-    result = initialize_mt5()
-    return result.get('success', False)
-
-
-
-
-def detect_mt5_symbol(symbol):
-    """Detecta el nombre exacto del símbolo en MT5 probando aliases."""
-    if not MT5_AVAILABLE:
-        return symbol
-    if SYMBOLS_AVAILABLE:
-        cfg = get_symbol_config(symbol)
-        aliases = cfg.mt5_symbol_aliases if cfg else [symbol]
-    else:
-        aliases = [symbol]
-    for alias in aliases:
-        try:
-            if mt5.symbol_select(alias, True):
-                tick = mt5.symbol_info_tick(alias)
-                if tick is not None:
-                    return alias
-        except Exception:
-            continue
-    return symbol
+            print(f"Error en update_prices: {e}")
+            time.sleep(5)
 
 def get_candle_data(max_candles=40):
-    """Devuelve datos de velas para el gráfico."""
-    if MT5_AVAILABLE and MT5_CONNECTED:
+    """Devuelve velas OHLC reales desde el proveedor de mercado"""
+    with PRICE_LOCK:
+        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
+        
+    if MARKET_DATA_AVAILABLE and market_data:
         try:
-            symbol = detect_mt5_symbol(TRADING_SYMBOL or TRADING_DATA.get('symbol', 'EURUSD'))
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, max_candles)
-            if rates is not None and len(rates) > 0:
+            historical = market_data.get_historical_data(symbol, period='1d', interval='5m')
+            if historical and len(historical) > 0:
                 candles = []
-                for rate in rates:
+                for i, c in enumerate(historical[-max_candles:]):
                     candles.append({
-                        'x': datetime.fromtimestamp(rate.time).isoformat(),
-                        'o': float(rate.open),
-                        'h': float(rate.high),
-                        'l': float(rate.low),
-                        'c': float(rate.close)
+                        'o': c['open'],
+                        'h': c['high'],
+                        'l': c['low'],
+                        'c': c['close'],
+                        'x': i + 1
                     })
-                return candles[::-1]
-        except Exception:
-            pass
+                return candles
+        except Exception as e:
+            print(f"Error en get_candle_data: {e}")
 
-    prices = TRADING_DATA['price_history'][-max_candles * 4:]
-    if not prices:
-        return []
+    # Fallback con precios reales acumulados (sin datos sintéticos)
+    prices = TRADING_DATA['price_history'][-max_candles:]
+    return [{'c': float(p), 'x': i + 1} for i, p in enumerate(prices)]
 
-    candles = []
-    for i in range(0, len(prices), 4):
-        chunk = prices[i:i+4]
-        if len(chunk) < 4:
-            break
-        candles.append({
-            'x': datetime.now().isoformat(),
-            'o': float(chunk[0]),
-            'h': float(max(chunk)),
-            'l': float(min(chunk)),
-            'c': float(chunk[-1])
-        })
-    return candles[-max_candles:]
-
-
-def mt5_status():
-    """Devuelve estado y datos de la cuenta MT5"""
-    global MT5_CONNECTED, MT5_ACCOUNT_INFO
-    if not MT5_AVAILABLE:
-        return {'connected': False, 'error': 'MetaTrader5 package no instalado'}
-
-    if not MT5_CONNECTED and MT5_CREDENTIALS.get('login'):
-        ensure_mt5_connected()
-
-    if not MT5_CONNECTED:
-        return {'connected': False, 'error': 'No conectado a MT5'}
-
-    try:
-        info = mt5.account_info()
-        if info is None:
-            MT5_CONNECTED = False
-            return {'connected': False, 'error': 'Sesión MT5 cerrada'}
-        MT5_ACCOUNT_INFO = info
-        return {
-            'connected': True,
-            'login': str(info.login),
-            'server': str(info.server),
-            'balance': float(info.balance),
-            'equity': float(info.equity),
-            'profit': float(info.profit) if hasattr(info, 'profit') else float(info.equity - info.balance),
-            'currency': str(info.currency)
-        }
-    except Exception as e:
-        MT5_CONNECTED = False
-        return {'connected': False, 'error': f'Error al obtener info MT5: {str(e)}'}
-
-
-def place_mt5_order(action):
-    """Envía orden a MT5"""
-    if not MT5_AVAILABLE:
-        return {'success': False, 'error': 'MetaTrader5 no disponible'}
-
-    if not ensure_mt5_connected():
-        return {'success': False, 'error': 'No conectado a MT5. Verifica las credenciales y la ruta de MT5.'}
-
-    symbol = detect_mt5_symbol(TRADING_SYMBOL or TRADING_DATA.get('symbol', 'EURUSD'))
-    volume = TRADING_DATA.get('volume', DEFAULT_VOLUME or 0.01)
-    if not mt5.symbol_select(symbol, True):
-        return {'success': False, 'error': f'No se pudo seleccionar el símbolo {symbol} en MT5'}
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return {'success': False, 'error': f'No hay ticks disponibles para {symbol}'}
-    price = float(tick.ask) if action == 'BUY' else float(tick.bid)
-    order_type = mt5.ORDER_TYPE_BUY if action == 'BUY' else mt5.ORDER_TYPE_SELL
-    deviation = 20
-
-    request = {
-        'action': mt5.TRADE_ACTION_DEAL,
-        'symbol': symbol,
-        'volume': float(volume),
-        'type': order_type,
-        'price': float(price),
-        'deviation': deviation,
-        'magic': 234000,
-        'comment': f'AI {action}',
-        'type_time': mt5.ORDER_TIME_GTC,
-        'type_filling': mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-    if result is None:
-        last_error = mt5.last_error()
-        last_error = ' - '.join(map(str, last_error)) if isinstance(last_error, tuple) else str(last_error)
-        return {'success': False, 'error': f'Orden MT5 no enviada. Error MT5: {last_error}'}
-
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        error_comment = getattr(result, 'comment', '')
-        last_error = mt5.last_error()
-        last_error = ' - '.join(map(str, last_error)) if isinstance(last_error, tuple) else str(last_error)
-        return {
-            'success': False,
-            'error': f'Orden MT5 fallida: {result.retcode} - {error_comment}'.strip(),
-            'mt5_error': last_error
-        }
-
-    return {'success': True, 'ticket': int(result.order), 'price': float(price), 'volume': float(volume)}
-
-
-def close_all_mt5_positions():
-    """Cierra todas las posiciones abiertas en MT5 para el símbolo configurado"""
-    if not MT5_AVAILABLE or not MT5_CONNECTED:
-        return {'success': False, 'error': 'MT5 no conectado'}
-
-    symbol = detect_mt5_symbol(TRADING_SYMBOL or TRADING_DATA.get('symbol', 'EURUSD'))
-    positions = mt5.positions_get(symbol=symbol)
-    if positions is None or len(positions) == 0:
-        return {'success': True, 'closed': 0}
-
-    closed = 0
-    for pos in positions:
-        order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        price = mt5.symbol_info_tick(symbol).bid if order_type == mt5.ORDER_TYPE_SELL else mt5.symbol_info_tick(symbol).ask
-        request = {
-            'action': mt5.TRADE_ACTION_DEAL,
-            'symbol': symbol,
-            'volume': float(pos.volume),
-            'type': order_type,
-            'position': int(pos.ticket),
-            'price': float(price),
-            'deviation': 20,
-            'magic': 234000,
-            'comment': f'Close pos {pos.ticket}',
-            'type_time': mt5.ORDER_TIME_GTC,
-            'type_filling': mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            closed += 1
-
-    return {'success': True, 'closed': closed}
 
 
 price_thread = None
@@ -1061,47 +651,705 @@ def start_background_services():
         price_thread.start()
 
 # ====================================================================
-# RUTAS
+# AUTENTICACIÓN Y AUTORIZACIÓN
+# ====================================================================
+
+def get_current_user():
+    """Obtener usuario actual de la sesión con verificación de expiración de plan"""
+    if not DB_AVAILABLE or 'user_id' not in session:
+        return None
+    try:
+        user = User.query.get(session['user_id'])
+        if user and user.subscription_plan in ('PRO', 'PREMIUM') and user.subscription_expires:
+            if datetime.utcnow() > user.subscription_expires:
+                user.subscription_plan = 'FREE'
+                user.subscription_status = 'expired'
+                db.session.commit()
+        return user
+    except Exception:
+        return None
+
+def login_required(f):
+    """Decorador para rutas que requieren autenticación"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({'success': False, 'error': 'Autenticación requerida'}), 401
+        request.user = user
+        return f(*args, **kwargs)
+    return decorated_function
+
+def check_subscription(required_plan='FREE'):
+    """Decorador para verificar que el usuario autenticado tiene el plan necesario"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({'success': False, 'error': 'Autenticación requerida'}), 401
+            
+            if required_plan == 'PRO':
+                if user.subscription_plan not in ('PRO', 'PREMIUM') or not user.has_active_subscription():
+                    return jsonify({
+                        'success': False, 
+                        'error': 'Esta función requiere un plan PRO ($9.99/mes) o PREMIUM ($19.99/mes)',
+                        'upgrade_required': True
+                    }), 403
+            elif required_plan == 'PREMIUM':
+                if user.subscription_plan != 'PREMIUM' or not user.has_active_subscription():
+                    return jsonify({
+                        'success': False, 
+                        'error': 'Esta función requiere un plan PREMIUM ($19.99/mes)',
+                        'upgrade_required': True
+                    }), 403
+            
+            request.user = user
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+# ====================================================================
+# RUTAS DE AUTENTICACIÓN
+# ====================================================================
+
+@app.route('/api/auth/register', methods=['POST'])
+@rate_limit(10)  # 10 registros por minuto máximo
+def api_register():
+    """Registrar nuevo usuario"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema de usuarios no disponible'}), 503
+    
+    data = request.get_json() or {}
+    email = data.get('email', '').strip().lower()
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    full_name = data.get('full_name', '').strip()
+    
+    # Validaciones
+    if not email or not username or not password:
+        return jsonify({'success': False, 'error': 'Email, usuario y contraseña requeridos'}), 400
+    
+    if len(password) < 6:
+        return jsonify({'success': False, 'error': 'Contraseña debe tener al menos 6 caracteres'}), 400
+    
+    if len(username) < 3:
+        return jsonify({'success': False, 'error': 'Usuario debe tener al menos 3 caracteres'}), 400
+    
+    # Verificar si existe
+    if User.query.filter_by(email=email).first():
+        return jsonify({'success': False, 'error': 'El email ya está registrado'}), 400
+    
+    if User.query.filter_by(username=username).first():
+        return jsonify({'success': False, 'error': 'El usuario ya está en uso'}), 400
+    
+    try:
+        # Crear usuario
+        user = User(
+            email=email,
+            username=username,
+            full_name=full_name,
+            subscription_plan='FREE',
+            subscription_status='active'
+        )
+        user.set_password(password)
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        # Crear sesión automática
+        token = secrets.token_urlsafe(32)
+        login_sess = LoginSession(
+            user_id=user.id,
+            session_token=token,
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent', ''),
+            expires_at=datetime.utcnow() + timedelta(days=30)
+        )
+        db.session.add(login_sess)
+        db.session.commit()
+        
+        session['user_id'] = user.id
+        session['session_token'] = token
+        
+        return jsonify({
+            'success': True,
+            'message': 'Usuario registrado exitosamente',
+            'user': user.to_dict()
+        }), 201
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/login', methods=['POST'])
+@rate_limit(20)  # 20 intentos por minuto máximo
+def api_login():
+    """Login de usuario"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema de usuarios no disponible'}), 503
+    
+    data = request.get_json() or {}
+    email_or_user = data.get('email') or data.get('username', '').strip()
+    password = data.get('password', '')
+    
+    if not email_or_user or not password:
+        return jsonify({'success': False, 'error': 'Email/usuario y contraseña requeridos'}), 400
+    
+    # Buscar usuario
+    user = User.query.filter(
+        (User.email == email_or_user.lower()) | (User.username == email_or_user)
+    ).first()
+    
+    if not user or not user.check_password(password):
+        return jsonify({'success': False, 'error': 'Email/usuario o contraseña incorrectos'}), 401
+    
+    if not user.is_active:
+        return jsonify({'success': False, 'error': 'Usuario desactivado'}), 403
+    
+    try:
+        # Crear sesión
+        token = secrets.token_urlsafe(32)
+        login_sess = LoginSession(
+            user_id=user.id,
+            session_token=token,
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent', ''),
+            expires_at=datetime.utcnow() + timedelta(days=30)
+        )
+        
+        user.last_login = datetime.utcnow()
+        db.session.add(login_sess)
+        db.session.commit()
+        
+        session['user_id'] = user.id
+        session['session_token'] = token
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login exitoso',
+            'user': user.to_dict()
+        })
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@login_required
+def api_logout():
+    """Logout de usuario"""
+    try:
+        if 'session_token' in session:
+            login_sess = LoginSession.query.filter_by(
+                session_token=session['session_token']
+            ).first()
+            if login_sess:
+                login_sess.is_active = False
+                db.session.commit()
+        
+        session.clear()
+        return jsonify({'success': True, 'message': 'Logout exitoso'})
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/me')
+@login_required
+def api_get_current_user():
+    """Obtener datos del usuario actual"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'success': False, 'error': 'No autenticado'}), 401
+    
+    return jsonify({
+        'success': True,
+        'user': user.to_dict(include_sensitive=True)
+    })
+
+
+@app.route('/api/user/profile', methods=['PUT', 'POST'])
+@login_required
+def api_update_profile():
+    """Actualizar perfil del usuario autenticado"""
+    user = get_current_user()
+    data = request.get_json() or {}
+    
+    full_name = data.get('full_name')
+    avatar_url = data.get('avatar_url')
+    
+    if full_name is not None:
+        user.full_name = str(full_name).strip()
+    if avatar_url is not None:
+        user.avatar_url = str(avatar_url).strip()
+        
+    try:
+        user.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({
+            'success': True,
+            'message': 'Perfil actualizado correctamente',
+            'user': user.to_dict(include_sensitive=True)
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/user/password', methods=['PUT', 'POST'])
+@login_required
+def api_change_password():
+    """Cambiar contraseña del usuario autenticado"""
+    user = get_current_user()
+    data = request.get_json() or {}
+    
+    current_password = data.get('current_password', '')
+    new_password = data.get('new_password', '')
+    
+    if not current_password or not new_password:
+        return jsonify({'success': False, 'error': 'Se requiere contraseña actual y nueva'}), 400
+        
+    if not user.check_password(current_password):
+        return jsonify({'success': False, 'error': 'La contraseña actual es incorrecta'}), 401
+        
+    if len(new_password) < 6:
+        return jsonify({'success': False, 'error': 'La nueva contraseña debe tener al menos 6 caracteres'}), 400
+        
+    try:
+        user.set_password(new_password)
+        db.session.commit()
+        return jsonify({
+            'success': True,
+            'message': 'Contraseña cambiada exitosamente'
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/forgot-password', methods=['POST'])
+@rate_limit(5)
+def api_forgot_password():
+    """Solicitar recuperación de contraseña"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+        
+    data = request.get_json() or {}
+    email = data.get('email', '').strip().lower()
+    
+    if not email:
+        return jsonify({'success': False, 'error': 'Email requerido'}), 400
+        
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({'success': True, 'message': 'Si el email está registrado, se generó el token de recuperación.'})
+        
+    try:
+        token_str = secrets.token_urlsafe(32)
+        reset_token = PasswordResetToken(
+            user_id=user.id,
+            token=token_str,
+            expires_at=datetime.utcnow() + timedelta(hours=1)
+        )
+        db.session.add(reset_token)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Token de recuperación generado exitosamente',
+            'reset_token': token_str
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/reset-password', methods=['POST'])
+@rate_limit(5)
+def api_reset_password():
+    """Restablecer contraseña usando token de recuperación"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+        
+    data = request.get_json() or {}
+    token_str = data.get('token', '').strip()
+    new_password = data.get('new_password', '')
+    
+    if not token_str or not new_password:
+        return jsonify({'success': False, 'error': 'Token y nueva contraseña requeridos'}), 400
+        
+    if len(new_password) < 6:
+        return jsonify({'success': False, 'error': 'La contraseña debe tener al menos 6 caracteres'}), 400
+        
+    try:
+        reset_token = PasswordResetToken.query.filter_by(token=token_str).first()
+        if not reset_token or not reset_token.is_valid():
+            return jsonify({'success': False, 'error': 'Token inválido o expirado'}), 400
+            
+        user = reset_token.user
+        user.set_password(new_password)
+        reset_token.is_used = True
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Contraseña restablecida exitosamente'
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ====================================================================
+# RUTAS DE SUSCRIPCIÓN
+# ====================================================================
+
+@app.route('/api/subscription/plans')
+def api_get_plans():
+    """Obtener planes disponibles"""
+    plans = {
+        'FREE': {
+            'name': 'Gratis',
+            'price': 0,
+            'currency': 'USD',
+            'billing_period': 'forever',
+            'features': [
+                'Acceso básico a trading',
+                'Máximo 5 operaciones por día',
+                'Gráficos simples',
+                'Análisis técnico básico',
+                'Sin datos históricos avanzados'
+            ]
+        },
+        'PRO': {
+            'name': 'Pro',
+            'price': 9.99,
+            'currency': 'USD',
+            'billing_period': 'monthly',
+            'features': [
+                'Trading ilimitado',
+                'Gráficos avanzados',
+                'Análisis técnico completo',
+                'Datos históricos 1 año',
+                'Alertas de precios',
+                'Soporte prioritario'
+            ]
+        },
+        'PREMIUM': {
+            'name': 'Premium',
+            'price': 19.99,
+            'currency': 'USD',
+            'billing_period': 'monthly',
+            'features': [
+                'Todo de PRO',
+                'IA predictiva avanzada',
+                'Datos históricos 5 años',
+    
+                'API access',
+                'Soporte 24/7',
+                'Análisis personalizado'
+            ]
+        }
+    }
+    return jsonify({'success': True, 'plans': plans})
+
+
+@app.route('/api/subscription/current')
+@login_required
+def api_get_subscription():
+    """Obtener suscripción actual del usuario"""
+    user = get_current_user()
+    
+    return jsonify({
+        'success': True,
+        'subscription': {
+            'plan': user.subscription_plan,
+            'status': user.subscription_status,
+            'expires_at': user.subscription_expires.isoformat() if user.subscription_expires else None,
+            'is_active': user.has_active_subscription()
+        }
+    })
+
+
+@app.route('/api/subscription/upgrade', methods=['POST'])
+@login_required
+def api_upgrade_subscription():
+    """Mejorar a plan de pago"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+    
+    user = get_current_user()
+    data = request.get_json() or {}
+    plan = data.get('plan', '').upper()
+    
+    if plan not in ('PRO', 'PREMIUM'):
+        return jsonify({'success': False, 'error': 'Plan inválido'}), 400
+    
+    if user.subscription_plan == plan:
+        return jsonify({'success': False, 'error': f'Ya tienes el plan {plan}'}), 400
+    
+    try:
+        # Simulación de pago con Stripe (en producción usar Stripe API real)
+        user.upgrade_subscription(plan, stripe_sub_id=f"sub_{user.id}_{plan}")
+        
+        # Registrar en historial de billing
+        billing = BillingHistory(
+            user_id=user.id,
+            plan=plan,
+            amount=9.99 if plan == 'PRO' else 19.99,
+            currency='USD',
+            status='succeeded',
+            description=f'Upgrade to {plan}'
+        )
+        
+        db.session.add(billing)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Actualizado a plan {plan}',
+            'subscription': {
+                'plan': user.subscription_plan,
+                'expires_at': user.subscription_expires.isoformat() if user.subscription_expires else None
+            }
+        })
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/subscription/cancel', methods=['POST'])
+@login_required
+def api_cancel_subscription():
+    """Cancelar suscripción"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+    
+    user = get_current_user()
+    
+    if user.subscription_plan == 'FREE':
+        return jsonify({'success': False, 'error': 'No hay suscripción activa para cancelar'}), 400
+    
+    try:
+        user.cancel_subscription()
+        
+        # Registrar cancelación
+        billing = BillingHistory(
+            user_id=user.id,
+            plan='CANCELED',
+            amount=0,
+            status='succeeded',
+            description='Subscription canceled'
+        )
+        
+        db.session.add(billing)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Suscripción cancelada. Vuelviste al plan FREE.',
+            'subscription': {
+                'plan': user.subscription_plan,
+                'status': user.subscription_status
+            }
+        })
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/subscription/renew', methods=['POST'])
+@login_required
+def api_renew_subscription():
+    """Renovar suscripción actual"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+        
+    user = get_current_user()
+    if user.subscription_plan == 'FREE':
+        return jsonify({'success': False, 'error': 'El plan FREE no requiere renovación'}), 400
+        
+    try:
+        base_time = user.subscription_expires if (user.subscription_expires and user.subscription_expires > datetime.utcnow()) else datetime.utcnow()
+        user.subscription_expires = base_time + timedelta(days=30)
+        user.subscription_status = 'active'
+        
+        amount = 9.99 if user.subscription_plan == 'PRO' else 19.99
+        billing = BillingHistory(
+            user_id=user.id,
+            plan=user.subscription_plan,
+            amount=amount,
+            currency='USD',
+            status='succeeded',
+            description=f'Renewal of {user.subscription_plan} plan'
+        )
+        db.session.add(billing)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Suscripción {user.subscription_plan} renovada exitosamente por 30 días',
+            'subscription': {
+                'plan': user.subscription_plan,
+                'expires_at': user.subscription_expires.isoformat()
+            }
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/billing/history')
+@login_required
+def api_billing_history():
+    """Obtener historial de pagos"""
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+    
+    user = get_current_user()
+    
+    billing_records = BillingHistory.query.filter_by(user_id=user.id).order_by(
+        BillingHistory.charged_at.desc()
+    ).limit(20).all()
+    
+    return jsonify({
+        'success': True,
+        'billing_history': [record.to_dict() for record in billing_records]
+    })
+
+# ====================================================================
+# RUTAS DE PÁGINAS Y NAVEGACIÓN
 # ====================================================================
 
 @app.route('/')
 def index():
-    """Dashboard principal"""
-    return render_template_string(DASHBOARD_HTML)
+    """Ruta raíz: redirige según autenticación"""
+    user = get_current_user()
+    if user:
+        return redirect('/dashboard')
+    return redirect('/login')
 
 
 @app.route('/dashboard')
 def dashboard():
-    """Ruta alternativa para el panel de control"""
+    """Panel de control principal"""
+    user = get_current_user()
+    if not user:
+        return redirect('/login')
     return render_template_string(DASHBOARD_HTML)
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def view_login():
+    """Vista de inicio de sesión"""
+    if request.method == 'POST':
+        email_or_user = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        
+        user = User.query.filter(
+            (User.email == email_or_user.lower()) | (User.username == email_or_user)
+        ).first() if DB_AVAILABLE else None
+        
+        if user and user.check_password(password):
+            token = secrets.token_urlsafe(32)
+            login_sess = LoginSession(
+                user_id=user.id,
+                session_token=token,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', ''),
+                expires_at=datetime.utcnow() + timedelta(days=30)
+            )
+            user.last_login = datetime.utcnow()
+            db.session.add(login_sess)
+            db.session.commit()
+            
+            session['user_id'] = user.id
+            session['session_token'] = token
+            return redirect('/dashboard')
+        
+        return render_template_string(LOGIN_HTML, error='Usuario/Email o contraseña incorrectos')
+    
+    user = get_current_user()
+    if user:
+        return redirect('/dashboard')
+    return render_template_string(LOGIN_HTML)
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def view_register():
+    """Vista de registro de usuario"""
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        full_name = request.form.get('full_name', '').strip()
+        
+        if not email or not username or not password:
+            return render_template_string(REGISTER_HTML, error='Campos requeridos incompletos')
+            
+        if User.query.filter_by(email=email).first():
+            return render_template_string(REGISTER_HTML, error='El email ya está registrado')
+            
+        if User.query.filter_by(username=username).first():
+            return render_template_string(REGISTER_HTML, error='El usuario ya está en uso')
+            
+        try:
+            user = User(
+                email=email,
+                username=username,
+                full_name=full_name,
+                subscription_plan='FREE',
+                subscription_status='active'
+            )
+            user.set_password(password)
+            db.session.add(user)
+            db.session.commit()
+            
+            token = secrets.token_urlsafe(32)
+            login_sess = LoginSession(
+                user_id=user.id,
+                session_token=token,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', ''),
+                expires_at=datetime.utcnow() + timedelta(days=30)
+            )
+            db.session.add(login_sess)
+            db.session.commit()
+            
+            session['user_id'] = user.id
+            session['session_token'] = token
+            return redirect('/dashboard')
+        except Exception as e:
+            db.session.rollback()
+            return render_template_string(REGISTER_HTML, error=f'Error creando cuenta: {e}')
+            
+    user = get_current_user()
+    if user:
+        return redirect('/dashboard')
+    return render_template_string(REGISTER_HTML)
 
 
 @app.route('/api/status')
 def api_status():
-    """Obtener estado del trading"""
+    """Obtener estado del sistema de mercado y predicciones"""
     with PRICE_LOCK:
-        mt5_state = mt5_status() if MT5_AVAILABLE else {'connected': False, 'error': 'MetaTrader5 package no instalado'}
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
         decimals, _, _, _, _ = get_symbol_format(symbol)
-        return jsonify({
+        status = {
             'price': TRADING_DATA['price'],
             'decimals': decimals,
-            'balance': TRADING_DATA['balance'],
-            'equity': TRADING_DATA['equity'],
-            'trades_open': TRADING_DATA['trades_open'],
-            'trades': TRADING_DATA['trades'],
-            'auto_enabled': TRADING_DATA['auto_enabled'],
-            'use_prediction': TRADING_DATA.get('use_prediction', True),
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
-            'volume': TRADING_DATA.get('volume', 0.01),
-            'simulation_mode': SIMULATION_MODE,
             'prices': TRADING_DATA['price_history'][-30:],
-            'candles': get_candle_data(40),
-            'closed_count': len(TRADING_DATA['closed_trades']),
-            'chat_history': TRADING_DATA['chat_history'][-20:],
-            'mt5': mt5_state
-        })
+            'chat_history': TRADING_DATA['chat_history'][-20:]
+        }
+
+    status['candles'] = get_candle_data(40)
+    return jsonify(status)
 
 
 
@@ -1143,6 +1391,8 @@ def api_set_symbol():
 
 
 @app.route('/api/news-alerts')
+@login_required
+@check_subscription('PRO')
 def api_news_alerts():
     """Devuelve noticias y alertas de volatilidad recientes."""
     with PRICE_LOCK:
@@ -1164,6 +1414,8 @@ def api_news_alerts():
 
 
 @app.route('/api/advanced-prediction')
+@login_required
+@check_subscription('PRO')
 def api_advanced_prediction():
     """Panel de predicción avanzada con todos los indicadores."""
     with PRICE_LOCK:
@@ -1222,108 +1474,10 @@ def api_advanced_prediction():
             'timestamp': datetime.now().isoformat()
         })
 
-@app.route('/api/mt5/connect', methods=['POST'])
-def api_mt5_connect():
-    """Conecta MT5 usando credenciales enviadas por la web o mt5_config.py"""
-    global SIMULATION_MODE
-    data = request.get_json(silent=True) or {}
-    login = data.get('login')
-    password = data.get('password')
-    server = data.get('server')
-    path = data.get('path')
-
-    result = initialize_mt5(login=login, password=password, server=server, path=path)
-    if result.get('success'):
-        SIMULATION_MODE = False
-        mt5_state = mt5_status() if MT5_AVAILABLE else {'connected': False, 'error': 'MetaTrader5 package no instalado'}
-        response = {**result, 'mt5': mt5_state, 'simulation_mode': SIMULATION_MODE}
-        return jsonify(response)
-    return jsonify(result), 400
-
-
-@app.route('/api/mt5/status')
-def api_mt5_status():
-    return jsonify(mt5_status())
-
-
-def save_mt5_config_file(login, password, server, path=None, symbol=None, volume=None):
-    """Guarda las credenciales MT5 en el archivo mt5_config.py para uso persistente."""
-    global MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH, MT5_CREDENTIALS, TRADING_SYMBOL, DEFAULT_VOLUME
-    cfg_path = os.path.join(os.path.dirname(__file__), 'mt5_config.py')
-    try:
-        # Decide si login es numérico
-        try:
-            login_val = int(str(login).strip())
-            login_repr = str(login_val)
-        except Exception:
-            login_repr = '"' + str(login).strip().replace('"', '\\"') + '"'
-
-        password_repr = '"' + str(password).replace('"', '\\"') + '"'
-        server_repr = '"' + str(server).replace('"', '\\"') + '"'
-        path_repr = 'None' if not path else 'r"' + str(path).replace('"', '\\"') + '"'
-
-        active_symbol = (normalize_symbol(symbol) if SYMBOLS_AVAILABLE and symbol else (symbol or TRADING_SYMBOL or 'EURUSD')).upper()
-        active_volume = DEFAULT_VOLUME if volume is None else float(volume)
-        content = (
-            "#!/usr/bin/env python3\n"
-            '"""MetaTrader5 Configuration File (auto-generated)"""\n\n'
-            "# Auto-generated MT5 config\n"
-            f"MT5_LOGIN = {login_repr}\n"
-            f"MT5_PASSWORD = {password_repr}\n"
-            f"MT5_SERVER = {server_repr}\n"
-            f"MT5_PATH = {path_repr}\n"
-            f"TRADING_SYMBOL = \"{active_symbol}\"\n"
-            f"DEFAULT_VOLUME = {active_volume}\n\n"
-            "# Defaults\n"
-            "USE_REAL_ACCOUNT = False\n"
-            "TIMEFRAME_MINUTES = 1\n"
-            "CANDLE_COUNT = 100\n"
-        )
-
-        with open(cfg_path, 'w', encoding='utf-8') as fh:
-            fh.write(content)
-
-        MT5_LOGIN = str(login).strip()
-        MT5_PASSWORD = str(password)
-        MT5_SERVER = str(server).strip()
-        MT5_PATH = str(path).strip() if path else MT5_PATH
-        if symbol:
-            TRADING_SYMBOL = normalize_symbol(symbol) if SYMBOLS_AVAILABLE else symbol.upper()
-        if volume is not None:
-            try:
-                DEFAULT_VOLUME = float(volume)
-            except Exception:
-                pass
-        MT5_CREDENTIALS = {
-            'login': MT5_LOGIN,
-            'password': MT5_PASSWORD,
-            'server': MT5_SERVER,
-            'path': MT5_PATH
-        }
-
-        return True, f'Archivo actualizado: {cfg_path}'
-    except Exception as e:
-        return False, str(e)
-
-
-@app.route('/api/mt5/save-config', methods=['POST'])
-def api_mt5_save_config():
-    data = request.get_json(silent=True) or {}
-    login = data.get('login')
-    password = data.get('password')
-    server = data.get('server')
-    path = data.get('path')
-
-    if not all([login, password, server]):
-        return jsonify({'success': False, 'error': 'Faltan campos: login, password o server'}), 400
-
-    ok, msg = save_mt5_config_file(login, password, server, path)
-    if ok:
-        return jsonify({'success': True, 'message': msg})
-    return jsonify({'success': False, 'error': msg}), 500
-
 
 @app.route('/api/professional-analysis')
+@login_required
+@check_subscription('PREMIUM')
 def api_professional_analysis():
     """Análisis profesional inteligente con indicadores técnicos avanzados y aprendizaje"""
     with PRICE_LOCK:
@@ -1367,6 +1521,7 @@ def api_professional_analysis():
 
 
 @app.route('/api/predict')
+@login_required
 def api_predict():
     """Predicción de precio futuro y dirección usando PredictionEngine."""
     with PRICE_LOCK:
@@ -1395,6 +1550,7 @@ def api_predict():
 
 
 @app.route('/api/predict/levels')
+@login_required
 def api_predict_levels():
     """Devuelve niveles clave (soportes/resistencias, entry, SL, TP)."""
     with PRICE_LOCK:
@@ -1423,6 +1579,7 @@ def api_predict_levels():
 
 
 @app.route('/api/predict/signal')
+@login_required
 def api_predict_signal():
     """Combina predicción y indicadores para una señal operativa recomendada."""
     with PRICE_LOCK:
@@ -1449,149 +1606,8 @@ def api_predict_signal():
         return jsonify({'success': True, 'prediction_signal': signal})
 
 
-@app.route('/api/buy', methods=['POST'])
-def api_buy():
-    """Ejecutar compra (MT5 si está conectado, o simulación local)"""
-    global SIMULATION_MODE
-    with PRICE_LOCK:
-        if not SIMULATION_MODE and MT5_AVAILABLE:
-            if ensure_mt5_connected():
-                result = place_mt5_order('BUY')
-                if result.get('success'):
-                    trade = {
-                        'id': len(TRADING_DATA['trades']) + 1,
-                        'action': 'BUY',
-                        'entry': result['price'],
-                        'size': result['volume'],
-                        'pl': 0,
-                        'ticket': result['ticket'],
-                        'source': 'MT5'
-                    }
-                    TRADING_DATA['trades'].append(trade)
-                    TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-                    return jsonify({'success': True, 'trade': trade, 'price': result['price']})
-                return jsonify({'success': False, 'error': result.get('error')}), 400
-            return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de ejecutar órdenes o activa Modo Simulación.'}), 400
-
-        # Simulación local
-        trade = {
-            'id': len(TRADING_DATA['trades']) + 1,
-            'action': 'BUY',
-            'entry': TRADING_DATA['price'],
-            'size': TRADING_DATA.get('volume', DEFAULT_VOLUME or 0.1),
-            'pl': 0,
-            'source': 'SIM'
-        }
-        TRADING_DATA['trades'].append(trade)
-        TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-        msg = f"Operación de COMPRA simulada en {TRADING_DATA['symbol']} a {trade['entry']} (vol {trade['size']})"
-        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
-        return jsonify({'success': True, 'trade': trade, 'price': TRADING_DATA['price'], 'simulated': True})
-
-
-@app.route('/api/sell', methods=['POST'])
-def api_sell():
-    """Ejecutar venta (MT5 si está conectado, o simulación local)"""
-    global SIMULATION_MODE
-    with PRICE_LOCK:
-        if not SIMULATION_MODE and MT5_AVAILABLE:
-            if ensure_mt5_connected():
-                result = place_mt5_order('SELL')
-                if result.get('success'):
-                    trade = {
-                        'id': len(TRADING_DATA['trades']) + 1,
-                        'action': 'SELL',
-                        'entry': result['price'],
-                        'size': result['volume'],
-                        'pl': 0,
-                        'ticket': result['ticket'],
-                        'source': 'MT5'
-                    }
-                    TRADING_DATA['trades'].append(trade)
-                    TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-                    return jsonify({'success': True, 'trade': trade, 'price': result['price']})
-                return jsonify({'success': False, 'error': result.get('error')}), 400
-            return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de ejecutar órdenes o activa Modo Simulación.'}), 400
-
-        # Simulación local
-        trade = {
-            'id': len(TRADING_DATA['trades']) + 1,
-            'action': 'SELL',
-            'entry': TRADING_DATA['price'],
-            'size': TRADING_DATA.get('volume', DEFAULT_VOLUME or 0.1),
-            'pl': 0,
-            'source': 'SIM'
-        }
-        TRADING_DATA['trades'].append(trade)
-        TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-        msg = f"Operación de VENTA simulada en {TRADING_DATA['symbol']} a {trade['entry']} (vol {trade['size']})"
-        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
-        return jsonify({'success': True, 'trade': trade, 'price': TRADING_DATA['price'], 'simulated': True})
-
-
-@app.route('/api/close-all', methods=['POST'])
-def api_close_all():
-    """Cerrar todos los trades"""
-    global SIMULATION_MODE
-    with PRICE_LOCK:
-        closed = 0
-        if not SIMULATION_MODE and MT5_AVAILABLE:
-            if ensure_mt5_connected():
-                result = close_all_mt5_positions()
-                if result.get('success'):
-                    closed = result.get('closed', 0)
-                else:
-                    return jsonify({'success': False, 'error': result.get('error')}), 400
-            else:
-                return jsonify({'success': False, 'error': 'MT5 disponible pero no conectado. Conecta MT5 antes de cerrar posiciones o activa Modo Simulación.'}), 400
-        else:
-            closed = len(TRADING_DATA['trades'])
-
-        TRADING_DATA['closed_trades'].extend(TRADING_DATA['trades'])
-        TRADING_DATA['trades'] = []
-        TRADING_DATA['trades_open'] = 0
-        msg = f"Cerradas {closed} operaciones en {TRADING_DATA['symbol']}"
-        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
-        return jsonify({'success': True, 'closed': closed})
-
-
-@app.route('/api/toggle-auto', methods=['POST'])
-def api_toggle_auto():
-    """Alternar modo IA automática"""
-    with PRICE_LOCK:
-        TRADING_DATA['auto_enabled'] = not TRADING_DATA['auto_enabled']
-        return jsonify({'success': True, 'auto_enabled': TRADING_DATA['auto_enabled']})
-
-
-@app.route('/api/toggle-prediction', methods=['POST'])
-def api_toggle_prediction():
-    """Alternar uso de predicciones en el trading automático"""
-    with PRICE_LOCK:
-        TRADING_DATA['use_prediction'] = not TRADING_DATA.get('use_prediction', True)
-        status = TRADING_DATA['use_prediction']
-        TRADING_DATA['chat_history'].append({
-            'sender': 'IA',
-            'text': f"Uso de predicción automática {'activado' if status else 'desactivado'}."
-        })
-        return jsonify({'success': True, 'use_prediction': status})
-
-
-@app.route('/api/simulation/toggle', methods=['POST'])
-def api_toggle_simulation():
-    """Alternar entre modo simulación y modo MT5 real"""
-    global SIMULATION_MODE
-    with PRICE_LOCK:
-        SIMULATION_MODE = not SIMULATION_MODE
-        status_text = 'SIMULACIÓN' if SIMULATION_MODE else 'MT5 REAL'
-        TRADING_DATA['chat_history'].append({
-            'timestamp': datetime.now().isoformat(),
-            'sender': 'IA',
-            'text': f"Modo cambiado a: {status_text}."
-        })
-        return jsonify({'success': True, 'simulation_mode': SIMULATION_MODE})
-
-
 @app.route('/api/chat', methods=['POST'])
+@login_required
 def api_chat():
     """Procesar mensajes del chat"""
     data = request.get_json()
@@ -1639,245 +1655,31 @@ def api_chat_history():
 
 
 def process_chat_message(message):
-    """Procesa mensajes del chat con IA inteligente"""
+    """Procesa mensajes del chat con IA de análisis de mercado"""
     if not message:
-        return "Por favor escribe un comando o pregunta."
+        return "Por favor escribe una consulta sobre el mercado o una predicción."
     
     message_lower = message.lower()
     
-    if 'compra' in message_lower or 'buy' in message_lower or 'comprar' in message_lower:
+    if 'estado' in message_lower or 'status' in message_lower or 'precio' in message_lower:
         with PRICE_LOCK:
-            trade = {
-                'id': len(TRADING_DATA['trades']) + len(TRADING_DATA['closed_trades']) + 1,
-                'action': 'COMPRA',
-                'entry': TRADING_DATA['price'],
-                'size': 0.1,
-                'pl': 0
-            }
-            TRADING_DATA['trades'].append(trade)
-            TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-            AI_LEARNING_DB['trade_history'].append(trade)
-        return f"Operación de compra ejecutada a: {TRADING_DATA['price']:.4f}. Identificador #{trade['id']}."
+            return f"Estado del Mercado - Símbolo: {TRADING_DATA.get('symbol', 'EURUSD')}, Precio Actual: {TRADING_DATA['price']:.4f}."
     
-    elif 'venta' in message_lower or 'sell' in message_lower or 'vender' in message_lower:
+    elif 'analizar' in message_lower or 'analyze' in message_lower or 'señal' in message_lower or 'prediccion' in message_lower:
         with PRICE_LOCK:
-            trade = {
-                'id': len(TRADING_DATA['trades']) + len(TRADING_DATA['closed_trades']) + 1,
-                'action': 'VENTA',
-                'entry': TRADING_DATA['price'],
-                'size': 0.1,
-                'pl': 0
-            }
-            TRADING_DATA['trades'].append(trade)
-            TRADING_DATA['trades_open'] = len(TRADING_DATA['trades'])
-            AI_LEARNING_DB['trade_history'].append(trade)
-        return f"Operación de venta ejecutada a: {TRADING_DATA['price']:.4f}. Identificador #{trade['id']}."
+            signal = TRADING_DATA.get('signal', {'action': 'ANALIZANDO', 'confidence': 0.75})
+            return f"Análisis de Mercado: Señal {signal.get('action', 'ESPERA')} con confianza {signal.get('confidence', 0.75):.1%}. Revisa el panel de Predicción Avanzada."
     
-    elif 'estado' in message_lower or 'status' in message_lower:
-        with PRICE_LOCK:
-            ia_status = 'ACTIVA' if TRADING_DATA['auto_enabled'] else 'INACTIVA'
-            return f"Estado actual - Precio: {TRADING_DATA['price']:.4f}, Saldo: ${TRADING_DATA['balance']:.2f}, Operaciones abiertas: {TRADING_DATA['trades_open']}, IA: {ia_status}"
-    
-    elif 'analizar' in message_lower or 'analyze' in message_lower or 'señal' in message_lower:
-        signal = TRADING_DATA['signal']
-        return f"Señal actual: {signal['action']} (Confianza: {signal['confidence']:.1%}). Continúa observando los indicadores técnicos."
-    
-    elif 'auto' in message_lower:
-        if 'on' in message_lower or 'activar' in message_lower or 'encender' in message_lower:
-            TRADING_DATA['auto_enabled'] = True
-            return "IA automática ACTIVADA. El sistema operará de forma inteligente según las señales técnicas."
-        elif 'off' in message_lower or 'desactivar' in message_lower or 'apagar' in message_lower:
-            TRADING_DATA['auto_enabled'] = False
-            return "IA automática DESACTIVADA. Control manual habilitado."
-    elif 'cerrar' in message_lower or 'close' in message_lower:
-        with PRICE_LOCK:
-            closed = len(TRADING_DATA['trades'])
-            TRADING_DATA['closed_trades'].extend(TRADING_DATA['trades'])
-            TRADING_DATA['trades'] = []
-            TRADING_DATA['trades_open'] = 0
-        return f"Se cerraron {closed} operaciones abiertas."
-    
-    elif 'ayuda' in message_lower or 'help' in message_lower or 'comandos' in message_lower:
-        return "Comandos disponibles: compra, venta, estado, analizar, auto on/off, cerrar, aprender. Soy tu asistente inteligente de trading."
-    
-    elif 'aprender' in message_lower or 'learning' in message_lower:
-        learning_pct = (AI_LEARNING_DB['learning_score'] * 100)
-        return f"Mi progreso de aprendizaje: {learning_pct:.1f}%. He analizado {len(AI_LEARNING_DB['trade_history'])} operaciones y {len(AI_LEARNING_DB['successful_patterns'])} patrones exitosos."
+    elif 'ayuda' in message_lower or 'help' in message_lower:
+        return "Soy tu Asistente de IA de Trading. Puedes preguntarme sobre el 'precio', solicitar un 'análisis' o pedir el 'estado' del mercado actual."
     
     else:
-        return "Comando no reconocido. Escribe 'ayuda' para ver comandos disponibles. Continuaré aprendiendo de cada operación."
+        with PRICE_LOCK:
+            return f"He analizado tu consulta '{message}'. El símbolo actual es {TRADING_DATA.get('symbol', 'EURUSD')} a un precio de {TRADING_DATA['price']:.4f}."
 
 
 # ====================================================================
-# ENDPOINTS DEL BOT + IA + MT5 INTEGRADO
-# ====================================================================
 
-@app.route('/api/bot/status')
-def api_bot_status():
-    """Obtiene estado del sistema integrado Bot + IA + MT5"""
-    
-    if not BOT_TRADER or not INTEGRATION_AVAILABLE:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    status = BOT_TRADER.get_status()
-    return jsonify({
-        'running': status['running'],
-        'mt5_connected': status['mt5_connected'],
-        'config': status['config'],
-        'stats': status['stats'],
-        'account': status['account'],
-        'positions': status['positions'],
-        'current_price': status['current_price'],
-        'price_history': status['price_history'][-50:]
-    })
-
-
-@app.route('/api/bot/start', methods=['POST'])
-def api_bot_start():
-    """Inicia el trading automático integrado"""
-    
-    if not BOT_TRADER or not INTEGRATION_AVAILABLE:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    global BOT_THREAD
-    
-    data = request.get_json() or {}
-    duration = data.get('duration', None)  # Minutos
-    
-    if BOT_TRADER.running:
-        return jsonify({'error': 'Bot ya está ejecutándose'}), 400
-    
-    # Iniciar en thread separado
-    BOT_THREAD = threading.Thread(target=BOT_TRADER.start_trading, args=(duration,), daemon=True)
-    BOT_THREAD.start()
-    
-    return jsonify({
-        'success': True,
-        'message': f'Bot iniciado{"" if not duration else f" por {duration} minutos"}',
-        'mt5_connected': BOT_TRADER.mt5_manager.connected
-    })
-
-
-@app.route('/api/bot/stop', methods=['POST'])
-def api_bot_stop():
-    """Detiene el trading automático integrado"""
-    
-    if not BOT_TRADER:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    BOT_TRADER.stop_trading()
-    
-    return jsonify({
-        'success': True,
-        'message': 'Bot detenido'
-    })
-
-
-@app.route('/api/bot/connect-mt5', methods=['POST'])
-def api_bot_connect_mt5():
-    """Conecta el bot a MT5"""
-    
-    if not BOT_TRADER:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    data = request.get_json()
-    login = int(data.get('login', 0))
-    password = data.get('password', '')
-    server = data.get('server', '')
-    
-    if not all([login, password, server]):
-        return jsonify({'error': 'Credenciales incompletas'}), 400
-    
-    result = BOT_TRADER._connect_mt5(login, password, server)
-    
-    if result:
-        account = BOT_TRADER.mt5_manager.get_account_info()
-        return jsonify({
-            'success': True,
-            'message': f'Conectado a MT5: {login}',
-            'account': account
-        })
-    else:
-        return jsonify({
-            'success': False,
-            'error': 'No se pudo conectar a MT5'
-        }), 400
-
-
-@app.route('/api/bot/execute-manual', methods=['POST'])
-def api_bot_execute_manual():
-    """Ejecuta un trade manual a través del bot integrado"""
-    
-    if not BOT_TRADER:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    data = request.get_json()
-    action = data.get('action', '').upper()
-    
-    if action not in ['BUY', 'SELL']:
-        return jsonify({'error': 'Acción inválida'}), 400
-    
-    symbol = data.get('symbol', 'EURUSD')
-    volume = float(data.get('volume', BOT_TRADER.config['default_volume']))
-    
-    if BOT_TRADER.mt5_manager.connected:
-        result = BOT_TRADER.mt5_manager.place_order(action, symbol, volume)
-        if result['success']:
-            return jsonify(result)
-        else:
-            return jsonify(result), 400
-    else:
-        # Ejecutar en simulación
-        current_price = BOT_TRADER.price_history[-1]
-        trade = BOT_TRADER.trading_engine.open_trade(action, current_price, 0.85)
-        return jsonify({
-            'success': True,
-            'trade': trade,
-            'message': f'Trade simulado: {action} {volume} {symbol}'
-        })
-
-
-@app.route('/api/bot/positions')
-def api_bot_positions():
-    """Obtiene las posiciones abiertas"""
-    
-    if not BOT_TRADER:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    positions = []
-    
-    if BOT_TRADER.mt5_manager.connected:
-        positions = BOT_TRADER.mt5_manager.get_positions(BOT_TRADER.config['trading_symbol'])
-    
-    return jsonify({
-        'positions': positions,
-        'count': len(positions),
-        'source': 'MT5' if BOT_TRADER.mt5_manager.connected else 'Simulación'
-    })
-
-
-@app.route('/api/bot/config', methods=['GET', 'POST'])
-def api_bot_config():
-    """Obtiene o actualiza la configuración del bot"""
-    
-    if not BOT_TRADER:
-        return jsonify({'error': 'Sistema integrado no disponible'}), 503
-    
-    if request.method == 'POST':
-        data = request.get_json()
-        
-        # Actualizar configuración
-        for key, value in data.items():
-            if key in BOT_TRADER.config:
-                BOT_TRADER.config[key] = value
-        
-        return jsonify({
-            'success': True,
-            'config': BOT_TRADER.config
-        })
-    
-    # GET
-    return jsonify({'config': BOT_TRADER.config})
 
 
 # ====================================================================
@@ -1890,99 +1692,279 @@ LOGIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Trading + IA</title>
+    <title>Iniciar Sesión - Asistente de Trading</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #050505;
+            --surface: #0a0a0a;
+            --gold: #FFD700;
+            --gold-dim: #B8860B;
+            --purple: #8B5CF6;
+            --text: #F5F5F5;
+            --text-dim: #A0A0A0;
+            --border: rgba(255, 215, 0, 0.2);
+        }
         body {
-            font-family: Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            height: 100vh;
+            font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
+            padding: 20px;
         }
         .login-box {
-            background: white;
+            background: var(--surface);
             padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
             width: 100%;
-            max-width: 400px;
+            max-width: 420px;
         }
         .login-box h1 {
-            color: #667eea;
+            background: linear-gradient(90deg, var(--gold), #fff7cc, var(--gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
             text-align: center;
-            margin-bottom: 30px;
+            font-size: 24px;
+            margin-bottom: 24px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            color: #333;
-            font-weight: bold;
-            margin-bottom: 8px;
-        }
+        .form-group { margin-bottom: 18px; }
+        label { display: block; color: var(--gold); font-size: 13px; font-weight: 600; margin-bottom: 6px; }
         input {
             width: 100%;
             padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
+            background: #0d0d0d;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
             font-size: 14px;
         }
-        input:focus { outline: none; border-color: #667eea; }
+        input:focus { outline: none; border-color: var(--gold); }
         button {
             width: 100%;
             padding: 12px;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
+            background: linear-gradient(90deg, var(--gold), var(--gold-dim));
+            color: #000;
             border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            font-weight: bold;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 700;
             cursor: pointer;
+            transition: all 0.2s ease;
+            margin-top: 8px;
         }
-        button:hover { opacity: 0.9; }
-        .error {
-            color: red;
-            margin-bottom: 20px;
-            text-align: center;
-            font-weight: bold;
-        }
+        button:hover { opacity: 0.9; transform: translateY(-1px); }
+        .error { color: #FF2D2D; background: rgba(255,45,45,0.1); border: 1px solid rgba(255,45,45,0.3); padding: 10px; border-radius: 8px; margin-bottom: 18px; text-align: center; font-size: 13px; }
+        .links { margin-top: 20px; text-align: center; font-size: 13px; color: var(--text-dim); }
+        .links a { color: var(--gold); text-decoration: none; font-weight: 600; }
+        .links a:hover { text-decoration: underline; }
         .creds {
-            margin-top: 30px;
-            padding-top: 30px;
-            border-top: 1px solid #eee;
+            margin-top: 24px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255,255,255,0.06);
             font-size: 12px;
-            color: #666;
+            color: var(--text-dim);
         }
-        .creds code {
-            background: #f5f5f5;
-            padding: 4px 8px;
-            border-radius: 3px;
-            font-family: monospace;
-        }
+        .creds code { background: #111; padding: 3px 6px; border-radius: 4px; color: var(--gold); }
     </style>
 </head>
 <body>
     <div class="login-box">
-        <h1>🤖 Trading + IA</h1>
+        <h1>Asistente de Trading</h1>
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
         <form method="POST">
             <div class="form-group">
-                <label>Usuario</label>
-                <input type="text" name="username" required>
+                <label>Usuario o Email</label>
+                <input type="text" name="username" placeholder="usuario o correo@ejemplo.com" required>
             </div>
             <div class="form-group">
                 <label>Contraseña</label>
-                <input type="password" name="password" required>
+                <input type="password" name="password" placeholder="••••••••" required>
             </div>
-            <button type="submit">Entrar</button>
+            <button type="submit">Iniciar Sesión</button>
         </form>
+        <div class="links">
+            <p>¿No tienes cuenta? <a href="/register">Regístrate gratis</a></p>
+            <p style="margin-top:8px;"><a href="#" onclick="showForgotModal()">¿Olvidaste tu contraseña?</a></p>
+        </div>
         <div class="creds">
-            <strong>Credenciales de Demo:</strong><br>
+            <strong>Cuentas Demo:</strong><br>
             Admin: <code>admin</code> / <code>RyzA_jjITjuPQtV66Wwf0A</code><br>
-            Trader: <code>trader</code> / <code>SecurePass123</code>
+            Trader: <code>trader</code> / <code>SecurePass123</code><br>
+            Demo: <code>demo</code> / <code>password123</code>
+        </div>
+    </div>
+
+    <!-- Modal Recuperación -->
+    <div id="forgot-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); justify-content:center; align-items:center; z-index:999;">
+        <div style="background:var(--surface); padding:30px; border-radius:14px; border:1px solid var(--gold); max-width:400px; width:90%;">
+            <h3 style="color:var(--gold); margin-bottom:15px;">Recuperar Contraseña</h3>
+            <div id="forgot-step-1">
+                <p style="font-size:13px; color:var(--text-dim); margin-bottom:12px;">Introduce tu correo electrónico para solicitar el token de recuperación.</p>
+                <input id="forgot-email" type="email" placeholder="correo@ejemplo.com" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:12px;">
+                <button onclick="requestForgotToken()" style="width:100%;">Solicitar Token</button>
+            </div>
+            <div id="forgot-step-2" style="display:none; margin-top:15px;">
+                <p style="font-size:12px; color:var(--gold); margin-bottom:10px;" id="forgot-msg"></p>
+                <input id="reset-token-input" type="text" placeholder="Token de recuperación" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:10px;">
+                <input id="reset-new-pass" type="password" placeholder="Nueva Contraseña" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:12px;">
+                <button onclick="submitResetPassword()" style="width:100%;">Restablecer Contraseña</button>
+            </div>
+            <button onclick="closeForgotModal()" style="background:transparent; color:var(--text-dim); border:1px solid var(--text-dim); margin-top:12px; width:100%;">Cancelar</button>
+        </div>
+    </div>
+
+    <script>
+        function showForgotModal() { document.getElementById('forgot-modal').style.display = 'flex'; }
+        function closeForgotModal() { document.getElementById('forgot-modal').style.display = 'none'; }
+        function requestForgotToken() {
+            const email = document.getElementById('forgot-email').value.trim();
+            if (!email) return alert('Por favor ingresa tu email');
+            fetch('/api/auth/forgot-password', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ email })
+            }).then(r => r.json()).then(d => {
+                if (d.success) {
+                    document.getElementById('forgot-step-1').style.display = 'none';
+                    document.getElementById('forgot-step-2').style.display = 'block';
+                    document.getElementById('forgot-msg').textContent = d.message;
+                    if (d.reset_token) document.getElementById('reset-token-input').value = d.reset_token;
+                } else {
+                    alert(d.error || 'Error al solicitar token');
+                }
+            });
+        }
+        function submitResetPassword() {
+            const token = document.getElementById('reset-token-input').value.trim();
+            const new_password = document.getElementById('reset-new-pass').value.trim();
+            if (!token || !new_password) return alert('Completa todos los campos');
+            fetch('/api/auth/reset-password', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ token, new_password })
+            }).then(r => r.json()).then(d => {
+                if (d.success) {
+                    alert('Contraseña actualizada correctamente. Ahora puedes iniciar sesión.');
+                    closeForgotModal();
+                } else {
+                    alert(d.error || 'Error al restablecer contraseña');
+                }
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+REGISTER_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Registro - Asistente de Trading</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #050505;
+            --surface: #0a0a0a;
+            --gold: #FFD700;
+            --gold-dim: #B8860B;
+            --text: #F5F5F5;
+            --text-dim: #A0A0A0;
+            --border: rgba(255, 215, 0, 0.2);
+        }
+        body {
+            font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .register-box {
+            background: var(--surface);
+            padding: 40px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+            width: 100%;
+            max-width: 440px;
+        }
+        .register-box h1 {
+            background: linear-gradient(90deg, var(--gold), #fff7cc, var(--gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+            font-size: 24px;
+            margin-bottom: 24px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .form-group { margin-bottom: 16px; }
+        label { display: block; color: var(--gold); font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+        input {
+            width: 100%;
+            padding: 12px;
+            background: #0d0d0d;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 14px;
+        }
+        input:focus { outline: none; border-color: var(--gold); }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(90deg, var(--gold), var(--gold-dim));
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover { opacity: 0.9; }
+        .error { color: #FF2D2D; background: rgba(255,45,45,0.1); border: 1px solid rgba(255,45,45,0.3); padding: 10px; border-radius: 8px; margin-bottom: 18px; text-align: center; font-size: 13px; }
+        .links { margin-top: 20px; text-align: center; font-size: 13px; color: var(--text-dim); }
+        .links a { color: var(--gold); text-decoration: none; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="register-box">
+        <h1>Crear Cuenta</h1>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <div class="form-group">
+                <label>Nombre Completo</label>
+                <input type="text" name="full_name" placeholder="Tu Nombre">
+            </div>
+            <div class="form-group">
+                <label>Usuario *</label>
+                <input type="text" name="username" placeholder="usuario123" required>
+            </div>
+            <div class="form-group">
+                <label>Correo Electrónico *</label>
+                <input type="email" name="email" placeholder="correo@ejemplo.com" required>
+            </div>
+            <div class="form-group">
+                <label>Contraseña *</label>
+                <input type="password" name="password" placeholder="Mínimo 6 caracteres" required>
+            </div>
+            <button type="submit">Registrarme</button>
+        </form>
+        <div class="links">
+            <p>¿Ya tienes cuenta? <a href="/login">Inicia sesión aquí</a></p>
         </div>
     </div>
 </body>
@@ -1997,7 +1979,11 @@ DASHBOARD_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Dashboard - Trading</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.1.0/dist/chartjs-chart-financial.min.js"></script>
+    <script>
+        if (typeof Chart === 'undefined') {
+            document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"><' + '/script>');
+        }
+    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -2283,75 +2269,35 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <div class="navbar">
-        <h1>Sistema de Trading Inteligente</h1>
+        <h1>Asistente de Trading Inteligente</h1>
+        <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <span id="nav-user-name" style="font-size: 13px; color: var(--text); font-weight: 600;">Usuario: Invitado</span>
+            <span id="nav-plan-badge" style="font-size: 11px; padding: 4px 10px; border-radius: 12px; background: rgba(212,175,55,0.15); color: var(--gold); border: 1px solid var(--gold); font-weight: 700;">Plan: FREE</span>
+            <button class="btn btn-purple" onclick="openPlansModal()" style="font-size:12px; padding:6px 14px; margin:0;">Planes ($0 - $19.99)</button>
+            <button class="btn" onclick="openProfileModal()" style="font-size:12px; padding:6px 14px; margin:0;">Perfil</button>
+            <button class="btn btn-red" onclick="logout()" style="font-size:12px; padding:6px 14px; margin:0;">Salir</button>
+        </div>
     </div>
     <div class="container">
-        <h2 style="margin-bottom: 28px; color: var(--text); font-size: 22px; letter-spacing: 2px; font-weight: 300; text-transform: uppercase;">Panel de Control de Trading en Vivo</h2>
-        <div class="grid">
-            <div class="card">
-                <h3>Saldo</h3>
-                <div class="stat" id="balance">$10,000.00</div>
-            </div>
-            <div class="card">
-                <h3>Patrimonio</h3>
-                <div class="stat" id="equity">$10,000.00</div>
-            </div>
-            <div class="card">
-                <h3>Precio Actual</h3>
-                <div class="stat" id="price">1.0850</div>
-            </div>
-            <div class="card">
-                <h3>Operaciones Abiertas</h3>
-                <div class="stat" id="trades">0</div>
-            </div>
-        </div>
-
         <div class="card">
-            <h3>Controles de Operaciones</h3>
-            <div style="margin-bottom: 15px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
-                <label style="color:var(--gold); font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">Símbolo:</label>
-                <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 9px 14px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:8px; font-family:'SF Mono',Consolas,monospace;">
-                    <option value="XAUUSD">XAUUSD (Oro)</option>
-                    <option value="EURUSD">EURUSD</option>
-                    <option value="GBPUSD">GBPUSD</option>
-                    <option value="USDJPY">USDJPY</option>
-                    <option value="US30">US30</option>
-                    <option value="NAS100">NAS100</option>
-                    <option value="BTCUSD">BTCUSD</option>
-                    <option value="USDCHF">USDCHF</option>
-                    <option value="AUDUSD">AUDUSD</option>
-                    <option value="USOIL">USOIL</option>
-                </select>
-                <label style="color:var(--gold); font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">Volumen:</label>
-                <input id="volume-input" type="number" step="0.01" value="0.01" style="width:90px; padding:9px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:8px; font-family:'SF Mono',Consolas,monospace;">
-                <button class="btn" onclick="applyVolume()" style="padding:8px 16px;">Aplicar</button>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3>Gráfico de Precios</h3>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <label style="color:var(--gold); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Divisa:</label>
+                    <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 6px 12px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:6px; font-family:'SF Mono',Consolas,monospace; font-size:12px;">
+                        <option value="XAUUSD">XAUUSD (Oro)</option>
+                        <option value="EURUSD">EURUSD</option>
+                        <option value="GBPUSD">GBPUSD</option>
+                        <option value="USDJPY">USDJPY</option>
+                        <option value="US30">US30</option>
+                        <option value="NAS100">NAS100</option>
+                        <option value="BTCUSD">BTCUSD</option>
+                        <option value="USDCHF">USDCHF</option>
+                        <option value="AUDUSD">AUDUSD</option>
+                        <option value="USOIL">USOIL</option>
+                    </select>
+                </div>
             </div>
-            <button class="btn btn-green" onclick="buy()">COMPRAR</button>
-            <button class="btn btn-red" onclick="sell()">VENDER</button>
-            <button class="btn btn-red" onclick="closeAll()">Cerrar Todo</button>
-            <button class="btn" onclick="toggleAuto()">IA Automática</button>
-            <button class="btn" onclick="togglePrediction()">Predicción Auto</button>
-            <button class="btn" onclick="toggleSimulation()" id="sim-btn">Modo Simulación</button>
-            <div style="margin-top: 20px; display: grid; gap: 8px;">
-                <div><strong style="color: var(--gold);">Estado de IA:</strong> <span id="auto-status" style="color: var(--green);">INACTIVA</span></div>
-                <div><strong style="color: var(--gold);">Uso de Predicción:</strong> <span id="prediction-status" style="color: var(--gold);">ON</span></div>
-                <div><strong style="color: var(--gold);">Modo Operación:</strong> <span id="sim-status" style="color: var(--purple);">SIMULACIÓN</span></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Conexión MetaTrader 5</h3>
-            <button class="btn btn-purple" onclick="connectMT5()">Conectar Cuenta MT5</button>
-            <div style="margin-top: 20px;">
-                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Estado:</strong> <span id="mt5-status" style="color: var(--red);">Desconectado</span></div>
-                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Cuenta:</strong> <span id="mt5-login" style="color:var(--text-dim);">-</span></div>
-                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Saldo MT5:</strong> <span id="mt5-balance" style="color:var(--text-dim);">-</span></div>
-                <div style="margin: 10px 0;"><strong style="color: var(--gold);">Patrimonio MT5:</strong> <span id="mt5-equity" style="color:var(--text-dim);">-</span></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Gráfico de Precios</h3>
             <div class="chart-container">
                 <canvas id="chart"></canvas>
             </div>
@@ -2373,6 +2319,8 @@ DASHBOARD_HTML = """
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Confianza Predicción:</strong> <span id="pred-confidence">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: var(--gold); margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: var(--gold); margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
         </div>
+
+
 
         <div class="card">
             <h3>Predicción Avanzada de IA</h3>
@@ -2438,17 +2386,7 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
-        <div class="card">
-            <h3>Operaciones Abiertas</h3>
-            <table>
-                <thead>
-                    <tr><th>ID</th><th>Tipo</th><th>Entrada</th><th>Ganancia/Pérdida</th></tr>
-                </thead>
-                <tbody id="trades-list">
-                    <tr><td colspan="4" style="text-align:center; padding: 20px;">Sin operaciones abiertas</td></tr>
-                </tbody>
-            </table>
-        </div>
+
 
         <div class="card">
             <h3>Asistente de IA</h3>
@@ -2456,6 +2394,97 @@ DASHBOARD_HTML = """
             <div style="display: flex; gap: 10px;">
                 <input id="chat-input" type="text" placeholder="Escribe un comando o pregunta..." style="flex: 1; padding: 12px; background: #0d0d0d; border: 1px solid var(--gold); border-radius: 8px; color: var(--text); font-size: 14px;" />
                 <button class="btn" onclick="sendChat()">Enviar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Planes -->
+    <div id="plans-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); justify-content:center; align-items:center; z-index:999; overflow-y:auto; padding:20px;">
+        <div style="background:var(--surface); padding:30px; border-radius:16px; border:1px solid var(--gold); max-width:900px; width:100%;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                <h2 style="color:var(--gold);">Planes de Suscripción</h2>
+                <button onclick="closePlansModal()" class="btn btn-red" style="padding:4px 10px; margin:0;">✕ Cerrar</button>
+            </div>
+            
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:20px; margin-bottom:24px;">
+                <!-- FREE -->
+                <div style="background:var(--surface-2); padding:20px; border-radius:12px; border:1px solid rgba(255,255,255,0.1); text-align:center;">
+                    <h3 style="color:var(--text); margin-bottom:10px;">FREE</h3>
+                    <div style="font-size:28px; font-weight:700; color:var(--gold); margin-bottom:15px;">$0 <span style="font-size:13px; color:var(--text-dim);">/mes</span></div>
+                    <ul style="text-align:left; font-size:13px; color:var(--text-dim); margin-bottom:20px; list-style:none; line-height:1.8;">
+                        <li>✓ Precios en tiempo real</li>
+                        <li>✓ Gráficos y datos reales</li>
+                        <li>✓ Predicciones básicas</li>
+                        <li>✗ Predicción Avanzada (PRO)</li>
+                        <li>✗ Análisis Profesional (PREMIUM)</li>
+                    </ul>
+                    <button onclick="changePlan('FREE')" class="btn" style="width:100%; margin:0;">Usar FREE</button>
+                </div>
+                <!-- PRO -->
+                <div style="background:var(--surface-2); padding:20px; border-radius:12px; border:1px solid var(--purple); text-align:center;">
+                    <h3 style="color:var(--purple); margin-bottom:10px;">PRO</h3>
+                    <div style="font-size:28px; font-weight:700; color:var(--gold); margin-bottom:15px;">$9.99 <span style="font-size:13px; color:var(--text-dim);">/mes</span></div>
+                    <ul style="text-align:left; font-size:13px; color:var(--text-dim); margin-bottom:20px; list-style:none; line-height:1.8;">
+                        <li>✓ Todo de FREE</li>
+                        <li>✓ Predicciones Avanzadas</li>
+                        <li>✓ Alertas de Volatilidad</li>
+                        <li>✓ Indicadores RSI, MACD, BB</li>
+                        <li>✗ Análisis Profesional</li>
+                    </ul>
+                    <button onclick="changePlan('PRO')" class="btn btn-purple" style="width:100%; margin:0;">Mejorar a PRO</button>
+                </div>
+                <!-- PREMIUM -->
+                <div style="background:var(--surface-2); padding:20px; border-radius:12px; border:1px solid var(--gold); text-align:center;">
+                    <h3 style="color:var(--gold); margin-bottom:10px;">PREMIUM</h3>
+                    <div style="font-size:28px; font-weight:700; color:var(--gold); margin-bottom:15px;">$19.99 <span style="font-size:13px; color:var(--text-dim);">/mes</span></div>
+                    <ul style="text-align:left; font-size:13px; color:var(--text-dim); margin-bottom:20px; list-style:none; line-height:1.8;">
+                        <li>✓ Todo de PRO</li>
+                        <li>✓ Análisis Profesional IA</li>
+                        <li>✓ Acceso Prioritario</li>
+                        <li>✓ Soporte 24/7</li>
+                        <li>✓ Máxima precisión</li>
+                    </ul>
+                    <button onclick="changePlan('PREMIUM')" class="btn" style="width:100%; margin:0; background:var(--gold); color:#000;">Mejorar a PREMIUM</button>
+                </div>
+            </div>
+
+            <div style="display:flex; gap:12px; margin-bottom:20px;">
+                <button onclick="renewPlan()" class="btn btn-green" style="flex:1;">Renovar Plan (+30 Días)</button>
+                <button onclick="cancelPlan()" class="btn btn-red" style="flex:1;">Cancelar Suscripción</button>
+            </div>
+
+            <h4 style="color:var(--gold); margin-bottom:10px;">Historial de Pagos</h4>
+            <div style="max-height:180px; overflow-y:auto; background:var(--bg); border-radius:8px; padding:10px;">
+                <table style="width:100%; font-size:12px;">
+                    <thead><tr><th>Plan</th><th>Monto</th><th>Estado</th><th>Fecha</th><th>Descripción</th></tr></thead>
+                    <tbody id="billing-history-body"><tr><td colspan="5" style="text-align:center;">Cargando...</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Perfil -->
+    <div id="profile-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); justify-content:center; align-items:center; z-index:999;">
+        <div style="background:var(--surface); padding:30px; border-radius:16px; border:1px solid var(--gold); max-width:450px; width:90%;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                <h3 style="color:var(--gold);">Perfil y Configuración</h3>
+                <button onclick="closeProfileModal()" class="btn btn-red" style="padding:4px 10px; margin:0;">✕</button>
+            </div>
+            <div style="margin-bottom:20px;">
+                <h4 style="color:var(--text); font-size:13px; margin-bottom:8px;">Datos de Usuario</h4>
+                <div style="margin-bottom:10px;">
+                    <label style="font-size:12px; color:var(--text-dim);">Nombre Completo:</label>
+                    <input id="profile-fullname" type="text" style="width:100%; padding:8px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px;">
+                </div>
+                <button onclick="saveProfile()" class="btn" style="width:100%; margin:0;">Guardar Perfil</button>
+            </div>
+            <div style="border-top:1px solid rgba(255,255,255,0.1); padding-top:15px;">
+                <h4 style="color:var(--text); font-size:13px; margin-bottom:8px;">Cambiar Contraseña</h4>
+                <div style="margin-bottom:10px;">
+                    <input id="pass-current" type="password" placeholder="Contraseña Actual" style="width:100%; padding:8px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:8px;">
+                    <input id="pass-new" type="password" placeholder="Nueva Contraseña (mín 6 car.)" style="width:100%; padding:8px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px;">
+                </div>
+                <button onclick="changePassword()" class="btn btn-purple" style="width:100%; margin:0;">Actualizar Contraseña</button>
             </div>
         </div>
     </div>
@@ -2486,88 +2515,51 @@ DASHBOARD_HTML = """
                     if (d.error) {
                         console.warn('Status API returned error:', d.error);
                     }
+                    
                     currentSymbol = d.symbol || currentSymbol;
                     currentDecimals = typeof d.decimals === 'number' ? d.decimals : getSymbolDecimals(currentSymbol);
 
-                    if (typeof d.balance === 'number') {
-                        document.getElementById('balance').textContent = '$' + d.balance.toFixed(2);
-                    }
-                    if (typeof d.equity === 'number') {
-                        document.getElementById('equity').textContent = '$' + d.equity.toFixed(2);
-                    }
-                    if (typeof d.price === 'number') {
-                        document.getElementById('price').textContent = formatPrice(d.price, currentDecimals);
-                    }
-                    document.getElementById('trades').textContent = d.trades_open || 0;
-                    document.getElementById('auto-status').textContent = d.auto_enabled ? 'ON' : 'OFF';
-                    document.getElementById('auto-status').style.color = d.auto_enabled ? 'var(--green)' : 'var(--red)';
-                    document.getElementById('prediction-status').textContent = d.use_prediction ? 'ON' : 'OFF';
-                    document.getElementById('prediction-status').style.color = d.use_prediction ? 'var(--green)' : 'var(--red)';
-
-                    const simActive = d.simulation_mode !== false;
-                    const simText = simActive ? 'SIMULACIÓN' : 'MT5 REAL';
-                    const simColor = simActive ? 'var(--purple)' : 'var(--green)';
-                    document.getElementById('sim-status').textContent = simText;
-                    document.getElementById('sim-status').style.color = simColor;
-                    document.getElementById('sim-btn').textContent = simActive ? 'Desactivar Simulación' : 'Activar Simulación';
-
-                    if (d.mt5) {
-                        document.getElementById('mt5-status').textContent = d.mt5.connected ? 'Conectado' : 'Desconectado';
-                        document.getElementById('mt5-status').style.color = d.mt5.connected ? 'var(--green)' : 'var(--red)';
-                        document.getElementById('mt5-login').textContent = d.mt5.login || '-';
-                        document.getElementById('mt5-balance').textContent = d.mt5.balance ? '$' + d.mt5.balance.toFixed(2) : '-';
-                        document.getElementById('mt5-equity').textContent = d.mt5.equity ? '$' + d.mt5.equity.toFixed(2) : '-';
-                    }
-
-                    let html = '';
-                    if (d.trades && d.trades.length > 0) {
-                        d.trades.forEach(t => {
-                            const entryValue = typeof t.entry === 'number' ? formatPrice(t.entry, currentDecimals) : t.entry;
-                            const plValue = typeof t.pl === 'number' ? t.pl.toFixed(2) : '0.00';
-                            html += '<tr><td>#' + t.id + '</td><td>' + t.action + '</td><td>' + entryValue + '</td><td>' + plValue + '</td></tr>';
-                        });
-                    } else {
-                        html = '<tr><td colspan="4" style="text-align:center; padding:20px; color:var(--text-dim);">Sin operaciones abiertas</td></tr>';
-                    }
-                    document.getElementById('trades-list').innerHTML = html;
-
                     try {
-                        const chartDataArr = Array.isArray(d.candles) && d.candles.length ? d.candles : (Array.isArray(d.prices) ? d.prices : []);
-                        const raw = Array.isArray(chartDataArr) ? chartDataArr : [];
-                        const useCandles = raw.length > 0 && typeof raw[0] === 'object' && raw[0].c !== undefined && raw[0].o !== undefined;
-                        const dataPoints = raw.map((item, index) => {
-                            if (useCandles) {
-                                return { x: item.x || index, y: item.c };
+                        // Obtener datos del gráfico - priorizar candles
+                        const chartDataArr = Array.isArray(d.candles) && d.candles.length > 0 ? 
+                                            d.candles : 
+                                            (Array.isArray(d.prices) ? d.prices : []);
+                        
+                        if (!chartDataArr || chartDataArr.length === 0) {
+                            console.warn('No hay datos para el gráfico, creando datos de demostración');
+                            const demoData = [];
+                            const basePrice = d.price || 1.0850;
+                            for (let i = 0; i < 20; i++) {
+                                demoData.push(basePrice + (Math.random() - 0.5) * 0.01);
                             }
-                            return { x: item && item.x !== undefined ? item.x : index, y: typeof item === 'number' ? item : (item.c || item.y || 0) };
-                        });
-                        const labels = dataPoints.map(p => p.x);
-
-                        if (chart) {
-                            try {
-                                chart.data.labels = labels;
-                                chart.data.datasets[0].data = dataPoints;
-                                chart.data.datasets[0].label = currentSymbol;
-                                chart.options.plugins.tooltip.callbacks.label = context => currentSymbol + ' ' + formatPrice(Number(context.parsed.y), currentDecimals);
-                                chart.update('none');
-                            } catch (err) {
-                                console.warn('Error actualizando datos del gráfico:', err);
-                            }
+                            drawChart(demoData);
                         } else {
-                            try {
-                                drawChart(raw);
-                            } catch (err) {
-                                console.warn('Error dibujando gráfico por primera vez:', err);
-                            }
+                            drawChart(chartDataArr);
                         }
                     } catch (err) {
-                        console.warn('Error actualizando gráfico:', err);
+                        console.error('Error crítico actualizando gráfico:', err);
                     }
-                    loadChat();
-                    loadSymbols();
-                    updateAIAnalysis();
-                    updatePrediction();
-                    loadNewsAlerts(false);
+                    
+                    // Actualizar otros elementos
+                    try {
+                        loadChat();
+                    } catch (e) { console.error('Error en loadChat:', e); }
+                    
+                    try {
+                        loadSymbols();
+                    } catch (e) { console.error('Error en loadSymbols:', e); }
+                    
+                    try {
+                        updateAIAnalysis();
+                    } catch (e) { console.error('Error en updateAIAnalysis:', e); }
+                    
+                    try {
+                        updatePrediction();
+                    } catch (e) { console.error('Error en updatePrediction:', e); }
+                    
+                    try {
+                        loadNewsAlerts(false);
+                    } catch (e) { console.error('Error en loadNewsAlerts:', e); }
                 })
                 .catch(e => {
                     console.error('Error fetching dashboard status:', e);
@@ -2575,263 +2567,334 @@ DASHBOARD_HTML = """
         }
 
         function drawChart(chartData) {
-            const ctx = document.getElementById('chart');
-            if (!ctx) {
-                console.warn('Canvas de gráfico no encontrado');
+            if (typeof Chart === 'undefined') {
+                console.error('Chart.js no está cargado aún');
                 return;
             }
-            const canvasContext = ctx.getContext('2d');
-            const rawData = Array.isArray(chartData) ? chartData : [];
-            const useCandles = rawData.length > 0 && typeof rawData[0] === 'object' && rawData[0].c !== undefined && rawData[0].o !== undefined;
-            const dataPoints = rawData.map((item, index) => {
-                if (useCandles) {
-                    return { x: item.x || index, y: item.c };
+            
+            const canvas = document.getElementById('chart');
+            if (!canvas) {
+                console.error('Canvas de gráfico no encontrado');
+                return;
+            }
+            
+            try {
+                const canvasContext = canvas.getContext('2d');
+                if (!canvasContext) return;
+                
+                const rawData = Array.isArray(chartData) ? chartData : [];
+                const useCandles = rawData.length > 0 && typeof rawData[0] === 'object' && rawData[0].c !== undefined;
+                
+                const dataPoints = rawData.map((item) => {
+                    if (useCandles) return Number(item.c || 0);
+                    return typeof item === 'number' ? item : Number(item.c || item.y || 0);
+                });
+                
+                if (dataPoints.length === 0) {
+                    dataPoints.push(0);
                 }
-                return { x: item && item.x !== undefined ? item.x : index, y: typeof item === 'number' ? item : item.c || item.y || 0 };
-            });
+                
+                const labels = dataPoints.map((_, i) => (i + 1).toString());
+                const upColor = '#D4AF37';      // Dorado - para subidas
+                const downColor = '#8B5CF6';    // Morado - para bajadas
+                
+                const firstVal = dataPoints[0] || 0;
+                const lastVal = dataPoints[dataPoints.length - 1] || 0;
+                const isOverallUp = lastVal >= firstVal;
+                const mainColor = isOverallUp ? upColor : downColor;
 
-            const labels = dataPoints.map(p => p.x);
+                // Si el gráfico ya existe, actualizamos los datos sin destruirlo constantemente
+                if (chart && typeof chart.update === 'function' && chart.ctx) {
+                    try {
+                        chart.data.labels = labels;
+                        chart.data.datasets[0].label = currentSymbol + ' (' + formatPrice(lastVal, currentDecimals) + ')';
+                        chart.data.datasets[0].data = dataPoints;
+                        chart.data.datasets[0].borderColor = mainColor;
+                        if (chart.options && chart.options.plugins && chart.options.plugins.legend) {
+                            chart.options.plugins.legend.labels.color = mainColor;
+                        }
+                        chart.update('none');
+                        return;
+                    } catch (e) {
+                        console.warn('Error actualizando gráfico, recreando:', e);
+                        try { chart.destroy(); } catch (err) {}
+                        chart = null;
+                    }
+                }
 
-            const upColor = 'var(--green)';
-            const downColor = 'var(--red)';
-            const chartConfig = {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: currentSymbol,
-                        data: dataPoints,
-                        borderColor: 'var(--gold)',
-                        backgroundColor: (context) => {
-                            const ctx = context.chart.ctx;
-                            const gradient = ctx.createLinearGradient(0, 0, 0, 320);
-                            gradient.addColorStop(0, 'rgba(139, 92, 246, 0.25)');
-                            gradient.addColorStop(1, 'rgba(139, 92, 246, 0)');
-                            return gradient;
-                        },
-                        fill: true,
-                        tension: 0.22,
-                        pointRadius: 0,
-                        pointHoverRadius: 5,
-                        pointHoverBackgroundColor: 'var(--gold)',
-                        borderWidth: 2,
-                        segment: {
-                            borderColor: ctx => ctx.p1.parsed.y > ctx.p0.parsed.y ? upColor : downColor
-                        }
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    layout: {
-                        padding: { top: 14, right: 16, bottom: 10, left: 10 }
-                    },
-                    plugins: {
-                        legend: {
-                            display: true,
-                            labels: { color: 'var(--gold)', font: { family: 'SF Mono', size: 11 } }
-                        },
-                        tooltip: {
-                            mode: 'nearest',
-                            intersect: false,
-                            backgroundColor: 'rgba(5, 5, 5, 0.96)',
-                            titleColor: 'var(--gold)',
-                            bodyColor: 'var(--text)',
-                            borderColor: 'rgba(255, 215, 0, 0.25)',
-                            borderWidth: 1,
-                            callbacks: {
-                                label: context => currentSymbol + ' ' + formatPrice(Number(context.parsed.y), currentDecimals)
-                            }
-                        }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: false,
-                            grid: {
-                                color: 'rgba(255, 255, 255, 0.05)',
-                                borderColor: 'rgba(255, 255, 255, 0.08)'
+                const chartConfig = {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: currentSymbol + ' (' + formatPrice(lastVal, currentDecimals) + ')',
+                            data: dataPoints,
+                            borderColor: mainColor,
+                            backgroundColor: (context) => {
+                                try {
+                                    const chartObj = context.chart;
+                                    const canvasCtx = chartObj.ctx;
+                                    const gradient = canvasCtx.createLinearGradient(0, 0, 0, 380);
+                                    if (isOverallUp) {
+                                        gradient.addColorStop(0, 'rgba(212, 175, 55, 0.30)');
+                                        gradient.addColorStop(1, 'rgba(212, 175, 55, 0.00)');
+                                    } else {
+                                        gradient.addColorStop(0, 'rgba(139, 92, 246, 0.30)');
+                                        gradient.addColorStop(1, 'rgba(139, 92, 246, 0.00)');
+                                    }
+                                    return gradient;
+                                } catch (e) {
+                                    return isOverallUp ? 'rgba(212, 175, 55, 0.15)' : 'rgba(139, 92, 246, 0.15)';
+                                }
                             },
-                            ticks: {
-                                color: 'var(--text-dim)',
-                                font: { family: 'SF Mono', size: 11 }
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointHoverRadius: 7,
+                            pointBackgroundColor: (ctx) => {
+                                try {
+                                    if (ctx && ctx.dataIndex > 0 && ctx.chart && ctx.chart.data && ctx.chart.data.datasets && ctx.chart.data.datasets[0]) {
+                                        const datasetData = ctx.chart.data.datasets[0].data;
+                                        if (datasetData && ctx.dataIndex < datasetData.length) {
+                                            const current = datasetData[ctx.dataIndex];
+                                            const prev = datasetData[ctx.dataIndex - 1];
+                                            return (current >= prev) ? upColor : downColor;
+                                        }
+                                    }
+                                } catch(e) {}
+                                return mainColor;
+                            },
+                            pointBorderColor: '#FFFFFF',
+                            pointBorderWidth: 1.5,
+                            borderWidth: 2.5,
+                            segment: {
+                                borderColor: (ctx) => {
+                                    try {
+                                        if (ctx && ctx.p0 && ctx.p1 && ctx.p0.parsed && ctx.p1.parsed) {
+                                            return ctx.p1.parsed.y >= ctx.p0.parsed.y ? upColor : downColor;
+                                        }
+                                    } catch(e) {}
+                                    return mainColor;
+                                }
+                            }
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        layout: {
+                            padding: { top: 15, right: 15, bottom: 10, left: 10 }
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                labels: { 
+                                    color: mainColor, 
+                                    font: { family: 'SF Mono, monospace', size: 12, weight: 'bold' },
+                                    padding: 15
+                                }
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false,
+                                backgroundColor: 'rgba(10, 10, 10, 0.95)',
+                                titleColor: '#D4AF37',
+                                bodyColor: '#F5F5F5',
+                                borderColor: 'rgba(212, 175, 55, 0.4)',
+                                borderWidth: 1,
+                                padding: 12,
+                                callbacks: {
+                                    label: (context) => {
+                                        const value = Number(context.parsed.y);
+                                        return '  ' + currentSymbol + ': ' + formatPrice(value, currentDecimals);
+                                    }
+                                }
                             }
                         },
-                        x: {
-                            display: true,
-                            grid: { display: false },
-                            ticks: {
-                                color: 'var(--text-dim)',
-                                font: { size: 10 },
-                                maxRotation: 0,
-                                autoSkip: true
+                        scales: {
+                            y: {
+                                beginAtZero: false,
+                                grid: {
+                                    color: 'rgba(255, 255, 255, 0.05)'
+                                },
+                                ticks: {
+                                    color: '#A0A0A0',
+                                    font: { family: 'SF Mono, monospace', size: 10 },
+                                    callback: (val) => formatPrice(val, currentDecimals)
+                                }
+                            },
+                            x: {
+                                display: true,
+                                grid: { display: false },
+                                ticks: {
+                                    color: '#A0A0A0',
+                                    font: { family: 'SF Mono, monospace', size: 9 },
+                                    maxTicksLimit: 8
+                                }
                             }
                         }
-                    },
-                    interaction: {
-                        intersect: false,
-                        mode: 'index'
-                    },
-                    hover: {
-                        mode: 'index',
-                        intersect: false
                     }
-                }
-            };
-
-            if (dataPoints.length === 0) {
+                };
+                
                 chart = new Chart(canvasContext, chartConfig);
-                return;
+            } catch (e) {
+                console.error('Error al dibujar gráfico:', e);
             }
-
-            chart = new Chart(canvasContext, chartConfig);
         }
 
-        function buy() {
-            fetch('/api/buy', { method: 'POST' })
-                .then(r => r.json())
-                .then(d => {
-                    if (!d.success) {
-                        alert('Error al ejecutar compra: ' + (d.error || 'Respuesta inválida'));
-                    } else {
-                        alert('Compra ejecutada a: ' + formatPrice(d.price, currentDecimals));
+        function loadCurrentUser() {
+            fetch('/api/auth/me')
+                .then(r => {
+                    if (r.status === 401) {
+                        window.location.href = '/login';
+                        return null;
                     }
-                    update();
+                    return r.json();
                 })
-                .catch(e => {
-                    alert('Error en compra: ' + e.message);
-                    update();
-                });
-        }
-
-        function sell() {
-            fetch('/api/sell', { method: 'POST' })
-                .then(r => r.json())
                 .then(d => {
-                    if (!d.success) {
-                        alert('Error al ejecutar venta: ' + (d.error || 'Respuesta inválida'));
-                    } else {
-                        alert('Venta ejecutada a: ' + formatPrice(d.price, currentDecimals));
+                    if (!d || !d.success) return;
+                    const u = d.user;
+                    document.getElementById('nav-user-name').textContent = 'Usuario: ' + (u.full_name || u.username);
+                    document.getElementById('nav-plan-badge').textContent = 'Plan: ' + u.subscription_plan;
+                    if (document.getElementById('profile-fullname')) {
+                        document.getElementById('profile-fullname').value = u.full_name || '';
                     }
-                    update();
-                })
-                .catch(e => {
-                    alert('Error en venta: ' + e.message);
-                    update();
                 });
         }
 
-        function closeAll() {
-            fetch('/api/close-all', { method: 'POST' })
-                .then(r => r.json())
-                .then(d => {
-                    if (!d.success) {
-                        alert('Error al cerrar posiciones: ' + (d.error || 'Respuesta inválida'));
-                    } else {
-                        alert('Se cerraron ' + d.closed + ' operaciones');
-                    }
-                    update();
-                })
-                .catch(e => {
-                    alert('Error cerrando posiciones: ' + e.message);
-                    update();
-                });
+        function openPlansModal() {
+            document.getElementById('plans-modal').style.display = 'flex';
+            loadBillingHistory();
         }
 
-        function toggleAuto() {
-            fetch('/api/toggle-auto', { method: 'POST' })
-                .then(r => r.json())
-                .then(d => {
-                    const estado = d.auto_enabled ? 'ACTIVA' : 'INACTIVA';
-                    const color = d.auto_enabled ? 'var(--green)' : 'var(--red)';
-                    document.getElementById('auto-status').textContent = estado;
-                    document.getElementById('auto-status').style.color = color;
-                    alert('IA Automática: ' + estado);
-                    update();
-                });
+        function closePlansModal() {
+            document.getElementById('plans-modal').style.display = 'none';
         }
 
-        function togglePrediction() {
-            fetch('/api/toggle-prediction', { method: 'POST' })
-                .then(r => r.json())
-                .then(d => {
-                    const estado = d.use_prediction ? 'ON' : 'OFF';
-                    const color = d.use_prediction ? 'var(--green)' : 'var(--red)';
-                    document.getElementById('prediction-status').textContent = estado;
-                    document.getElementById('prediction-status').style.color = color;
-                    alert('Uso de predicción automática: ' + estado);
-                    update();
-                });
+        function openProfileModal() {
+            document.getElementById('profile-modal').style.display = 'flex';
         }
 
-        function toggleSimulation() {
-            fetch('/api/simulation/toggle', { method: 'POST' })
-                .then(r => r.json())
-                .then(d => {
-                    const estado = d.simulation_mode ? 'SIMULACIÓN' : 'MT5 REAL';
-                    const color = d.simulation_mode ? 'var(--purple)' : 'var(--green)';
-                    document.getElementById('sim-status').textContent = estado;
-                    document.getElementById('sim-status').style.color = color;
-                    document.getElementById('sim-btn').textContent = d.simulation_mode ? 'Desactivar Simulación' : 'Activar Simulación';
-                    alert('Modo de operación: ' + estado);
-                    update();
-                });
+        function closeProfileModal() {
+            document.getElementById('profile-modal').style.display = 'none';
         }
 
-        function connectMT5() {
-            const login = prompt('Ingrese el número de cuenta MT5:');
-            if (!login) return;
-            const password = prompt('Ingrese la contraseña MT5:');
-            if (!password) return;
-            const server = prompt('Ingrese el servidor MT5 (ej: ICMarketsDemoEU-05):');
-            if (!server) return;
-            const path = prompt('Ruta completa al terminal MT5 (dejar vacío para auto-detección):');
+        function logout() {
+            fetch('/api/auth/logout', { method: 'POST' })
+                .then(() => window.location.href = '/login');
+        }
 
-            fetch('/api/mt5/connect', {
+        function changePlan(plan) {
+            if (plan === 'FREE') {
+                return cancelPlan();
+            }
+            fetch('/api/subscription/upgrade', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    login: login.trim(),
-                    password: password.trim(),
-                    server: server.trim(),
-                    path: path ? path.trim() : ''
-                })
+                body: JSON.stringify({ plan })
             })
                 .then(r => r.json())
                 .then(d => {
                     if (d.success) {
-                        alert('Conexión exitosa: ' + d.message);
-                        if (confirm('¿Deseas guardar estas credenciales en mt5_config.py para futuras ejecuciones?')) {
-                            fetch('/api/mt5/save-config', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    login: login.trim(),
-                                    password: password.trim(),
-                                    server: server.trim(),
-                                    path: path ? path.trim() : ''
-                                })
-                            })
-                            .then(r => r.json())
-                            .then(s => {
-                                if (s.success) alert('Configuración guardada: ' + s.message);
-                                else alert('Error guardando configuración: ' + (s.error || ''));
-                            })
-                            .catch(e => { alert('Error guardando configuración: ' + e.message); });
-                        }
-                        const mt5info = d.mt5 || {};
-                        const connected = mt5info.connected === true;
-                        document.getElementById('mt5-status').textContent = connected ? 'Conectado' : 'Desconectado';
-                        document.getElementById('mt5-status').style.color = connected ? 'var(--green)' : 'var(--red)';
-                        document.getElementById('mt5-login').textContent = mt5info.login || '-';
-                        document.getElementById('mt5-balance').textContent = mt5info.balance ? '$' + mt5info.balance.toFixed(2) : '-';
-                        document.getElementById('mt5-equity').textContent = mt5info.equity ? '$' + mt5info.equity.toFixed(2) : '-';
+                        alert(d.message);
+                        loadCurrentUser();
+                        loadBillingHistory();
                     } else {
-                        alert('Error de conexión: ' + (d.error || 'No se pudo conectar a MT5'));
+                        alert(d.error || 'Error cambiando plan');
                     }
-                    update();
-                })
-                .catch(e => {
-                    alert('Error conectando a MT5: ' + e.message);
+                });
+        }
+
+        function cancelPlan() {
+            if (!confirm('¿Seguro que deseas cancelar tu suscripción y volver al plan FREE?')) return;
+            fetch('/api/subscription/cancel', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        alert(d.message);
+                        loadCurrentUser();
+                        loadBillingHistory();
+                    } else {
+                        alert(d.error || 'Error cancelando suscripción');
+                    }
+                });
+        }
+
+        function renewPlan() {
+            fetch('/api/subscription/renew', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        alert(d.message);
+                        loadCurrentUser();
+                        loadBillingHistory();
+                    } else {
+                        alert(d.error || 'Error renovando suscripción');
+                    }
+                });
+        }
+
+        function loadBillingHistory() {
+            fetch('/api/billing/history')
+                .then(r => r.json())
+                .then(d => {
+                    const tbody = document.getElementById('billing-history-body');
+                    if (!d.success || !d.billing_history || d.billing_history.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">Sin registros de pago</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = d.billing_history.map(b => {
+                        const date = b.charged_at ? new Date(b.charged_at).toLocaleDateString() : '-';
+                        return `<tr>
+                            <td><b>${b.plan}</b></td>
+                            <td>$${b.amount}</td>
+                            <td><span style="color:var(--green);">${b.status}</span></td>
+                            <td>${date}</td>
+                            <td>${b.description || '-'}</td>
+                        </tr>`;
+                    }).join('');
+                });
+        }
+
+        function saveProfile() {
+            const full_name = document.getElementById('profile-fullname').value.trim();
+            fetch('/api/user/profile', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ full_name })
+            })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        alert('Perfil actualizado correctamente');
+                        loadCurrentUser();
+                        closeProfileModal();
+                    } else {
+                        alert(d.error || 'Error actualizando perfil');
+                    }
+                });
+        }
+
+        function changePassword() {
+            const current_password = document.getElementById('pass-current').value;
+            const new_password = document.getElementById('pass-new').value;
+            if (!current_password || !new_password) return alert('Completa ambas contraseñas');
+            fetch('/api/user/password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ current_password, new_password })
+            })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        alert('Contraseña actualizada correctamente');
+                        document.getElementById('pass-current').value = '';
+                        document.getElementById('pass-new').value = '';
+                        closeProfileModal();
+                    } else {
+                        alert(d.error || 'Error cambiando contraseña');
+                    }
                 });
         }
 
@@ -2954,7 +3017,8 @@ DASHBOARD_HTML = """
         }
 
         function changeSymbol(symbol) {
-            const volume = parseFloat(document.getElementById('volume-input').value) || 0.01;
+            const volElem = document.getElementById('volume-input');
+            const volume = volElem ? (parseFloat(volElem.value) || 0.01) : 0.01;
             fetch('/api/symbol', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2963,13 +3027,17 @@ DASHBOARD_HTML = """
                 .then(r => r.json())
                 .then(d => {
                     if (d.success) {
-                        alert('Símbolo cambiado a ' + d.symbol + ' (volumen ' + d.volume + ')');
+                        currentSymbol = d.symbol;
+                        if (chart) {
+                            try { chart.destroy(); } catch(e) {}
+                            chart = null;
+                        }
                         update();
                     } else {
                         alert('Error: ' + (d.error || ''));
                     }
                 })
-                .catch(e => alert('Error cambiando símbolo: ' + e.message));
+                .catch(e => console.error('Error cambiando símbolo:', e));
         }
 
         function applyVolume() {
@@ -3009,13 +3077,23 @@ DASHBOARD_HTML = """
             btn.disabled = true;
             loading.style.display = 'inline';
             fetch('/api/advanced-prediction')
-                .then(r => r.json())
+                .then(r => {
+                    if (r.status === 403) {
+                        return r.json().then(d => {
+                            alert(d.error || 'Esta función requiere plan PRO o PREMIUM');
+                            openPlansModal();
+                            throw new Error('Upgrade required');
+                        });
+                    }
+                    return r.json();
+                })
                 .then(d => {
                     updateAdvancedPredictionUI(d);
                 })
                 .catch(e => {
-                    console.error('Error predicción avanzada:', e);
-                    alert('Error al calcular predicción avanzada: ' + e.message);
+                    if (e.message !== 'Upgrade required') {
+                        console.error('Error predicción avanzada:', e);
+                    }
                 })
                 .finally(() => {
                     btn.disabled = false;
@@ -3088,6 +3166,7 @@ DASHBOARD_HTML = """
                 });
         }
 
+        loadCurrentUser();
         update();
         setInterval(() => loadNewsAlerts(false), 5000);
         setInterval(update, 1000);
@@ -3114,11 +3193,10 @@ def run_flask_app():
 
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("  TRADING SYSTEM - INICIANDO")
+    print("  ASISTENTE DE TRADING INTELIGENTE - INICIANDO")
     print("="*70 + "\n")
     
     print("Servidor iniciando en http://0.0.0.0:5000")
-    print("La conexión a MT5 se realiza desde la UI con /api/mt5/connect")
     print("\n" + "="*70 + "\n")
     
     try:
@@ -3127,3 +3205,4 @@ if __name__ == '__main__':
         pass
     
     run_flask_app()
+ 

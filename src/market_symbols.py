@@ -26,7 +26,7 @@ class SymbolConfig:
     spread: float  # spread típico en puntos/pips
     session_hours: str
     description: str
-    mt5_symbol_aliases: List[str]  # alias comunes en brokers
+    symbol_aliases: List[str]  # alias comunes en brokers
 
 
 # Símbolos populares soportados
@@ -46,7 +46,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.05,
         session_hours='23h (cierre viernes 22h UTC)',
         description='Oro spot contra dólar estadounidense',
-        mt5_symbol_aliases=['XAUUSD', 'GOLD', 'XAUUSDm', 'XAUUSDb', 'XAUUSDc']
+        symbol_aliases=['XAUUSD', 'GOLD', 'XAUUSDm', 'XAUUSDb', 'XAUUSDc']
     ),
     'EURUSD': SymbolConfig(
         name='EURUSD',
@@ -63,7 +63,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.00003,
         session_hours='24h (Lun 00:00 - Vie 22:00 UTC)',
         description='Par de divisas Euro contra Dólar',
-        mt5_symbol_aliases=['EURUSD', 'EURUSDm', 'EURUSDb', 'EURUSDc']
+        symbol_aliases=['EURUSD', 'EURUSDm', 'EURUSDb', 'EURUSDc']
     ),
     'GBPUSD': SymbolConfig(
         name='GBPUSD',
@@ -80,7 +80,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.00004,
         session_hours='24h (Lun 00:00 - Vie 22:00 UTC)',
         description='Libra esterlina contra Dólar',
-        mt5_symbol_aliases=['GBPUSD', 'GBPUSDm', 'GBPUSDb', 'GBPUSDc']
+        symbol_aliases=['GBPUSD', 'GBPUSDm', 'GBPUSDb', 'GBPUSDc']
     ),
     'USDJPY': SymbolConfig(
         name='USDJPY',
@@ -97,7 +97,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.005,
         session_hours='24h (Lun 00:00 - Vie 22:00 UTC)',
         description='Dólar estadounidense contra Yen japonés',
-        mt5_symbol_aliases=['USDJPY', 'USDJPYm', 'USDJPYb', 'USDJPYc']
+        symbol_aliases=['USDJPY', 'USDJPYm', 'USDJPYb', 'USDJPYc']
     ),
     'US30': SymbolConfig(
         name='US30',
@@ -114,7 +114,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=2.0,
         session_hours='Mon-Fri 13:30 - 20:00 UTC',
         description='Índice Dow Jones Industrial Average',
-        mt5_symbol_aliases=['US30', 'US30Cash', 'DJ30', 'WallStreet', 'US30m']
+        symbol_aliases=['US30', 'US30Cash', 'DJ30', 'WallStreet', 'US30m']
     ),
     'NAS100': SymbolConfig(
         name='NAS100',
@@ -131,7 +131,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=3.0,
         session_hours='Mon-Fri 13:30 - 20:00 UTC',
         description='Índice Nasdaq 100',
-        mt5_symbol_aliases=['NAS100', 'NAS100Cash', 'USTEC', 'Nasdaq', 'NAS100m']
+        symbol_aliases=['NAS100', 'NAS100Cash', 'USTEC', 'Nasdaq', 'NAS100m']
     ),
     'BTCUSD': SymbolConfig(
         name='BTCUSD',
@@ -148,7 +148,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=12.0,
         session_hours='24/7',
         description='Bitcoin contra Dólar estadounidense',
-        mt5_symbol_aliases=['BTCUSD', 'BTCUSDT', 'BTCUSDm', 'Bitcoin']
+        symbol_aliases=['BTCUSD', 'BTCUSDT', 'BTCUSDm', 'Bitcoin']
     ),
     'USDCHF': SymbolConfig(
         name='USDCHF',
@@ -165,7 +165,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.00004,
         session_hours='24h (Lun 00:00 - Vie 22:00 UTC)',
         description='Dólar contra Franco suizo',
-        mt5_symbol_aliases=['USDCHF', 'USDCHFm', 'USDCHFb']
+        symbol_aliases=['USDCHF', 'USDCHFm', 'USDCHFb']
     ),
     'AUDUSD': SymbolConfig(
         name='AUDUSD',
@@ -182,7 +182,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.00003,
         session_hours='24h (Lun 00:00 - Vie 22:00 UTC)',
         description='Dólar australiano contra Dólar',
-        mt5_symbol_aliases=['AUDUSD', 'AUDUSDm', 'AUDUSDb']
+        symbol_aliases=['AUDUSD', 'AUDUSDm', 'AUDUSDb']
     ),
     'USOIL': SymbolConfig(
         name='USOIL',
@@ -199,7 +199,7 @@ POPULAR_SYMBOLS: Dict[str, SymbolConfig] = {
         spread=0.04,
         session_hours='Mon-Thu 00:00-22:00, Fri 00:00-20:30 UTC',
         description='Petróleo crudo WTI',
-        mt5_symbol_aliases=['USOIL', 'WTI', 'XTIUSD', 'OIL', 'XTIUSDb']
+        symbol_aliases=['USOIL', 'WTI', 'XTIUSD', 'OIL', 'XTIUSDb']
     ),
 }
 
@@ -211,7 +211,7 @@ def get_symbol_config(symbol: str) -> Optional[SymbolConfig]:
         return POPULAR_SYMBOLS[symbol_upper]
     # Buscar por alias
     for cfg in POPULAR_SYMBOLS.values():
-        if symbol_upper in [a.upper() for a in cfg.mt5_symbol_aliases]:
+        if symbol_upper in [a.upper() for a in cfg.symbol_aliases]:
             return cfg
     return None
 
