@@ -136,13 +136,18 @@ _sim_params = get_simulation_params(DEFAULT_SYMBOL) if SYMBOLS_AVAILABLE else {'
 _initial_price = float(_sim_params.get('default_price', 1.0850))
 _initial_vol = float(_sim_params.get('volatility', 0.00008))
 _initial_decimals = int(_sim_params.get('decimals', 5))
+_initial_price_history = [
+    round(_initial_price + i * (_initial_vol * 0.1) + random.uniform(-_initial_vol * 5, _initial_vol * 5), _initial_decimals)
+    for i in range(49)
+]
+_initial_price_history.append(round(_initial_price, _initial_decimals))
 
 TRADING_DATA = {
     'symbol': DEFAULT_SYMBOL,
     'symbols': SYMBOL_LIST,
     'volume': 0.01,
     'price': round(_initial_price, _initial_decimals),
-    'price_history': [round(_initial_price + i * (_initial_vol * 0.1) + random.uniform(-_initial_vol * 5, _initial_vol * 5), _initial_decimals) for i in range(50)],
+    'price_history': _initial_price_history,
     'balance': 10000.0,
     'equity': 10000.0,
     'trades_open': 0,
@@ -666,34 +671,6 @@ def update_prices():
         except Exception as e:
             print(f"Error en update_prices: {e}")
             time.sleep(5)
-
-def get_candle_data(max_candles=40):
-    """Devuelve velas OHLC reales desde el proveedor de mercado"""
-    with PRICE_LOCK:
-        symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
-        
-    if MARKET_DATA_AVAILABLE and market_data:
-        try:
-            historical = market_data.get_historical_data(symbol, period='1d', interval='5m')
-            if historical and len(historical) > 0:
-                candles = []
-                for i, c in enumerate(historical[-max_candles:]):
-                    candles.append({
-                        'o': c['open'],
-                        'h': c['high'],
-                        'l': c['low'],
-                        'c': c['close'],
-                        'x': i + 1
-                    })
-                return candles
-        except Exception as e:
-            print(f"Error en get_candle_data: {e}")
-
-    # Fallback con precios reales acumulados (sin datos sintéticos)
-    prices = TRADING_DATA['price_history'][-max_candles:]
-    return [{'c': float(p), 'x': i + 1} for i, p in enumerate(prices)]
-
-
 
 price_thread = None
 
@@ -1398,16 +1375,24 @@ def api_status():
     with PRICE_LOCK:
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
         decimals, _, _, _, _ = get_symbol_format(symbol)
+        current_price = float(TRADING_DATA['price'])
+        chart_prices = [float(price) for price in TRADING_DATA['price_history'][-40:]]
+        if not chart_prices or chart_prices[-1] != current_price:
+            chart_prices.append(current_price)
         status = {
-            'price': TRADING_DATA['price'],
+            'price': current_price,
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
             'prices': TRADING_DATA['price_history'][-30:],
+            'chart_prices': chart_prices,
             'chat_history': TRADING_DATA['chat_history'][-20:]
         }
 
-    status['candles'] = get_candle_data(40)
+    status['candles'] = [
+        {'c': price, 'x': i + 1}
+        for i, price in enumerate(chart_prices)
+    ]
     return jsonify(status)
 
 
@@ -1434,19 +1419,20 @@ def api_set_symbol():
         if not cfg:
             return jsonify({'success': False, 'error': f'Símbolo {symbol} no soportado'}), 400
     symbol = symbol.upper()
-    TRADING_SYMBOL = symbol
-    reset_price_history(symbol)
-    if volume is not None:
-        try:
-            vol = float(volume)
-            if vol > 0:
-                TRADING_DATA['volume'] = vol
-                DEFAULT_VOLUME = vol
-        except Exception:
-            pass
-    msg = f'Símbolo cambiado a {symbol}, volumen {TRADING_DATA["volume"]}'
-    TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
-    return jsonify({'success': True, 'symbol': symbol, 'volume': TRADING_DATA['volume'], 'price': TRADING_DATA['price']})
+    with PRICE_LOCK:
+        TRADING_SYMBOL = symbol
+        reset_price_history(symbol)
+        if volume is not None:
+            try:
+                vol = float(volume)
+                if vol > 0:
+                    TRADING_DATA['volume'] = vol
+                    DEFAULT_VOLUME = vol
+            except Exception:
+                pass
+        msg = f'Símbolo cambiado a {symbol}, volumen {TRADING_DATA["volume"]}'
+        TRADING_DATA['chat_history'].append({'timestamp': datetime.now().isoformat(), 'sender': 'IA', 'text': msg})
+        return jsonify({'success': True, 'symbol': symbol, 'volume': TRADING_DATA['volume'], 'price': TRADING_DATA['price']})
 
 
 @app.route('/api/news-alerts')
@@ -2309,7 +2295,8 @@ DASHBOARD_HTML = """
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                 <h3>Gráfico de Precios</h3>
                 <div style="display: flex; gap: 10px; align-items: center;">
-                    <label style="color:var(--gold); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Divisa:</label>
+                        <span id="chart-current-quote" style="color:var(--gold); font:12px 'SF Mono',Consolas,monospace; white-space:nowrap;">XAUUSD: -</span>
+                        <label style="color:var(--gold); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Divisa:</label>
                     <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 6px 12px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:6px; font-family:'SF Mono',Consolas,monospace; font-size:12px;">
                         <option value="XAUUSD">XAUUSD (Oro)</option>
                         <option value="EURUSD">EURUSD</option>
@@ -2550,8 +2537,13 @@ DASHBOARD_HTML = """
                     currentSymbol = d.symbol || currentSymbol;
                     currentDecimals = typeof d.decimals === 'number' ? d.decimals : getSymbolDecimals(currentSymbol);
 
-                    const chartDataArr = Array.isArray(d.candles) && d.candles.length > 0 ?
-                        d.candles : (Array.isArray(d.prices) ? d.prices : []);
+                    const quoteElement = document.getElementById('chart-current-quote');
+                    if (quoteElement && typeof d.price === 'number') {
+                        quoteElement.textContent = currentSymbol + ': ' + formatPrice(d.price, currentDecimals);
+                    }
+                    const chartDataArr = Array.isArray(d.chart_prices) && d.chart_prices.length > 0 ?
+                        d.chart_prices : (Array.isArray(d.candles) && d.candles.length > 0 ?
+                            d.candles : (Array.isArray(d.prices) ? d.prices : []));
                     drawChart(chartDataArr);
                     
                     // Actualizar otros elementos

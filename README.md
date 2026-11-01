@@ -90,6 +90,7 @@ Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE
 #### Gráfico de Precios
 - Ver gráfico con colores dinámicos (dorado subida, morado bajada)
 - Cambiar símbolo: EURUSD, XAUUSD, BTCUSD, etc.
+- Ver la cotización actual de la divisa seleccionada, sincronizada con el último punto del gráfico
 - Niveles de entrada, stop-loss y objetivo cuando hay una señal confirmada
 - Ver símbolo y precio del punto al pasar el cursor sobre el gráfico
 
