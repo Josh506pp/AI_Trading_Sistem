@@ -15,10 +15,10 @@ Asistente de Trading Inteligente es una aplicación Flask de análisis de mercad
 ## Características Principales
 
 ### Análisis de Mercado Tiempo Real
-- Gráficos interactivos con Chart.js (colores dorado/morado)
+- Gráfico de precios en canvas nativo, sin dependencia de CDN
 - Datos en vivo desde yfinance (12+ símbolos)
 - Análisis técnico: RSI, MACD, Bandas de Bollinger, Estocástico, ATR
-- Predicciones de precios con confianza calculada
+- Predicciones con consenso técnico y filtro mínimo de riesgo/beneficio 2:1
 - Niveles de soporte/resistencia automáticos
 - Monitoreo de volatilidad en tiempo real
 
@@ -81,14 +81,14 @@ python src/app.py
 ### Acceso a la Plataforma
 1. Abre [http://localhost:5000/dashboard](http://localhost:5000/dashboard)
 2. La plataforma carga automáticamente en modo demostración
-3. Los precios se actualizan cada segundo
+3. Los precios se actualizan cada cinco segundos
 
 ### Funcionalidades
 
 #### Gráfico de Precios
 - Ver gráfico con colores dinámicos (dorado subida, morado bajada)
 - Cambiar símbolo: EURUSD, XAUUSD, BTCUSD, etc.
-- Tooltips con precio exacto
+- Niveles de entrada, stop-loss y objetivo cuando hay una señal confirmada
 
 #### Análisis de IA
 - **Señal**: COMPRA/VENTA/ESPERA
@@ -176,10 +176,14 @@ proyectos/
 - Tema consistente en toda la plataforma
 
 **Mejoras de gráfico**
-- Validación robusta de Chart.js
-- Manejo de datos con fallback
-- Actualizaciones suave
-- Tooltips informativos
+- Renderizado en canvas nativo, sin depender de librerías externas bloqueadas por CSP
+- Manejo de datos faltantes sin inventar precios de demostración
+- Actualizaciones cada cinco segundos
+
+**Filtro de operaciones**
+- Requiere consenso entre modelos e indicadores técnicos alineados
+- Solo muestra operaciones con riesgo/beneficio estimado de al menos 2:1
+- Las estimaciones no incluyen costos de operación ni garantizan ganancias
 
 ## Seguridad
 

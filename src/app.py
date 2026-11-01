@@ -415,15 +415,16 @@ AI_LEARNING_DB = {
 
 def calculate_rsi(prices, period=14):
     """Calcula RSI (Índice de Fuerza Relativa)"""
-    if len(prices) < period:
+    if len(prices) <= period:
         return 50
     
     deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    seed = deltas[:period]
-    up = sum([d for d in seed if d > 0])
-    down = sum([-d for d in seed if d < 0])
-    
-    rs = up / down if down != 0 else 0
+    recent = deltas[-period:]
+    up = sum(delta for delta in recent if delta > 0) / period
+    down = sum(-delta for delta in recent if delta < 0) / period
+    if down == 0:
+        return 100.0 if up > 0 else 50.0
+    rs = up / down
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
@@ -431,14 +432,23 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     """Calcula MACD (Moving Average Convergence Divergence)"""
     if len(prices) < slow:
         return {'macd': 0, 'signal': 0, 'histogram': 0}
-    
-    ema_fast = prices[-fast:]
-    ema_slow = prices[-slow:]
-    
-    macd = sum(ema_fast) / len(ema_fast) - sum(ema_slow) / len(ema_slow)
-    signal_line = macd
+
+    def ema_series(values, period):
+        multiplier = 2 / (period + 1)
+        ema = float(values[0])
+        result = [ema]
+        for value in values[1:]:
+            ema = float(value) * multiplier + ema * (1 - multiplier)
+            result.append(ema)
+        return result
+
+    fast_ema = ema_series(prices, fast)
+    slow_ema = ema_series(prices, slow)
+    macd_series = [fast_value - slow_value for fast_value, slow_value in zip(fast_ema, slow_ema)]
+    macd = macd_series[-1]
+    signal_line = ema_series(macd_series, signal)[-1]
     histogram = macd - signal_line
-    
+
     return {'macd': macd, 'signal': signal_line, 'histogram': histogram}
 
 def calculate_bollinger_bands(prices, period=20, std_dev=2):
@@ -579,6 +589,49 @@ def analyze_signal(prices, symbol=None):
         'score': score,
         'pattern': pattern_record
     }
+
+
+def build_prediction_signal(prices):
+    """Genera una recomendación conservadora con niveles de riesgo verificables."""
+    if not PREDICTION_AVAILABLE or not prediction_engine:
+        current = float(prices[-1]) if prices else 0.0
+        prediction = {
+            'current_price': current,
+            'predicted_price': current,
+            'price_change': 0.0,
+            'change_percent': 0.0,
+            'direction': 'NEUTRAL',
+            'confidence': 0.0,
+            'model_agreement': 0.0,
+            'confidence_basis': 'model_unavailable'
+        }
+        levels = {
+            'entry': round(current, 6),
+            'stop_loss': None,
+            'take_profit': None,
+            'risk_reward': 0.0,
+            'direction': 'NEUTRAL'
+        }
+        return {
+            'signal': 'ESPERA',
+            'strength': 0.0,
+            'confidence': 0.0,
+            'model_agreement': 0.0,
+            'confidence_basis': 'model_unavailable',
+            'reasons': ['Motor de predicción no disponible'],
+            'prediction': prediction,
+            'levels': levels,
+            'risk_reward': 0.0,
+            'trade_allowed': False,
+            'risk_note': 'El ratio estimado no incluye spread, comisiones ni deslizamiento; no garantiza ganancias.'
+        }
+
+    rsi = calculate_rsi(prices)
+    macd = calculate_macd(prices)['histogram']
+    bands = calculate_bollinger_bands(prices)
+    return prediction_engine.get_prediction_signal(
+        prices, rsi, macd, bands['upper'], bands['lower']
+    )
 
 # ====================================================================
 # ACTUALIZACIÓN DE PRECIOS
@@ -1422,43 +1475,35 @@ def api_advanced_prediction():
         prices = TRADING_DATA['price_history']
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
         analysis = analyze_signal(prices, symbol)
+        trade = build_prediction_signal(prices)
         pred = {'predicted_price': prices[-1], 'expected_high': prices[-1], 'expected_low': prices[-1], 'confidence': 0.0, 'direction': 'NEUTRAL', 'volatility': 0.0}
-        levels = {'support': 0, 'resistance': 0, 'pivot': 0, 'entry': prices[-1], 'stop_loss': prices[-1], 'take_profit': prices[-1]}
+        levels = trade['levels']
         if PREDICTION_AVAILABLE and prediction_engine:
             try:
                 pred = prediction_engine.predict_price_range(prices, periods=5)
-                levels = prediction_engine.get_trading_levels(prices)
             except Exception as e:
                 print(f"Error predicción avanzada: {e}")
         else:
             if len(prices) >= 10:
-                recent = prices[-50:]
-                high = max(recent)
-                low = min(recent)
-                pivot = (high + low + prices[-1]) / 3
                 atr = analysis.get('atr', 0.001) or 0.001
-                levels = {
-                    'support': (2 * pivot) - high,
-                    'resistance': (2 * pivot) - low,
-                    'pivot': pivot,
-                    'entry': prices[-1],
-                    'stop_loss': prices[-1] - atr * 2,
-                    'take_profit': prices[-1] + atr * 2
-                }
                 pred = {
                     'predicted_price': prices[-1] + (prices[-1] - prices[-5]) if len(prices) >= 5 else prices[-1],
                     'expected_high': prices[-1] + atr * 3,
                     'expected_low': prices[-1] - atr * 3,
-                    'confidence': analysis.get('confidence', 0),
-                    'direction': 'ALCISTA' if analysis['action'] == 'COMPRA' else ('BAJISTA' if analysis['action'] == 'VENTA' else 'NEUTRAL'),
+                    'confidence': 0.0,
+                    'direction': 'NEUTRAL',
                     'volatility': atr
                 }
         return jsonify({
             'success': True,
             'symbol': symbol,
-            'signal': analysis['action'],
-            'score': analysis.get('score', 0),
-            'confidence': analysis['confidence'],
+            'signal': trade['signal'],
+            'score': trade['strength'],
+            'confidence': trade['confidence'],
+            'trade_allowed': trade['trade_allowed'],
+            'risk_reward': trade['risk_reward'],
+            'reasons': trade['reasons'],
+            'risk_note': trade['risk_note'],
             'indicators': {
                 'rsi': round(analysis['rsi'], 2),
                 'macd': round(analysis['macd'], 6),
@@ -1492,6 +1537,7 @@ def api_professional_analysis():
         
         # Análisis inteligente
         analysis = analyze_signal(prices)
+        trade = build_prediction_signal(prices)
         
         # Calcular indicadores avanzados
         rsi = analysis['rsi']
@@ -1501,9 +1547,12 @@ def api_professional_analysis():
         return jsonify({
             'available': True,
             'current_price': TRADING_DATA['price'],
-            'signal': analysis['action'],
-            'confidence': analysis['confidence'],
-            'confidence_percent': round(analysis['confidence'] * 100, 1),
+            'signal': trade['signal'],
+            'confidence': trade['confidence'],
+            'confidence_percent': round(trade['confidence'] * 100, 1),
+            'trade_allowed': trade['trade_allowed'],
+            'risk_reward': trade['risk_reward'],
+            'signal_reasons': trade['reasons'],
             'learning_progress': learning_pct,
             'indicators': {
                 'rsi': round(rsi, 2),
@@ -1527,26 +1576,18 @@ def api_predict():
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            if PREDICTION_AVAILABLE and prediction_engine:
-                pred = prediction_engine.predict_next_price(prices, periods=5)
-            else:
-                # Fallback simple: usar analyze_signal para dar una predicción básica
-                basic = analyze_signal(prices)
-                pred = {
-                    'current_price': prices[-1],
-                    'predicted_price': prices[-1] + (0.0001 if basic['action'] == 'COMPRA' else -0.0001),
-                    'price_change': 0.0001 if basic['action'] == 'COMPRA' else -0.0001,
-                    'change_percent': round((0.0001 / prices[-1]) * 100, 4),
-                    'direction': 'ALCISTA' if basic['action'] == 'COMPRA' else ('BAJISTA' if basic['action'] == 'VENTA' else 'NEUTRAL'),
-                    'confidence': basic.get('confidence', 0.3),
-                    'methods': {'fallback': True},
-                    'periods': 5,
-                    'timestamp': datetime.now().isoformat()
-                }
+            trade = build_prediction_signal(prices)
+            pred = trade['prediction']
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
-        return jsonify({'success': True, 'prediction': pred})
+        return jsonify({
+            'success': True,
+            'prediction': pred,
+            'recommendation': trade['signal'],
+            'trade': trade,
+            'levels': trade['levels']
+        })
 
 
 @app.route('/api/predict/levels')
@@ -1556,22 +1597,7 @@ def api_predict_levels():
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            if PREDICTION_AVAILABLE and prediction_engine:
-                levels = prediction_engine.get_trading_levels(prices)
-            else:
-                # Fallback: calcular niveles simples
-                recent = prices[-50:] if len(prices) >= 50 else prices
-                high = max(recent)
-                low = min(recent)
-                pivot = (high + low + recent[-1]) / 3 if recent else 0
-                levels = {
-                    'support': round((2 * pivot) - high, 6),
-                    'resistance': round((2 * pivot) - low, 6),
-                    'pivot': round(pivot, 6),
-                    'entry': round(recent[-1], 6) if recent else 0,
-                    'stop_loss': round(recent[-1] - 0.001, 6) if recent else 0,
-                    'take_profit': round(recent[-1] + 0.002, 6) if recent else 0,
-                }
+            levels = build_prediction_signal(prices)['levels']
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1585,21 +1611,7 @@ def api_predict_signal():
     with PRICE_LOCK:
         prices = TRADING_DATA['price_history']
         try:
-            # Extraer indicadores básicos
-            rsi = calculate_rsi(prices)
-            macd = calculate_macd(prices)['histogram']
-            bb = calculate_bollinger_bands(prices)
-
-            if PREDICTION_AVAILABLE and prediction_engine:
-                signal = prediction_engine.get_prediction_signal(prices, rsi, macd, bb['upper'], bb['lower'])
-            else:
-                basic = analyze_signal(prices)
-                signal = {
-                    'signal': 'NEUTRAL' if basic['action'] == 'ESPERA' else ('COMPRA' if basic['action'] == 'COMPRA' else 'VENTA'),
-                    'strength': basic.get('confidence', 0.3) * 100,
-                    'confidence': basic.get('confidence', 0.3),
-                    'reasons': ['Fallback analysis used']
-                }
+            signal = build_prediction_signal(prices)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1978,12 +1990,6 @@ DASHBOARD_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Dashboard - Trading</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
-    <script>
-        if (typeof Chart === 'undefined') {
-            document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"><' + '/script>');
-        }
-    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -2316,8 +2322,11 @@ DASHBOARD_HTML = """
             <h3>Predicciones y Niveles</h3>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción:</strong> <span id="pred-direction">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
-            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Confianza Predicción:</strong> <span id="pred-confidence">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Consenso de modelos:</strong> <span id="pred-confidence">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Operación sugerida:</strong> <span id="pred-signal">ESPERA</span> <strong style="color: var(--gold); margin-left:12px;">Riesgo/beneficio:</strong> <span id="pred-risk-reward">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: var(--gold); margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: var(--gold); margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Filtro:</strong> <span id="pred-reasons">Calculando...</span></div>
+            <small style="color:var(--text-dim);">Filtro mínimo 2:1. Las estimaciones no incluyen costos ni garantizan ganancias.</small>
         </div>
 
 
@@ -2519,26 +2528,9 @@ DASHBOARD_HTML = """
                     currentSymbol = d.symbol || currentSymbol;
                     currentDecimals = typeof d.decimals === 'number' ? d.decimals : getSymbolDecimals(currentSymbol);
 
-                    try {
-                        // Obtener datos del gráfico - priorizar candles
-                        const chartDataArr = Array.isArray(d.candles) && d.candles.length > 0 ? 
-                                            d.candles : 
-                                            (Array.isArray(d.prices) ? d.prices : []);
-                        
-                        if (!chartDataArr || chartDataArr.length === 0) {
-                            console.warn('No hay datos para el gráfico, creando datos de demostración');
-                            const demoData = [];
-                            const basePrice = d.price || 1.0850;
-                            for (let i = 0; i < 20; i++) {
-                                demoData.push(basePrice + (Math.random() - 0.5) * 0.01);
-                            }
-                            drawChart(demoData);
-                        } else {
-                            drawChart(chartDataArr);
-                        }
-                    } catch (err) {
-                        console.error('Error crítico actualizando gráfico:', err);
-                    }
+                    const chartDataArr = Array.isArray(d.candles) && d.candles.length > 0 ?
+                        d.candles : (Array.isArray(d.prices) ? d.prices : []);
+                    drawChart(chartDataArr);
                     
                     // Actualizar otros elementos
                     try {
@@ -2557,43 +2549,133 @@ DASHBOARD_HTML = """
                         updatePrediction();
                     } catch (e) { console.error('Error en updatePrediction:', e); }
                     
-                    try {
-                        loadNewsAlerts(false);
-                    } catch (e) { console.error('Error en loadNewsAlerts:', e); }
                 })
                 .catch(e => {
                     console.error('Error fetching dashboard status:', e);
                 });
         }
 
-        function drawChart(chartData) {
-            if (typeof Chart === 'undefined') {
-                console.error('Chart.js no está cargado aún');
+        function normalizeChartData(chartData) {
+            if (!Array.isArray(chartData)) return [];
+            return chartData.map((item) => {
+                const rawValue = typeof item === 'number' ? item :
+                    (item && item.c !== undefined ? item.c :
+                        (item && item.y !== undefined ? item.y : item && item.close));
+                const value = Number(rawValue);
+                return Number.isFinite(value) && value > 0 ? value : null;
+            }).filter(value => value !== null);
+        }
+
+        function drawFallbackChart(dataPoints) {
+            const canvas = document.getElementById('chart');
+            if (!canvas || !canvas.parentElement) return;
+            const bounds = canvas.parentElement.getBoundingClientRect();
+            const width = Math.max(bounds.width, 320);
+            const height = Math.max(bounds.height, 260);
+            const pixelRatio = window.devicePixelRatio || 1;
+            canvas.width = Math.round(width * pixelRatio);
+            canvas.height = Math.round(height * pixelRatio);
+            const context = canvas.getContext('2d');
+            if (!context) return;
+            context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+            context.clearRect(0, 0, width, height);
+
+            if (!dataPoints.length) {
+                context.fillStyle = '#A0A0A0';
+                context.font = '14px sans-serif';
+                context.textAlign = 'center';
+                context.fillText('Esperando datos de mercado...', width / 2, height / 2);
                 return;
             }
-            
+
+            const padding = { top: 24, right: 76, bottom: 30, left: 16 };
+            const plotWidth = width - padding.left - padding.right;
+            const plotHeight = height - padding.top - padding.bottom;
+            const low = Math.min(...dataPoints);
+            const high = Math.max(...dataPoints);
+            const range = high - low || Math.max(Math.abs(high) * 0.001, 0.000001);
+            const minimum = low - range * 0.08;
+            const maximum = high + range * 0.08;
+            const xAt = index => padding.left + (dataPoints.length < 2 ? plotWidth / 2 : index * plotWidth / (dataPoints.length - 1));
+            const yAt = value => padding.top + (maximum - value) * plotHeight / (maximum - minimum);
+            const isOverallUp = dataPoints[dataPoints.length - 1] >= dataPoints[0];
+            const lineColor = isOverallUp ? '#D4AF37' : '#8B5CF6';
+
+            context.font = '10px monospace';
+            context.textAlign = 'right';
+            context.textBaseline = 'middle';
+            for (let line = 0; line <= 4; line++) {
+                const y = padding.top + line * plotHeight / 4;
+                const value = maximum - line * (maximum - minimum) / 4;
+                context.strokeStyle = 'rgba(255,255,255,0.08)';
+                context.beginPath();
+                context.moveTo(padding.left, y);
+                context.lineTo(width - padding.right, y);
+                context.stroke();
+                context.fillStyle = '#A0A0A0';
+                context.fillText(formatPrice(value, currentDecimals), width - 8, y);
+            }
+
+            const gradient = context.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+            gradient.addColorStop(0, isOverallUp ? 'rgba(212,175,55,0.28)' : 'rgba(139,92,246,0.28)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            context.beginPath();
+            dataPoints.forEach((value, index) => {
+                const x = xAt(index);
+                const y = yAt(value);
+                if (index === 0) context.moveTo(x, y);
+                else context.lineTo(x, y);
+            });
+            context.lineTo(xAt(dataPoints.length - 1), height - padding.bottom);
+            context.lineTo(xAt(0), height - padding.bottom);
+            context.closePath();
+            context.fillStyle = gradient;
+            context.fill();
+
+            context.beginPath();
+            dataPoints.forEach((value, index) => {
+                const x = xAt(index);
+                const y = yAt(value);
+                if (index === 0) context.moveTo(x, y);
+                else context.lineTo(x, y);
+            });
+            context.strokeStyle = lineColor;
+            context.lineWidth = 2.5;
+            context.stroke();
+            context.fillStyle = '#A0A0A0';
+            context.font = '10px monospace';
+            context.textAlign = 'left';
+            context.textBaseline = 'bottom';
+            context.fillText('1', padding.left, height - 6);
+            context.textAlign = 'right';
+            context.fillText(String(dataPoints.length), width - padding.right, height - 6);
+        }
+
+        function drawChart(chartData) {
+            const dataPoints = normalizeChartData(chartData);
+            if (!dataPoints.length) {
+                if (chart) {
+                    chart.destroy();
+                    chart = null;
+                }
+                drawFallbackChart([]);
+                return;
+            }
+            if (typeof Chart === 'undefined') {
+                drawFallbackChart(dataPoints);
+                return;
+            }
+
             const canvas = document.getElementById('chart');
             if (!canvas) {
                 console.error('Canvas de gráfico no encontrado');
                 return;
             }
-            
+
             try {
                 const canvasContext = canvas.getContext('2d');
                 if (!canvasContext) return;
-                
-                const rawData = Array.isArray(chartData) ? chartData : [];
-                const useCandles = rawData.length > 0 && typeof rawData[0] === 'object' && rawData[0].c !== undefined;
-                
-                const dataPoints = rawData.map((item) => {
-                    if (useCandles) return Number(item.c || 0);
-                    return typeof item === 'number' ? item : Number(item.c || item.y || 0);
-                });
-                
-                if (dataPoints.length === 0) {
-                    dataPoints.push(0);
-                }
-                
+
                 const labels = dataPoints.map((_, i) => (i + 1).toString());
                 const upColor = '#D4AF37';      // Dorado - para subidas
                 const downColor = '#8B5CF6';    // Morado - para bajadas
@@ -2976,31 +3058,31 @@ DASHBOARD_HTML = """
                 .then(r => r.json())
                 .then(d => {
                     if (!d.success) return;
-                    const p = d.prediction;
+                    const p = d.prediction || {};
+                    const trade = d.trade || {};
+                    const levels = d.levels || {};
                     document.getElementById('pred-direction').textContent = p.direction || '-';
-                    document.getElementById('pred-price').textContent = p.predicted_price ? p.predicted_price.toFixed(4) : '-';
-                    document.getElementById('pred-confidence').textContent = p.confidence ? (p.confidence*100).toFixed(1) + '%' : '-';
+                    document.getElementById('pred-price').textContent = typeof p.predicted_price === 'number' ?
+                        formatPrice(p.predicted_price, currentDecimals) : '-';
+                    document.getElementById('pred-confidence').textContent = typeof p.confidence === 'number' ?
+                        (p.confidence * 100).toFixed(1) + '%' : '-';
+                    const signal = trade.signal || d.recommendation || 'ESPERA';
+                    const signalElement = document.getElementById('pred-signal');
+                    signalElement.textContent = signal;
+                    signalElement.style.color = signal === 'COMPRA' ? 'var(--green)' :
+                        signal === 'VENTA' ? 'var(--red)' : 'var(--gold)';
+                    document.getElementById('pred-risk-reward').textContent = trade.trade_allowed ?
+                        Number(trade.risk_reward).toFixed(2) + ':1' : '-';
+                    document.getElementById('pred-reasons').textContent =
+                        Array.isArray(trade.reasons) ? trade.reasons.join(' · ') : '-';
+                    document.getElementById('pred-entry').textContent = levels.entry ?
+                        formatPrice(levels.entry, currentDecimals) : '-';
+                    document.getElementById('pred-sl').textContent = levels.stop_loss ?
+                        formatPrice(levels.stop_loss, currentDecimals) : '-';
+                    document.getElementById('pred-tp').textContent = levels.take_profit ?
+                        formatPrice(levels.take_profit, currentDecimals) : '-';
                 })
                 .catch(e => console.error('Error fetching predict:', e));
-
-            fetch('/api/predict/levels')
-                .then(r => r.json())
-                .then(d => {
-                    if (!d.success) return;
-                    const l = d.levels;
-                    document.getElementById('pred-entry').textContent = l.entry || '-';
-                    document.getElementById('pred-sl').textContent = l.stop_loss || '-';
-                    document.getElementById('pred-tp').textContent = l.take_profit || '-';
-                })
-                .catch(e => console.error('Error fetching predict levels:', e));
-
-            fetch('/api/predict/signal')
-                .then(r => r.json())
-                .then(d => {
-                    if (!d.success) return;
-                    console.debug('Prediction signal:', d.prediction_signal || d.predictionSignal);
-                })
-                .catch(e => console.error('Error fetching predict signal:', e));
         }
 
         function loadSymbols() {
@@ -3169,7 +3251,7 @@ DASHBOARD_HTML = """
         loadCurrentUser();
         update();
         setInterval(() => loadNewsAlerts(false), 5000);
-        setInterval(update, 1000);
+        setInterval(update, 5000);
     </script>
 </body>
 </html>
