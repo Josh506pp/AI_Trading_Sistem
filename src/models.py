@@ -277,3 +277,30 @@ def init_db(app):
             except Exception as e:
                 db.session.rollback()
                 print(f"Error al crear usuarios iniciales: {e}")
+
+        if os.environ.get('FLASK_ENV', '').lower() != 'production':
+            now = datetime.utcnow()
+            demo_profiles = (
+                ('admin', 'admin@example.com', 'PREMIUM', 365),
+                ('trader', 'trader@example.com', 'PRO', 30),
+                ('demo', 'demo@example.com', 'FREE', None),
+            )
+            for username, email, plan, duration_days in demo_profiles:
+                user = User.query.filter_by(username=username, email=email).first()
+                if not user:
+                    continue
+                subscription_expired = (
+                    duration_days is not None and
+                    (not user.subscription_expires or user.subscription_expires <= now)
+                )
+                if (
+                    user.subscription_plan != plan or
+                    user.subscription_status != 'active' or
+                    subscription_expired
+                ):
+                    user.subscription_plan = plan
+                    user.subscription_status = 'active'
+                    user.subscription_expires = (
+                        now + timedelta(days=duration_days) if duration_days else None
+                    )
+            db.session.commit()

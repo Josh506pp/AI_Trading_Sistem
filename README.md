@@ -83,6 +83,8 @@ python src/app.py
 2. La plataforma carga automáticamente en modo demostración
 3. Los precios se actualizan cada cinco segundos
 
+Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
+
 ### Funcionalidades
 
 #### Gráfico de Precios

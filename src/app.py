@@ -1299,6 +1299,12 @@ def dashboard():
 @app.route('/login', methods=['GET', 'POST'])
 def view_login():
     """Vista de inicio de sesión"""
+    if not DB_AVAILABLE:
+        return render_template_string(
+            LOGIN_HTML,
+            error='Autenticación no disponible: revisa SQLAlchemy y la base de datos.'
+        ), 503
+
     if request.method == 'POST':
         email_or_user = request.form.get('username', '').strip()
         password = request.form.get('password', '')
