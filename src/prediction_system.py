@@ -8,6 +8,8 @@ from typing import Dict, List, Tuple
 import json
 import math
 
+MIN_WALK_FORWARD_ACCURACY = 0.55
+
 
 class PredictionEngine:
     """Motor de predicciones para análisis técnico y pronósticos de precios"""
@@ -93,7 +95,7 @@ class PredictionEngine:
         backtest_rejects_signal = (
             walk_forward_samples >= 8 and
             walk_forward_accuracy is not None and
-            walk_forward_accuracy < 0.50
+            walk_forward_accuracy < MIN_WALK_FORWARD_ACCURACY
         )
         if (
             abs(price_change) < minimum_move or model_agreement < 0.75 or
@@ -362,8 +364,11 @@ class PredictionEngine:
         if len(prices) < 10 or prediction['direction'] == 'NEUTRAL':
             reasons = ['Modelos sin consenso suficiente']
             if prediction.get('walk_forward_samples', 0) >= 8 and prediction.get('walk_forward_accuracy') is not None:
-                if prediction['walk_forward_accuracy'] < 0.50:
-                    reasons = ['El backtest direccional reciente no supera el 50% de aciertos']
+                if prediction['walk_forward_accuracy'] < MIN_WALK_FORWARD_ACCURACY:
+                    reasons = [
+                        'El backtest direccional reciente no alcanza el '
+                        f'{MIN_WALK_FORWARD_ACCURACY:.0%} de aciertos'
+                    ]
             return self._no_trade_signal(prediction, prices, reasons)
 
         current = float(prices[-1])

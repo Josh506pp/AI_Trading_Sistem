@@ -190,6 +190,7 @@ proyectos/
 - Requiere consenso entre modelos e indicadores técnicos alineados
 - Solo muestra operaciones con riesgo/beneficio estimado de al menos 2:1
 - Contrasta la dirección con un backtest walk-forward reciente y aplica un cooldown de 15 segundos para reutilizar cálculos
+- Solo permite una dirección si el backtest reciente tiene al menos 55% de aciertos con 8 o más muestras
 - El consenso del modelo y el backtest son referencias históricas, no probabilidades ni garantías de resultados
 - Las estimaciones no incluyen costos de operación ni garantizan ganancias
 - La presión de compra/venta se estima de las velas OHLCV; no revela las posiciones ni órdenes de participantes institucionales

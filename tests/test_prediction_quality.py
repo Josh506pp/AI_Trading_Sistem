@@ -97,6 +97,15 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertGreaterEqual(prediction['walk_forward_accuracy'], 0.0)
         self.assertLessEqual(prediction['walk_forward_accuracy'], 1.0)
 
+    def test_low_walk_forward_accuracy_suppresses_directional_predictions(self):
+        prices = [100.0 + index * 0.1 + math.sin(index) * 0.01 for index in range(120)]
+        with patch.object(self.engine, '_walk_forward_accuracy', return_value=(0.54, 12)):
+            prediction = self.engine.predict_next_price(prices)
+
+        self.assertEqual(prediction['direction'], 'NEUTRAL')
+        self.assertEqual(prediction['confidence'], 0.0)
+        self.assertEqual(prediction['walk_forward_accuracy'], 0.54)
+
     def test_prediction_calculation_is_cached_per_symbol_during_cooldown(self):
         app_module._prediction_cache.clear()
         fake_prediction = {
