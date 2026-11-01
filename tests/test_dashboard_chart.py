@@ -35,6 +35,7 @@ class TestDashboardChart(unittest.TestCase):
             payload = response.get_json()
             self.assertEqual(payload['symbol'], 'USDJPY')
             self.assertEqual(payload['price'], 149.123)
+            self.assertIn('price_source', payload)
             self.assertEqual(payload['chart_prices'][-1], payload['price'])
             self.assertEqual(payload['candles'][-1]['c'], payload['price'])
             historical_data.assert_not_called()
@@ -49,6 +50,7 @@ class TestDashboardChart(unittest.TestCase):
 
         self.assertIn('id="chart-current-quote"', DASHBOARD_HTML)
         self.assertIn('id="chart-update-time"', DASHBOARD_HTML)
+        self.assertIn('d.price_source', DASHBOARD_HTML)
         self.assertIn("currentSymbol + ': ' + formatPrice(d.price, currentDecimals)", DASHBOARD_HTML)
         self.assertIn("d.chart_prices", DASHBOARD_HTML)
 
@@ -58,6 +60,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_price = app_module.TRADING_DATA['price']
             previous_history = app_module.TRADING_DATA['price_history']
             previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
+            previous_source = app_module.TRADING_DATA.get('price_source')
             app_module.TRADING_DATA['symbol'] = 'USDJPY'
             app_module.TRADING_DATA['price'] = 149.123
             app_module.TRADING_DATA['price_history'] = [149.0, 149.123]
@@ -67,7 +70,8 @@ class TestDashboardChart(unittest.TestCase):
                     patch.object(app_module.market_data, 'get_latest_quote', return_value={
                         'price': 149.127,
                         'timestamp': '2026-10-30T16:59:00-04:00',
-                        'history': [149.0, 149.123]
+                        'history': [149.0, 149.123],
+                        'source': 'MetaTrader 5'
                     }), \
                     patch.object(app_module.market_data, 'get_intraday_prices', return_value=[]):
                 updated = app_module.update_market_price_once()
@@ -76,12 +80,14 @@ class TestDashboardChart(unittest.TestCase):
             self.assertEqual(app_module.TRADING_DATA['price'], 149.127)
             self.assertEqual(app_module.TRADING_DATA['price_history'][-1], 149.127)
             self.assertEqual(app_module.TRADING_DATA['price_updated_at'], '2026-10-30T16:59:00-04:00')
+            self.assertEqual(app_module.TRADING_DATA['price_source'], 'MetaTrader 5')
         finally:
             with app_module.PRICE_LOCK:
                 app_module.TRADING_DATA['symbol'] = previous_symbol
                 app_module.TRADING_DATA['price'] = previous_price
                 app_module.TRADING_DATA['price_history'] = previous_history
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
+                app_module.TRADING_DATA['price_source'] = previous_source
 
     def test_market_tick_publishes_liquidity_for_the_active_symbol(self):
         candle = {
@@ -99,6 +105,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_candles = app_module.TRADING_DATA['market_candles']
             previous_liquidity = app_module.TRADING_DATA['liquidity']
             previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
+            previous_source = app_module.TRADING_DATA.get('price_source')
             app_module.TRADING_DATA['symbol'] = 'USDJPY'
             app_module.TRADING_DATA['price_history'] = [149.0]
 
@@ -126,6 +133,7 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['market_candles'] = previous_candles
                 app_module.TRADING_DATA['liquidity'] = previous_liquidity
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
+                app_module.TRADING_DATA['price_source'] = previous_source
 
     def test_changing_symbol_updates_the_chart_to_that_symbols_latest_quote(self):
         with app_module.PRICE_LOCK:

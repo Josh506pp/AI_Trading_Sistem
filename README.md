@@ -83,6 +83,14 @@ python src/app.py
 2. La plataforma carga automáticamente en modo demostración
 3. La dashboard consulta el último tick cada cinco segundos; Yahoo Finance entrega barras de un minuto y puede retrasarse. Fuera del horario de un mercado se conserva el último precio y se marca como atrasado.
 
+#### Cotización MT5 opcional (Windows)
+Para recibir ticks del bróker en lugar de las barras retrasadas de Yahoo:
+1. Instala y abre MetaTrader 5, inicia sesión en una cuenta demo o del bróker y habilita los símbolos en Market Watch.
+2. Instala el puente oficial en el mismo entorno Python: `pip install MetaTrader5`.
+3. Reinicia la aplicación. Intentará leer cotizaciones y velas de MT5; si el terminal, la sesión o el símbolo no están disponibles, usará Yahoo Finance como respaldo.
+
+La integración es de solo lectura y no envía órdenes. MT5 no aporta una cotización por sí solo: la rapidez y disponibilidad dependen del servidor del bróker y de que el terminal siga conectado.
+
 Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
 
 ### Funcionalidades

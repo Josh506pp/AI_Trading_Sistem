@@ -152,6 +152,7 @@ TRADING_DATA = {
     'price': round(_initial_price, _initial_decimals),
     'price_history': _initial_price_history,
     'price_updated_at': None,
+    'price_source': None,
     'market_candles': [],
     'liquidity': {'available': False, 'flow_bias': 'SIN DATOS'},
     'balance': 10000.0,
@@ -397,6 +398,7 @@ def reset_price_history(symbol):
             TRADING_DATA['price'] = round(default_price, decimals)
             TRADING_DATA['price_history'] = [TRADING_DATA['price']] * 50
         TRADING_DATA['price_updated_at'] = None
+        TRADING_DATA['price_source'] = None
         TRADING_DATA['market_candles'] = []
         TRADING_DATA['liquidity'] = {'available': False, 'flow_bias': 'SIN DATOS'}
         invalidate_prediction_cache(symbol)
@@ -786,6 +788,7 @@ def update_market_price_once():
                                     market_candles, symbol
                                 )
                         TRADING_DATA['price'] = latest_price
+                        TRADING_DATA['price_source'] = quote.get('source', 'Proveedor externo')
                         history = TRADING_DATA['price_history']
                         if not history or history[-1] != latest_price:
                             history.append(latest_price)
@@ -1531,6 +1534,7 @@ def api_status():
         status = {
             'price': current_price,
             'price_updated_at': TRADING_DATA.get('price_updated_at'),
+            'price_source': TRADING_DATA.get('price_source'),
             'liquidity': copy.deepcopy(TRADING_DATA.get('liquidity', {'available': False})),
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],
@@ -2744,13 +2748,15 @@ DASHBOARD_HTML = """
                     }
                     const updateTimeElement = document.getElementById('chart-update-time');
                     if (updateTimeElement) {
+                        const sourceLabel = d.price_source || 'Fuente sin confirmar';
                         if (d.price_updated_at) {
                             const quoteTime = new Date(d.price_updated_at);
                             const stale = Date.now() - quoteTime.getTime() > 180000;
-                            updateTimeElement.textContent = (stale ? 'Último tick ' : 'Tick ') +
+                            updateTimeElement.textContent = sourceLabel + ' · ' +
+                                (stale ? 'último tick ' : 'tick ') +
                                 quoteTime.toLocaleTimeString() + (stale ? ' · dato atrasado' : '');
                         } else {
-                            updateTimeElement.textContent = 'Sin cotización del mercado';
+                            updateTimeElement.textContent = sourceLabel + ' · Sin cotización';
                         }
                     }
                     const chartDataArr = Array.isArray(d.chart_prices) && d.chart_prices.length > 0 ?

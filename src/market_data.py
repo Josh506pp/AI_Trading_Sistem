@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""
-Real Market Data Service using yfinance
-Provides live OHLCV data for multiple assets
-"""
+"""Read-only MT5 quotes with Yahoo Finance fallback for supported market symbols."""
 
 import yfinance as yf
 from datetime import datetime, timedelta
 import logging
 import math
+import threading
+import time
+from datetime import timezone
+
+try:
+    from .market_symbols import get_symbol_config
+except ImportError:
+    from market_symbols import get_symbol_config
+
+try:
+    import MetaTrader5
+except ImportError:
+    MetaTrader5 = None
 
 logger = logging.getLogger(__name__)
 
@@ -128,10 +138,168 @@ def calculate_liquidity_metrics(candles, symbol):
 class MarketDataProvider:
     """Proveedor de datos reales del mercado"""
     
-    def __init__(self):
+    def __init__(self, mt5_client=None, mt5_retry_seconds=30):
         self.cache = {}
         self.last_update = {}
         self.cache_duration = 60  # segundos
+        self.mt5 = mt5_client if mt5_client is not None else MetaTrader5
+        self.mt5_retry_seconds = mt5_retry_seconds
+        self._mt5_initialized = False
+        self._mt5_last_attempt = 0.0
+        self._mt5_lock = threading.Lock()
+
+    def _ensure_mt5(self):
+        if self.mt5 is None:
+            return False
+
+        with self._mt5_lock:
+            if self._mt5_initialized:
+                try:
+                    terminal = self.mt5.terminal_info()
+                    if (
+                        self.mt5.account_info() is not None and
+                        terminal is not None and
+                        getattr(terminal, 'connected', False)
+                    ):
+                        return True
+                except Exception:
+                    pass
+                self._mt5_initialized = False
+
+            now = time.monotonic()
+            if now - self._mt5_last_attempt < self.mt5_retry_seconds:
+                return False
+            self._mt5_last_attempt = now
+
+            try:
+                if not self.mt5.initialize():
+                    logger.info("MetaTrader 5 no está disponible; se usará la fuente de respaldo.")
+                    return False
+                terminal = self.mt5.terminal_info()
+                if (
+                    self.mt5.account_info() is None or terminal is None or
+                    not getattr(terminal, 'connected', False)
+                ):
+                    logger.info("MetaTrader 5 no tiene una sesión de bróker conectada.")
+                    self.mt5.shutdown()
+                    return False
+                self._mt5_initialized = True
+                return True
+            except Exception as exc:
+                logger.info("No se pudo conectar con MetaTrader 5: %s", exc)
+                return False
+
+    def _resolve_mt5_symbol(self, symbol):
+        candidates = [symbol.upper()]
+        config = get_symbol_config(symbol)
+        if config:
+            candidates.extend(alias for alias in config.symbol_aliases if alias not in candidates)
+
+        for candidate in candidates:
+            info = self.mt5.symbol_info(candidate)
+            if info is not None:
+                if not getattr(info, 'visible', True) and not self.mt5.symbol_select(candidate, True):
+                    continue
+                return candidate
+
+        symbols_get = getattr(self.mt5, 'symbols_get', None)
+        if symbols_get:
+            for candidate in candidates:
+                matches = symbols_get(group=f'{candidate}*') or ()
+                for info in matches:
+                    name = getattr(info, 'name', '')
+                    if name.upper().startswith(candidate.upper()):
+                        if not getattr(info, 'visible', True) and not self.mt5.symbol_select(name, True):
+                            continue
+                        return name
+        return None
+
+    def _mt5_candles(self, symbol, interval='1m', count=200):
+        if not self._ensure_mt5():
+            return []
+
+        timeframes = {
+            '1m': 'TIMEFRAME_M1',
+            '5m': 'TIMEFRAME_M5',
+            '15m': 'TIMEFRAME_M15',
+            '1h': 'TIMEFRAME_H1'
+        }
+        timeframe_name = timeframes.get(interval)
+        if not timeframe_name or not hasattr(self.mt5, timeframe_name):
+            return []
+
+        mt5_symbol = self._resolve_mt5_symbol(symbol)
+        if not mt5_symbol:
+            return []
+        rates = self.mt5.copy_rates_from_pos(
+            mt5_symbol, getattr(self.mt5, timeframe_name), 0, count
+        )
+        if rates is None:
+            return []
+
+        candles = []
+        for rate in rates:
+            try:
+                real_volume = float(rate['real_volume'])
+                tick_volume = float(rate['tick_volume'])
+                volume = real_volume if real_volume > 0 else tick_volume
+                timestamp = int(rate['time'])
+                candle = {
+                    'time': timestamp,
+                    'open': float(rate['open']),
+                    'high': float(rate['high']),
+                    'low': float(rate['low']),
+                    'close': float(rate['close']),
+                    'volume': volume
+                }
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if (
+                all(math.isfinite(candle[key]) for key in ('open', 'high', 'low', 'close', 'volume')) and
+                candle['close'] > 0 and candle['volume'] >= 0
+            ):
+                candles.append(candle)
+        return candles
+
+    def _get_mt5_quote(self, symbol):
+        if not self._ensure_mt5():
+            return None
+
+        mt5_symbol = self._resolve_mt5_symbol(symbol)
+        if not mt5_symbol:
+            logger.info("El símbolo %s no está disponible en MetaTrader 5.", symbol)
+            return None
+        tick = self.mt5.symbol_info_tick(mt5_symbol)
+        if tick is None:
+            return None
+
+        bid = float(getattr(tick, 'bid', 0.0) or 0.0)
+        ask = float(getattr(tick, 'ask', 0.0) or 0.0)
+        last = float(getattr(tick, 'last', 0.0) or 0.0)
+        price = last if last > 0 else (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+        if not math.isfinite(price) or price <= 0:
+            return None
+
+        time_msc = int(getattr(tick, 'time_msc', 0) or 0)
+        tick_time = (
+            datetime.fromtimestamp(time_msc / 1000, tz=timezone.utc).isoformat()
+            if time_msc else
+            datetime.fromtimestamp(int(tick.time), tz=timezone.utc).isoformat()
+        )
+        candles = self._mt5_candles(symbol, '1m', 200)
+        history = [candle['close'] for candle in candles]
+        if not history or history[-1] != price:
+            history.append(price)
+
+        return {
+            'price': price,
+            'timestamp': tick_time,
+            'history': history[-200:],
+            'candles': candles[-120:],
+            'source': 'MetaTrader 5',
+            'spread': ask - bid if bid > 0 and ask > 0 else None,
+            'mt5_symbol': mt5_symbol
+        }
     
     def get_yf_ticker(self, symbol):
         """Obtener ticker de Yahoo Finance para el símbolo"""
@@ -143,7 +311,15 @@ class MarketDataProvider:
         return quote['price'] if quote else None
 
     def get_latest_quote(self, symbol):
-        """Obtener precio y hora del último tick disponible del proveedor."""
+        """Prioriza el tick de MT5 conectado; usa Yahoo Finance como respaldo."""
+        try:
+            mt5_quote = self._get_mt5_quote(symbol)
+        except Exception as exc:
+            logger.warning("No se pudo leer %s desde MT5; se usará Yahoo Finance: %s", symbol, exc)
+            mt5_quote = None
+        if mt5_quote:
+            return mt5_quote
+
         try:
             ticker = self.get_yf_ticker(symbol)
             data = yf.download(ticker, period='7d', interval='1m', progress=False)
@@ -187,14 +363,15 @@ class MarketDataProvider:
                 'price': latest['close'],
                 'timestamp': latest['time'],
                 'history': [candle['close'] for candle in valid_candles[-200:]],
-                'candles': valid_candles[-120:]
+                'candles': valid_candles[-120:],
+                'source': 'Yahoo Finance'
             }
         except Exception as e:
             logger.error(f"Error getting latest quote for {symbol}: {e}")
             return None
     
     def get_historical_data(self, symbol, period='1mo', interval='1h'):
-        """Obtener datos históricos para gráficos"""
+        """Obtener historia de MT5 cuando esté conectado; Yahoo queda como respaldo."""
         try:
             # Cache check
             cache_key = f"{symbol}_{period}_{interval}"
@@ -202,6 +379,17 @@ class MarketDataProvider:
                 if datetime.now() - self.last_update.get(cache_key, datetime.min) < timedelta(seconds=self.cache_duration):
                     return self.cache[cache_key]
             
+            mt5_count = self._history_count(period, interval)
+            try:
+                mt5_candles = self._mt5_candles(symbol, interval, mt5_count)
+            except Exception as exc:
+                logger.warning("No se pudo leer historia de MT5 para %s: %s", symbol, exc)
+                mt5_candles = []
+            if mt5_candles:
+                self.cache[cache_key] = mt5_candles
+                self.last_update[cache_key] = datetime.now()
+                return mt5_candles
+
             ticker = self.get_yf_ticker(symbol)
             data = yf.download(ticker, period=period, interval=interval, progress=False)
             
@@ -228,9 +416,23 @@ class MarketDataProvider:
         except Exception as e:
             logger.error(f"Error getting historical data for {symbol}: {e}")
             return []
+
+    @staticmethod
+    def _history_count(period, interval):
+        period_days = int(period[:-1]) * (365 if period.endswith('y') else 30 if period.endswith('mo') else 7 if period.endswith('d') else 1)
+        bars_per_day = {'1m': 1440, '5m': 288, '15m': 96, '1h': 24}.get(interval, 24)
+        return min(10000, max(1, period_days * bars_per_day))
     
     def get_intraday_prices(self, symbol, count=50):
         """Obtener últimos N precios intradiarios para actualización continua"""
+        try:
+            mt5_candles = self._mt5_candles(symbol, '1m', count)
+        except Exception as exc:
+            logger.warning("No se pudo leer historia intradía de MT5 para %s: %s", symbol, exc)
+            mt5_candles = []
+        if mt5_candles:
+            return [candle['close'] for candle in mt5_candles[-count:]]
+
         try:
             ticker = self.get_yf_ticker(symbol)
             data = yf.download(ticker, period='7d', interval='1m', progress=False)

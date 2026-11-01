@@ -1,12 +1,86 @@
 import unittest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 
 from src.market_data import MarketDataProvider, calculate_liquidity_metrics
 
 
+class FakeMetaTrader5:
+    TIMEFRAME_M1 = 1
+
+    def __init__(self, connected=True):
+        self.connected = connected
+
+    def initialize(self):
+        return self.connected
+
+    def account_info(self):
+        return SimpleNamespace() if self.connected else None
+
+    def terminal_info(self):
+        return SimpleNamespace(connected=self.connected)
+
+    def symbol_info(self, symbol):
+        return SimpleNamespace(visible=True) if symbol == 'EURUSD' else None
+
+    def symbol_select(self, symbol, selected):
+        return True
+
+    def symbol_info_tick(self, symbol):
+        return SimpleNamespace(
+            bid=1.1000,
+            ask=1.1002,
+            last=0.0,
+            time=1730000000,
+            time_msc=1730000000123
+        )
+
+    def copy_rates_from_pos(self, symbol, timeframe, start, count):
+        dtype = [
+            ('time', 'i8'), ('open', 'f8'), ('high', 'f8'), ('low', 'f8'),
+            ('close', 'f8'), ('tick_volume', 'i8'), ('spread', 'i4'),
+            ('real_volume', 'i8')
+        ]
+        return np.array([
+            (1730000000, 1.0998, 1.1001, 1.0997, 1.1000, 12, 2, 0)
+        ], dtype=dtype)
+
+
 class TestMarketDataProvider(unittest.TestCase):
+    def test_latest_quote_prefers_connected_mt5_tick_without_yahoo_request(self):
+        provider = MarketDataProvider(mt5_client=FakeMetaTrader5())
+        with patch('src.market_data.yf.download') as download:
+            quote = provider.get_latest_quote('EURUSD')
+
+        self.assertEqual(quote['source'], 'MetaTrader 5')
+        self.assertEqual(quote['mt5_symbol'], 'EURUSD')
+        self.assertAlmostEqual(quote['price'], 1.1001)
+        self.assertAlmostEqual(quote['spread'], 0.0002)
+        self.assertEqual(quote['candles'][0]['volume'], 12.0)
+        self.assertEqual(
+            quote['timestamp'],
+            datetime.fromtimestamp(1730000000.123, tz=timezone.utc).isoformat()
+        )
+        download.assert_not_called()
+
+    def test_latest_quote_falls_back_to_yahoo_without_connected_mt5(self):
+        timestamp = pd.Timestamp('2026-10-30 16:59:00', tz='America/New_York')
+        data = pd.DataFrame({
+            'Open': [1.1], 'High': [1.2], 'Low': [1.0],
+            'Close': [1.15], 'Volume': [50]
+        }, index=[timestamp])
+        provider = MarketDataProvider(mt5_client=FakeMetaTrader5(connected=False))
+
+        with patch('src.market_data.yf.download', return_value=data):
+            quote = provider.get_latest_quote('EURUSD')
+
+        self.assertEqual(quote['source'], 'Yahoo Finance')
+        self.assertEqual(quote['price'], 1.15)
+
     def test_latest_quote_uses_recent_intraday_data_and_returns_source_timestamp(self):
         timestamp = pd.Timestamp('2026-10-30 16:59:00', tz='America/New_York')
         data = pd.DataFrame({
@@ -24,6 +98,7 @@ class TestMarketDataProvider(unittest.TestCase):
             'price': 3898.9,
             'timestamp': timestamp.isoformat(),
             'history': [3898.9],
+            'source': 'Yahoo Finance',
             'candles': [{
                 'time': timestamp.isoformat(),
                 'open': 3898.0,
