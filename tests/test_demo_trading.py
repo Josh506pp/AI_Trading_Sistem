@@ -198,7 +198,7 @@ class TestDemoTrading(unittest.TestCase):
         self.assertTrue(signal['experimental_demo_only'])
         self.assertEqual(signal['confidence_basis'], 'unvalidated_raw_model_direction')
         self.assertEqual(signal['risk_reward'], 0.5)
-        self.assertEqual(engine.stop_atr_multiple, 1.5)
+        self.assertEqual(engine.stop_atr_multiple, 2.0)
 
     def test_raw_direction_experiment_rejects_conflict_with_component_votes(self):
         waiting_signal = {

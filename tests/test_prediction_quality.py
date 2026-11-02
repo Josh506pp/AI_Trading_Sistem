@@ -50,20 +50,20 @@ class TestPredictionQuality(unittest.TestCase):
             prices, 'ALCISTA', prices[-1] + 10.0
         )
         wider = self.engine.get_trading_levels(
-            prices, 'ALCISTA', prices[-1] + 10.0, stop_atr_multiple=2.0
+            prices, 'ALCISTA', prices[-1] + 10.0, stop_atr_multiple=2.5
         )
 
         self.assertEqual(standard['entry'], wider['entry'])
         self.assertAlmostEqual(
             wider['entry'] - wider['stop_loss'],
-            (standard['entry'] - standard['stop_loss']) * (2.0 / 1.5)
+            (standard['entry'] - standard['stop_loss']) * (2.5 / 2.0)
         )
         self.assertAlmostEqual(
             standard['entry'] - standard['stop_loss'],
             self.engine._calculate_atr(prices[-50:]) * DEFAULT_STOP_ATR_MULTIPLE
         )
-        self.assertEqual(standard['stop_atr_multiple'], 1.5)
-        self.assertEqual(wider['stop_atr_multiple'], 2.0)
+        self.assertEqual(standard['stop_atr_multiple'], 2.0)
+        self.assertEqual(wider['stop_atr_multiple'], 2.5)
 
     def test_forecast_below_two_to_one_is_rejected(self):
         prices = [100 + index * 0.08 + math.sin(index * 0.7) * 0.4 for index in range(120)]
