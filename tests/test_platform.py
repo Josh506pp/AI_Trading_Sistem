@@ -356,6 +356,101 @@ class TestSubscription(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()['success'])
 
+    def test_demo_trade_chat_command_requires_premium(self):
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        self.client.post('/api/subscription/upgrade', json={'plan': 'PRO'})
+        with patch.object(app_module, 'start_demo_chat_trade_job') as start_job:
+            response = self.client.post('/api/chat/command', json={
+                'command': '/trade auto demo XAUUSD'
+            })
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(start_job.called)
+
+    def test_premium_demo_trade_chat_command_starts_one_job(self):
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        self.client.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+        with patch.object(
+            app_module, 'start_demo_chat_trade_job', return_value='demo-job-123'
+        ) as start_job:
+            response = self.client.post('/api/chat/command', json={
+                'command': '/trade auto demo XAUUSD'
+            })
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()['job_id'], 'demo-job-123')
+        self.assertEqual(response.get_json()['status'], 'queued')
+        start_job.assert_called_once_with(self.user_id, 'XAUUSD')
+
+    def test_demo_trade_chat_command_rejects_bad_symbol(self):
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        self.client.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+        with patch.object(app_module, 'start_demo_chat_trade_job') as start_job:
+            response = self.client.post('/api/chat/command', json={
+                'command': '/trade auto demo BTCUSD'
+            })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(start_job.called)
+
+    def test_demo_trade_job_status_is_private_to_requesting_user(self):
+        with self.app.app_context():
+            other_user = User(
+                email='other-demo@example.com',
+                username='other_demo',
+                subscription_plan='PREMIUM',
+                subscription_status='active',
+                subscription_expires=datetime.utcnow() + timedelta(days=30)
+            )
+            other_user.set_password('password123')
+            db.session.add(other_user)
+            db.session.commit()
+        job_id = 'private-demo-job'
+        with app_module._demo_chat_trade_jobs_lock:
+            app_module.DEMO_CHAT_TRADE_JOBS[job_id] = {
+                'job_id': job_id,
+                'user_id': self.user_id,
+                'symbol': 'XAUUSD',
+                'status': 'completed',
+                'message': 'done'
+            }
+
+        try:
+            self.client.post('/api/auth/login', json={
+                'email': 'test@example.com',
+                'password': 'password123'
+            })
+            self.client.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+            owner_response = self.client.get(f'/api/chat/demo-trade/{job_id}')
+            other_client = self.app.test_client()
+            other_client.post('/api/auth/login', json={
+                'email': 'other-demo@example.com',
+                'password': 'password123'
+            })
+            other_response = other_client.get(f'/api/chat/demo-trade/{job_id}')
+
+            self.assertEqual(owner_response.status_code, 200)
+            self.assertEqual(other_response.status_code, 404)
+        finally:
+            with app_module._demo_chat_trade_jobs_lock:
+                app_module.DEMO_CHAT_TRADE_JOBS.pop(job_id, None)
+
+    def test_dashboard_exposes_premium_demo_trade_command(self):
+        from src.app import DASHBOARD_HTML
+
+        self.assertIn('/trade auto demo XAUUSD', DASHBOARD_HTML)
+        self.assertIn('function pollDemoTradeJob(jobId)', DASHBOARD_HTML)
+        self.assertIn("fetch(isCommand ? '/api/chat/command' : '/api/chat'", DASHBOARD_HTML)
+
     def test_premium_professional_analysis_is_cached_for_five_minutes(self):
         user_id = self.user_id
         symbol = app_module.TRADING_DATA['symbol']

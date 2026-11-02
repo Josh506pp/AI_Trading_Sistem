@@ -89,10 +89,10 @@ Para recibir ticks del bróker en lugar de las barras retrasadas de Yahoo:
 2. Instala el puente oficial en el mismo entorno Python: `pip install MetaTrader5`.
 3. Reinicia la aplicación. Intentará leer cotizaciones y velas de MT5; si el terminal, la sesión o el símbolo no están disponibles, usará Yahoo Finance como respaldo.
 
-La integración normal de la app lee cotizaciones y velas, pero no opera cuentas ni garantiza ganancias por operación ni un mínimo de USD 1.
+La actualización automática de mercado solo lee cotizaciones. La única vía de órdenes está protegida y requiere una solicitud explícita de un usuario PREMIUM; siempre rechaza cuentas reales y no garantiza ganancias.
 
 #### Prueba manual aislada en MT5 demo
-El ejecutor de prueba no forma parte del servidor web y nunca admite cuentas reales. Por defecto solo valida la señal y hace `order_check`; requiere `--execute-demo-order` para enviar como máximo una orden por ejecución:
+El ejecutor comparte el mismo motor protegido que el comando del dashboard y nunca admite cuentas reales. Por defecto solo valida la señal y hace `order_check`; requiere `--execute-demo-order` para enviar como máximo una orden por ejecución:
 
 ```powershell
 python tools\run_demo_trade_test.py --symbol EURUSD
@@ -100,6 +100,8 @@ python tools\run_demo_trade_test.py --symbol XAUUSD --max-loss-usd 5 --experimen
 ```
 
 Solo usa EURUSD/XAUUSD, cuenta demo USD y permisos MT5 activos. Por defecto exige una señal confirmada; el arnés experimental puede usar dirección cruda solo con `--experimental-raw-direction-demo-only`, al menos 75% de acuerdo, coincidencia entre el pronóstico ponderado y los cuatro modelos, movimiento suficiente y velas M1 recientes. El TP dinámico sigue el pronóstico dentro de USD 5-15; si no cabe en el límite de pérdida de USD 5, no abre la operación. El monitor espera el TP/SL del servidor hasta 15 minutos y puede cerrar antes solo cuando el PnL bruto estimado alcanza USD 1, la volatilidad M1 reciente es al menos 1.5 veces su referencia y la señal fresca indica giro. Si vence el monitor, el TP y SL siguen activos en MT5. Las entradas experimentales no son señales validadas y no deben usarse en cuentas reales. Lote mínimo, spread, comisiones, deslizamiento y gaps pueden cambiar el resultado real; no se garantiza ganancia. Otra posición u orden pendiente bloquea el mismo símbolo.
+
+En el chat PREMIUM del dashboard también se puede solicitar una operación individual con `/trade auto demo XAUUSD` o `/trade auto demo EURUSD`. La solicitud se procesa en segundo plano, informa su estado en el chat y usa los mismos límites/monitor del arnés; el servidor bloquea cuentas reales, posiciones ya abiertas y solicitudes simultáneas. No es un bot recurrente ni garantiza que se abra una operación o se alcance ganancia.
 
 Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
 
@@ -148,6 +150,8 @@ Los usuarios se registran desde `/register`; las contraseñas se guardan con has
 - `GET /api/subscription/plans` - Planes disponibles
 - `POST /api/subscription/upgrade` - Upgrade de plan
 - `POST /api/chat` - Enviar mensaje al asistente
+- `POST /api/chat/command` - Ejecutar comandos del chat; el trade automático demo requiere PREMIUM
+- `GET /api/chat/demo-trade/<job_id>` - Consultar el estado de una solicitud demo propia
 
 ## Testing
 

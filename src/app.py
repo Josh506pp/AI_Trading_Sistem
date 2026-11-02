@@ -15,6 +15,7 @@ import webbrowser
 import secrets
 import math
 import copy
+import logging
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -76,13 +77,45 @@ try:
         calculate_rsi,
     )
     from .trading_signals import build_prediction_signal
+    from .trading_signals import build_experimental_demo_signal
 except ImportError:
     from technical_indicators import (
         calculate_bollinger_bands,
         calculate_macd,
         calculate_rsi,
     )
-    from trading_signals import build_prediction_signal
+    from trading_signals import build_experimental_demo_signal, build_prediction_signal
+
+try:
+    from .demo_trading import (
+        DEMO_MAX_LOSS_USD,
+        DEMO_MAX_TARGET_PROFIT_USD,
+        DEMO_MIN_TARGET_PROFIT_USD,
+        DEMO_EARLY_CLOSE_PROFIT_USD,
+        DEMO_MONITOR_MAX_SECONDS,
+        DEMO_MAGIC,
+        SUPPORTED_TEST_SYMBOLS,
+        DemoTradeRejected,
+        monitor_demo_position,
+        prepare_demo_order,
+        send_demo_order,
+    )
+except ImportError:
+    from demo_trading import (
+        DEMO_MAX_LOSS_USD,
+        DEMO_MAX_TARGET_PROFIT_USD,
+        DEMO_MIN_TARGET_PROFIT_USD,
+        DEMO_EARLY_CLOSE_PROFIT_USD,
+        DEMO_MONITOR_MAX_SECONDS,
+        DEMO_MAGIC,
+        SUPPORTED_TEST_SYMBOLS,
+        DemoTradeRejected,
+        monitor_demo_position,
+        prepare_demo_order,
+        send_demo_order,
+    )
+
+logger = logging.getLogger(__name__)
 
 try:
     from .models import db, User, LoginSession, BillingHistory, PasswordResetToken, init_db
@@ -183,6 +216,248 @@ TRADING_DATA = {
     'news': []
 }
 CHAT_HISTORY_BY_USER = {}
+DEMO_CHAT_TRADE_JOBS = {}
+_demo_chat_trade_jobs_lock = threading.Lock()
+
+
+def _update_demo_chat_trade_job(job_id, status, message, **fields):
+    with _demo_chat_trade_jobs_lock:
+        job = DEMO_CHAT_TRADE_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job['status'] = status
+        job['message'] = message
+        job['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+        user_id = job['user_id']
+
+    if status not in ('queued', 'running'):
+        with PRICE_LOCK:
+            get_chat_history(user_id).append({
+                'sender': 'IA',
+                'text': message,
+                'timestamp': datetime.utcnow().isoformat() + 'Z'
+            })
+
+
+def get_demo_chat_trade_job(job_id, user_id):
+    with _demo_chat_trade_jobs_lock:
+        job = DEMO_CHAT_TRADE_JOBS.get(job_id)
+        if not job or job['user_id'] != user_id:
+            return None
+        return {
+            key: value for key, value in job.items()
+            if key != 'user_id'
+        }
+
+
+def start_demo_chat_trade_job(user_id, symbol):
+    if symbol not in SUPPORTED_TEST_SYMBOLS:
+        raise ValueError('El símbolo debe ser EURUSD o XAUUSD.')
+
+    job_id = secrets.token_urlsafe(16)
+    with _demo_chat_trade_jobs_lock:
+        if any(
+            job['status'] in ('queued', 'running')
+            for job in DEMO_CHAT_TRADE_JOBS.values()
+        ):
+            raise RuntimeError('Ya hay una operación demo automática en curso.')
+        DEMO_CHAT_TRADE_JOBS[job_id] = {
+            'job_id': job_id,
+            'user_id': user_id,
+            'symbol': symbol,
+            'status': 'queued',
+            'message': 'Solicitud recibida; comprobando cuenta demo y señal.',
+            'created_at': datetime.utcnow().isoformat() + 'Z',
+            'updated_at': datetime.utcnow().isoformat() + 'Z'
+        }
+        worker = threading.Thread(
+            target=_run_demo_chat_trade_job,
+            args=(job_id, user_id, symbol),
+            name=f'demo-trade-{job_id[:8]}',
+            daemon=True
+        )
+        try:
+            worker.start()
+        except Exception:
+            DEMO_CHAT_TRADE_JOBS.pop(job_id, None)
+            raise
+    return job_id
+
+
+def _run_demo_chat_trade_job(job_id, user_id, symbol):
+    order_ticket = None
+    try:
+        with app.app_context():
+            try:
+                user = db.session.get(User, user_id) if DB_AVAILABLE else None
+                if (
+                    user is None or user.subscription_plan != 'PREMIUM' or
+                    not user.has_active_subscription()
+                ):
+                    raise DemoTradeRejected(
+                        'El comando de operación demo requiere una suscripción PREMIUM activa.'
+                    )
+            finally:
+                if DB_AVAILABLE:
+                    db.session.remove()
+
+        provider = market_data if MARKET_DATA_AVAILABLE else None
+        mt5 = getattr(provider, 'mt5', None) if provider else None
+        if mt5 is None or not provider._ensure_mt5():
+            raise DemoTradeRejected('No hay una sesión conectada de MetaTrader 5.')
+
+        terminal = mt5.terminal_info()
+        account = mt5.account_info()
+        if (
+            terminal is None or account is None or
+            account.trade_mode != getattr(mt5, 'ACCOUNT_TRADE_MODE_DEMO', 0) or
+            not getattr(terminal, 'connected', False) or
+            not getattr(terminal, 'trade_allowed', False) or
+            getattr(terminal, 'tradeapi_disabled', True) or
+            not getattr(account, 'trade_allowed', False) or
+            getattr(account, 'currency', None) != 'USD'
+        ):
+            raise DemoTradeRejected(
+                'Se requiere una cuenta MT5 demo USD conectada con Algo Trading habilitado.'
+            )
+
+        positions = mt5.positions_get()
+        pending_orders = mt5.orders_get()
+        if positions is None or pending_orders is None:
+            raise DemoTradeRejected(
+                f'No se pudo comprobar la exposición actual de MT5: {mt5.last_error()}'
+            )
+        if positions or pending_orders:
+            raise DemoTradeRejected(
+                'No se inicia otra operación mientras la cuenta tenga posiciones u órdenes abiertas.'
+            )
+
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 200)
+        if rates is None or len(rates) < 60:
+            raise DemoTradeRejected(f'MT5 no entregó suficientes velas M1 para {symbol}.')
+        prices = [float(rate['close']) for rate in rates]
+        signal = build_experimental_demo_signal(
+            prices, periods=15, engine=prediction_engine
+        )
+        plan = prepare_demo_order(
+            mt5,
+            symbol,
+            signal,
+            int(rates[-1]['time']),
+            max_loss_usd=DEMO_MAX_LOSS_USD,
+            allow_unconfirmed_direction=True,
+            target_profit_range=(
+                DEMO_MIN_TARGET_PROFIT_USD,
+                DEMO_MAX_TARGET_PROFIT_USD
+            )
+        )
+
+        positions = mt5.positions_get()
+        pending_orders = mt5.orders_get()
+        if positions is None or pending_orders is None:
+            raise DemoTradeRejected(
+                f'No se pudo revalidar la exposición antes de enviar: {mt5.last_error()}'
+            )
+        if positions or pending_orders:
+            raise DemoTradeRejected(
+                'Se detectó una posición u orden abierta antes del envío; no se operó.'
+            )
+
+        _update_demo_chat_trade_job(
+            job_id,
+            'running',
+            f'Señal {signal["signal"]} validada para demo. Enviando una sola orden; '
+            f'TP estimado ${plan.estimated_target_usd:.2f}, '
+            f'riesgo estimado al SL ${plan.estimated_stop_loss_usd:.2f}.',
+            direction=signal['signal'],
+            volume=plan.volume,
+            target_goal_usd=plan.target_goal_usd,
+            estimated_target_usd=plan.estimated_target_usd,
+            estimated_stop_loss_usd=plan.estimated_stop_loss_usd
+        )
+        result = send_demo_order(mt5, symbol, plan)
+        order_ticket = int(getattr(result, 'order', 0))
+        if not order_ticket:
+            matches = [
+                position for position in (mt5.positions_get(symbol=symbol) or ())
+                if int(getattr(position, 'magic', 0)) == DEMO_MAGIC
+            ]
+            if len(matches) == 1:
+                order_ticket = int(matches[0].ticket)
+        if not order_ticket:
+            raise DemoTradeRejected(
+                'MT5 aceptó la orden, pero no se pudo identificar la posición para monitorearla; '
+                'verifica el TP/SL desde el terminal.'
+            )
+
+        _update_demo_chat_trade_job(
+            job_id,
+            'running',
+            f'Orden demo {order_ticket} abierta; esperando TP/SL o giro confirmado.',
+            order_id=order_ticket
+        )
+        monitor_result = monitor_demo_position(
+            mt5,
+            symbol,
+            order_ticket,
+            prediction_engine,
+            min_profit_usd=DEMO_EARLY_CLOSE_PROFIT_USD,
+            max_wait_seconds=DEMO_MONITOR_MAX_SECONDS
+        )
+
+        if monitor_result['status'] == 'still_open_with_server_sl_tp':
+            _update_demo_chat_trade_job(
+                job_id,
+                'timed_out_open',
+                'Terminó la ventana de monitoreo. La posición sigue abierta con TP/SL en MT5; '
+                'no se abrió otra operación.',
+                order_id=order_ticket,
+                outcome=monitor_result
+            )
+            return
+
+        deals = mt5.history_deals_get(position=order_ticket)
+        net_profit = None
+        if deals is not None:
+            net_profit = round(sum(
+                float(deal.profit) + float(deal.commission) +
+                float(deal.swap) + float(getattr(deal, 'fee', 0.0))
+                for deal in deals
+            ), 2)
+        result_text = (
+            f'Operación demo {order_ticket} cerrada ({monitor_result["status"]}).'
+        )
+        if net_profit is not None:
+            result_text += f' PnL neto registrado: ${net_profit:.2f}.'
+        _update_demo_chat_trade_job(
+            job_id,
+            'completed',
+            result_text,
+            order_id=order_ticket,
+            outcome=monitor_result,
+            net_profit_usd=net_profit
+        )
+    except DemoTradeRejected as exc:
+        _update_demo_chat_trade_job(
+            job_id,
+            'rejected',
+            f'No se abrió una operación demo: {exc}',
+            error=str(exc),
+            order_id=order_ticket
+        )
+    except Exception as exc:
+        logger.exception('Error en operación demo solicitada desde el chat.')
+        message = f'Error durante la operación demo: {type(exc).__name__}.'
+        if order_ticket:
+            message += ' Verifica en MT5 que la posición conserve su TP y SL.'
+        _update_demo_chat_trade_job(
+            job_id,
+            'error',
+            message,
+            error=type(exc).__name__,
+            order_id=order_ticket
+        )
 
 
 def get_chat_history(user_id):
@@ -1948,6 +2223,7 @@ def api_chat():
 @app.route('/api/chat/command', methods=['POST'])
 @login_required
 @check_subscription('PRO')
+@rate_limit(3)
 def api_chat_command():
     """Procesar comando de chat"""
     data = request.get_json(silent=True) or {}
@@ -1957,6 +2233,55 @@ def api_chat_command():
     command = data['command'].strip()
     if not command or len(command) > 2000:
         return jsonify({'error': 'Command must be between 1 and 2000 characters'}), 400
+
+    command_parts = command.split()
+    if command_parts and command_parts[0].lower() == '/trade':
+        if (
+            request.user.subscription_plan != 'PREMIUM' or
+            not request.user.has_active_subscription()
+        ):
+            return jsonify({
+                'success': False,
+                'error': 'El trade automático demo requiere un plan PREMIUM activo.',
+                'upgrade_required': True
+            }), 403
+        if (
+            len(command_parts) != 4 or
+            command_parts[1].lower().replace('á', 'a') not in ('auto', 'automatico') or
+            command_parts[2].lower() != 'demo'
+        ):
+            return jsonify({
+                'success': False,
+                'error': 'Uso: /trade auto demo XAUUSD (o EURUSD).'
+            }), 400
+        symbol = command_parts[3].upper()
+        if symbol not in SUPPORTED_TEST_SYMBOLS:
+            return jsonify({
+                'success': False,
+                'error': 'El comando demo solo admite EURUSD o XAUUSD.'
+            }), 400
+        try:
+            job_id = start_demo_chat_trade_job(request.user.id, symbol)
+        except RuntimeError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 409
+        except ValueError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+
+        response = (
+            f'Solicitud aceptada para {symbol}. Solo se intentará una operación '
+            'en cuenta demo, con TP estimado USD 5-15 y pérdida estimada máxima USD 5. '
+            'No se garantiza ganancia; puedes consultar el estado desde el chat.'
+        )
+        with PRICE_LOCK:
+            history = get_chat_history(request.user.id)
+            history.append({'sender': 'Tú', 'text': command})
+            history.append({'sender': 'IA', 'text': response})
+        return jsonify({
+            'success': True,
+            'response': response,
+            'job_id': job_id,
+            'status': 'queued'
+        }), 202
     
     # Procesar comando
     response = process_chat_message(command.lower())
@@ -1970,6 +2295,16 @@ def api_chat_command():
         })
     
     return jsonify({'response': response})
+
+
+@app.route('/api/chat/demo-trade/<job_id>')
+@login_required
+@check_subscription('PREMIUM')
+def api_chat_demo_trade_status(job_id):
+    job = get_demo_chat_trade_job(job_id, request.user.id)
+    if not job:
+        return jsonify({'success': False, 'error': 'Operación no encontrada.'}), 404
+    return jsonify({'success': True, 'job': job})
 
 
 @app.route('/api/chat/history')
@@ -2000,7 +2335,11 @@ def process_chat_message(message):
             return f"Análisis de Mercado: Señal {signal.get('action', 'ESPERA')} con confianza {signal.get('confidence', 0.75):.1%}. Revisa el panel de Predicción Avanzada."
     
     elif 'ayuda' in message_lower or 'help' in message_lower:
-        return "Soy tu Asistente de IA de Trading. Puedes preguntarme sobre el 'precio', solicitar un 'análisis' o pedir el 'estado' del mercado actual."
+        return (
+            "Soy tu Asistente de IA de Trading. Puedes usar /status o preguntar por "
+            "precio y análisis. PREMIUM puede solicitar una operación demo con "
+            "/trade auto demo XAUUSD o /trade auto demo EURUSD."
+        )
     
     else:
         with PRICE_LOCK:
@@ -2776,6 +3115,11 @@ DASHBOARD_HTML = """
                     <input id="chat-input" type="text" placeholder="Escribe un comando o pregunta..." style="flex: 1; padding: 12px; background: #0d0d0d; border: 1px solid var(--gold); border-radius: 8px; color: var(--text); font-size: 14px;" />
                     <button class="btn" onclick="sendChat()">Enviar</button>
                 </div>
+                <div id="demo-trade-command" style="display:none; margin-top:10px; font-size:12px; color:var(--text-dim);">
+                    PREMIUM · Demo MT5: <code>/trade auto demo XAUUSD</code> o <code>/trade auto demo EURUSD</code>.
+                    Una operación por solicitud; riesgo estimado máximo USD 5.
+                </div>
+                <div id="chat-demo-trade-status" role="status" aria-live="polite" style="margin-top:8px; font-size:12px; color:var(--gold);"></div>
             </div>
         </div>
     </div>
@@ -2881,6 +3225,7 @@ DASHBOARD_HTML = """
         let currentSymbol = 'EURUSD';
         let currentDecimals = 4;
         let currentSubscriptionPlan = 'FREE';
+        let demoTradePollingJobId = null;
         const PREDICTION_COOLDOWN_MS = 15000;
         const BASIC_ANALYSIS_COOLDOWN_MS = 300000;
         const FREE_ANALYSIS_COOLDOWN_MS = 900000;
@@ -3311,6 +3656,7 @@ DASHBOARD_HTML = """
             const canUseChat = currentSubscriptionPlan === 'PRO' || currentSubscriptionPlan === 'PREMIUM';
             const chatContent = document.getElementById('chat-content');
             const chatLocked = document.getElementById('chat-plan-locked');
+            const demoTradeCommand = document.getElementById('demo-trade-command');
             const predictionsContent = document.getElementById('predictions-content');
             const predictionsLocked = document.getElementById('predictions-plan-locked');
             const newsContent = document.getElementById('news-content');
@@ -3324,6 +3670,10 @@ DASHBOARD_HTML = """
             if (newsLocked) newsLocked.style.display = canUseChat ? 'none' : 'block';
             if (chatContent) chatContent.style.display = canUseChat ? '' : 'none';
             if (chatLocked) chatLocked.style.display = canUseChat ? 'none' : 'block';
+            if (demoTradeCommand) {
+                demoTradeCommand.style.display =
+                    currentSubscriptionPlan === 'PREMIUM' ? 'block' : 'none';
+            }
             if (advancedButton) advancedButton.style.display = canUseChat ? '' : 'none';
             if (advancedLocked) advancedLocked.style.display = canUseChat ? 'none' : 'block';
             if (advancedGrid) advancedGrid.style.display = canUseChat ? 'grid' : 'none';
@@ -3511,17 +3861,59 @@ DASHBOARD_HTML = """
             const input = document.getElementById('chat-input');
             const message = input.value.trim();
             if (!message) return;
-            fetch('/api/chat', {
+            const isCommand = message.startsWith('/');
+            fetch(isCommand ? '/api/chat/command' : '/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message })
+                body: JSON.stringify(isCommand ? { command: message } : { message })
             })
-                .then(r => r.json())
+                .then(async r => {
+                    const data = await r.json();
+                    if (!r.ok || data.success === false) {
+                        throw new Error(data.error || 'No se pudo procesar el mensaje.');
+                    }
+                    return data;
+                })
                 .then(d => {
                     input.value = '';
                     update();
+                    if (d.job_id) pollDemoTradeJob(d.job_id);
                 })
-                .catch(e => console.error('Chat send error:', e));
+                .catch(e => {
+                    const status = document.getElementById('chat-demo-trade-status');
+                    if (status) status.textContent = e.message;
+                });
+        }
+
+        function pollDemoTradeJob(jobId) {
+            if (demoTradePollingJobId === jobId) return;
+            demoTradePollingJobId = jobId;
+            const poll = () => {
+                fetch('/api/chat/demo-trade/' + encodeURIComponent(jobId))
+                    .then(async r => {
+                        const data = await r.json();
+                        if (!r.ok || !data.success) {
+                            throw new Error(data.error || 'No se pudo consultar la operación demo.');
+                        }
+                        return data.job;
+                    })
+                    .then(job => {
+                        const status = document.getElementById('chat-demo-trade-status');
+                        if (status) status.textContent = job.message || job.status;
+                        if (job.status === 'queued' || job.status === 'running') {
+                            window.setTimeout(poll, 3000);
+                        } else {
+                            demoTradePollingJobId = null;
+                            loadChat();
+                        }
+                    })
+                    .catch(e => {
+                        demoTradePollingJobId = null;
+                        const status = document.getElementById('chat-demo-trade-status');
+                        if (status) status.textContent = e.message;
+                    });
+            };
+            poll();
         }
 
         function updateAIAnalysis() {
