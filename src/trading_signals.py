@@ -3,14 +3,17 @@
 import math
 
 try:
-    from .prediction_system import DEFAULT_STOP_ATR_MULTIPLE
+    from .prediction_system import (
+        DEFAULT_STOP_ATR_MULTIPLE,
+        MIN_WALK_FORWARD_ACCURACY,
+    )
     from .technical_indicators import (
         calculate_bollinger_bands,
         calculate_macd,
         calculate_rsi,
     )
 except ImportError:
-    from prediction_system import DEFAULT_STOP_ATR_MULTIPLE
+    from prediction_system import DEFAULT_STOP_ATR_MULTIPLE, MIN_WALK_FORWARD_ACCURACY
     from technical_indicators import (
         calculate_bollinger_bands,
         calculate_macd,
@@ -108,6 +111,10 @@ def build_experimental_demo_signal(
         predicted_price = float(prediction['predicted_price'])
         model_agreement = float(prediction['model_agreement'])
         walk_forward_samples = int(prediction.get('walk_forward_samples', 0))
+        walk_forward_accuracy = float(prediction.get(
+            'effective_walk_forward_accuracy',
+            prediction.get('walk_forward_accuracy')
+        ))
         atr = float(engine._calculate_atr([float(price) for price in prices[-50:]]))
     except (KeyError, TypeError, ValueError, OverflowError):
         return signal
@@ -115,9 +122,11 @@ def build_experimental_demo_signal(
     minimum_move = max(atr * 0.25, current_price * 0.0001)
     if (
         not all(math.isfinite(value) for value in (
-            price_change, current_price, predicted_price, model_agreement, atr
+            price_change, current_price, predicted_price, model_agreement,
+            walk_forward_accuracy, atr
         )) or
         current_price <= 0 or atr <= 0 or
+        walk_forward_accuracy < MIN_WALK_FORWARD_ACCURACY or
         model_agreement < 0.75 or
         walk_forward_samples < 8 or
         abs(price_change) < minimum_move

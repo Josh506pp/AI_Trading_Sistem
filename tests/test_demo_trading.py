@@ -179,7 +179,7 @@ class TestDemoTrading(unittest.TestCase):
                 'current_price': 100.0,
                 'predicted_price': 103.0,
                 'model_agreement': 0.75,
-                'walk_forward_accuracy': 0.40,
+                'walk_forward_accuracy': 0.56,
                 'walk_forward_samples': 12,
                 'methods': {'ema': 103.0, 'linear': 104.0, 'momentum': 102.0, 'volatility': 99.0}
             }
@@ -249,13 +249,39 @@ class TestDemoTrading(unittest.TestCase):
         self.assertEqual(signal['signal'], 'ESPERA')
         self.assertFalse(signal.get('experimental_demo_only', False))
 
+    def test_raw_direction_experiment_rejects_low_walk_forward_accuracy(self):
+        waiting_signal = {
+            'signal': 'ESPERA',
+            'trade_allowed': False,
+            'prediction': {
+                'price_change': 3.0,
+                'current_price': 100.0,
+                'predicted_price': 103.0,
+                'model_agreement': 0.75,
+                'walk_forward_accuracy': 0.40,
+                'effective_walk_forward_accuracy': 0.40,
+                'walk_forward_samples': 12,
+                'methods': {'ema': 103.0, 'linear': 104.0, 'momentum': 102.0, 'volatility': 99.0}
+            }
+        }
+        with patch(
+            'src.trading_signals.build_prediction_signal',
+            return_value=waiting_signal
+        ):
+            signal = build_experimental_demo_signal(
+                [100.0] * 60, engine=RawDirectionEngine()
+            )
+
+        self.assertEqual(signal['signal'], 'ESPERA')
+        self.assertFalse(signal.get('experimental_demo_only', False))
+
     def test_unconfirmed_signal_is_accepted_only_in_explicit_demo_mode(self):
         signal = valid_buy_signal()
         signal['signal'] = 'COMPRA'
         signal['trade_allowed'] = False
         signal['experimental_demo_only'] = True
         signal['model_agreement'] = 0.75
-        signal['prediction']['walk_forward_accuracy'] = 0.40
+        signal['prediction']['walk_forward_accuracy'] = 0.56
 
         with self.assertRaisesRegex(DemoTradeRejected, 'no autorizó'):
             self.prepare(signal)
@@ -266,6 +292,21 @@ class TestDemoTrading(unittest.TestCase):
             allow_unconfirmed_direction=True
         )
         self.assertAlmostEqual(plan.estimated_target_usd, 1.0)
+
+    def test_demo_executor_rejects_low_accuracy_even_with_raw_direction_opt_in(self):
+        signal = valid_buy_signal()
+        signal['experimental_demo_only'] = True
+        signal['model_agreement'] = 0.75
+        signal['prediction']['walk_forward_accuracy'] = 0.28
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'walk-forward'):
+            self.prepare(
+                signal,
+                max_loss_usd=5.0,
+                allow_unconfirmed_direction=True
+            )
+        self.assertEqual(self.mt5.checked_requests, [])
+        self.assertEqual(self.mt5.sent_requests, [])
 
     def test_prepares_usd_bounded_bracketed_demo_order(self):
         plan = self.prepare()

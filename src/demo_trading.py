@@ -4,6 +4,11 @@ import math
 import time
 from dataclasses import dataclass
 
+try:
+    from .prediction_system import MIN_WALK_FORWARD_ACCURACY
+except ImportError:
+    from prediction_system import MIN_WALK_FORWARD_ACCURACY
+
 
 DEMO_TARGET_PROFIT_USD = 1.0
 DEMO_MIN_TARGET_PROFIT_USD = 5.0
@@ -156,13 +161,19 @@ def prepare_demo_order(
     if direction not in ('COMPRA', 'VENTA'):
         raise DemoTradeRejected('La señal de la IA no es COMPRA/VENTA.')
     prediction = signal.get('prediction') or {}
-    accuracy = prediction.get('walk_forward_accuracy')
+    accuracy = prediction.get(
+        'effective_walk_forward_accuracy',
+        prediction.get('walk_forward_accuracy')
+    )
     samples = prediction.get('walk_forward_samples', 0)
     if (
         accuracy is None or not math.isfinite(float(accuracy)) or
-        (float(accuracy) < 0.55 and not experimental_raw) or int(samples) < 8
+        float(accuracy) < MIN_WALK_FORWARD_ACCURACY or int(samples) < 8
     ):
-        raise DemoTradeRejected('La validación walk-forward no alcanza el 55% con 8 muestras.')
+        raise DemoTradeRejected(
+            f'La validación walk-forward no alcanza el '
+            f'{MIN_WALK_FORWARD_ACCURACY:.0%} con 8 muestras.'
+        )
     if experimental_raw and float(signal.get('model_agreement', 0)) < 0.75:
         raise DemoTradeRejected('La dirección experimental no alcanza el 75% de consenso.')
 
