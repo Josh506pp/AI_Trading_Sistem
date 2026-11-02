@@ -115,10 +115,20 @@ def valid_buy_signal():
 
 
 class RawDirectionEngine:
+    def __init__(self):
+        self.stop_atr_multiple = None
+
     def _calculate_atr(self, prices):
         return 1.0
 
-    def get_trading_levels(self, prices, direction, target_price):
+    def get_trading_levels(
+        self,
+        prices,
+        direction,
+        target_price,
+        stop_atr_multiple=1.0
+    ):
+        self.stop_atr_multiple = stop_atr_multiple
         if direction == 'ALCISTA':
             return {
                 'direction': direction,
@@ -174,12 +184,13 @@ class TestDemoTrading(unittest.TestCase):
                 'methods': {'ema': 103.0, 'linear': 104.0, 'momentum': 102.0, 'volatility': 99.0}
             }
         }
+        engine = RawDirectionEngine()
         with patch(
             'src.trading_signals.build_prediction_signal',
             return_value=waiting_signal
         ):
             signal = build_experimental_demo_signal(
-                [100.0] * 60, engine=RawDirectionEngine()
+                [100.0] * 60, engine=engine
             )
 
         self.assertEqual(signal['signal'], 'COMPRA')
@@ -187,6 +198,7 @@ class TestDemoTrading(unittest.TestCase):
         self.assertTrue(signal['experimental_demo_only'])
         self.assertEqual(signal['confidence_basis'], 'unvalidated_raw_model_direction')
         self.assertEqual(signal['risk_reward'], 0.5)
+        self.assertEqual(engine.stop_atr_multiple, 1.5)
 
     def test_raw_direction_experiment_rejects_conflict_with_component_votes(self):
         waiting_signal = {

@@ -76,7 +76,7 @@ try:
         calculate_macd,
         calculate_rsi,
     )
-    from .trading_signals import build_prediction_signal
+    from .trading_signals import build_prediction_signal as build_prediction_signal_uncached
     from .trading_signals import build_experimental_demo_signal
 except ImportError:
     from technical_indicators import (
@@ -84,7 +84,10 @@ except ImportError:
         calculate_macd,
         calculate_rsi,
     )
-    from trading_signals import build_experimental_demo_signal, build_prediction_signal
+    from trading_signals import (
+        build_experimental_demo_signal,
+        build_prediction_signal as build_prediction_signal_uncached,
+    )
 
 try:
     from .demo_trading import (
@@ -721,15 +724,6 @@ else:
 # SISTEMA INTELIGENTE DE ANÁLISIS Y APRENDIZAJE DE IA
 # ====================================================================
 
-# Base de datos de aprendizaje
-AI_LEARNING_DB = {
-    'successful_patterns': [],
-    'trade_history': [],
-    'professional_patterns': [],
-    'learning_score': 0.0,
-    'confidence_threshold': 0.65
-}
-
 def _ema(prices, period):
     """Calcula EMA simple."""
     if len(prices) < period:
@@ -817,14 +811,6 @@ def analyze_signal(prices, symbol=None):
     elif momentum < -atr * 1.5:
         score -= 10
 
-    # Aprendizaje de patrones
-    learned_bonus = 0.0
-    if AI_LEARNING_DB['successful_patterns']:
-        for pattern in AI_LEARNING_DB['successful_patterns'][-10:]:
-            if pattern.get('trend') == trend:
-                learned_bonus += 5 * (pattern.get('success_rate', 0.5) or 0.5)
-    score += max(-15, min(15, learned_bonus))
-
     if score > 30:
         action = 'COMPRA'
     elif score < -30:
@@ -909,7 +895,6 @@ def get_cached_analysis(user_id, symbol, prices, plan='FREE'):
                 'ALTA' if analysis['atr'] / max(abs(prices[-1]), 1e-12) >= 0.001
                 else 'BAJA'
             ) if prices else 'SIN DATOS',
-            'learning_progress': 0.0,
             'indicators': {
                 'rsi': round(analysis['rsi'], 2),
                 'trend': analysis['trend'],
@@ -1074,7 +1059,7 @@ def invalidate_prediction_cache(symbol):
 def _build_prediction_signal_uncached(prices, periods):
     """Genera una recomendación conservadora con niveles de riesgo verificables."""
     engine = prediction_engine if PREDICTION_AVAILABLE else None
-    return build_prediction_signal(prices, periods, engine)
+    return build_prediction_signal_uncached(prices, periods, engine)
 
 # ====================================================================
 # ACTUALIZACIÓN DE PRECIOS
@@ -2053,24 +2038,23 @@ def api_professional_analysis():
         prices = list(TRADING_DATA['price_history'])
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
         current_price = TRADING_DATA['price']
-        learning_pct = min(100.0, AI_LEARNING_DB['learning_score'] * 10)
-        successful_trades = len([
-            trade for trade in AI_LEARNING_DB['trade_history']
-            if trade.get('pl', 0) > 0
-        ])
-        total_trades = len(AI_LEARNING_DB['trade_history'])
 
     def calculate_professional_analysis():
         if len(prices) < 20:
             return {
                 'available': False,
                 'reason': 'Insuficientes datos históricos (se necesitan 20+ precios)',
-                'learning_progress': 0.0,
+                'market_learning': {
+                    'source': 'rolling_walk_forward_market_history',
+                    'available': False,
+                    'samples': 0
+                },
                 'symbol': symbol
             }
 
         analysis = analyze_signal(prices, symbol)
         trade = build_prediction_signal(prices, symbol)
+        prediction = trade['prediction']
         return {
             'available': True,
             'symbol': symbol,
@@ -2081,7 +2065,15 @@ def api_professional_analysis():
             'trade_allowed': trade['trade_allowed'],
             'risk_reward': trade['risk_reward'],
             'signal_reasons': trade['reasons'],
-            'learning_progress': learning_pct,
+            'market_learning': {
+                'source': 'rolling_walk_forward_market_history',
+                'available': prediction.get('walk_forward_samples', 0) > 0,
+                'baseline_accuracy': prediction.get('walk_forward_accuracy'),
+                'adaptive_accuracy': prediction.get('adaptive_walk_forward_accuracy'),
+                'adaptive_samples': prediction.get('adaptive_walk_forward_samples', 0),
+                'model_performance': prediction.get('model_performance', {}),
+                'model_weights': prediction.get('model_weights', {})
+            },
             'indicators': {
                 'rsi': round(analysis['rsi'], 2),
                 'trend': analysis['trend'],
@@ -2091,8 +2083,6 @@ def api_professional_analysis():
             },
             'volatility': 'ALTA' if analysis['atr'] > 0 else 'SIN DATOS',
             'pattern': analysis['trend'],
-            'successful_trades': successful_trades,
-            'total_trades': total_trades,
             'timestamp': datetime.now().isoformat()
         }
 
@@ -3016,6 +3006,8 @@ DASHBOARD_HTML = """
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Consenso de modelos:</strong> <span id="pred-confidence">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Backtest direccional:</strong> <span id="pred-backtest">-</span> <small id="pred-cooldown" style="color:var(--text-dim);"></small></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Validación adaptativa:</strong> <span id="pred-adaptive-backtest">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Aprendizaje por modelo:</strong> <span id="pred-model-learning" style="color:var(--text-dim);">-</span></div>
             <small style="color:var(--text-dim);">El acierto es una prueba histórica reciente, no una probabilidad ni garantía de resultados futuros.</small>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Operación sugerida:</strong> <span id="pred-signal">ESPERA</span> <strong style="color: var(--gold); margin-left:12px;">Riesgo/beneficio:</strong> <span id="pred-risk-reward">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Entry:</strong> <span id="pred-entry">-</span>  <strong style="color: var(--gold); margin-left:12px;">SL:</strong> <span id="pred-sl">-</span>  <strong style="color: var(--gold); margin-left:12px;">TP:</strong> <span id="pred-tp">-</span></div>
@@ -3969,6 +3961,29 @@ DASHBOARD_HTML = """
                         typeof p.walk_forward_accuracy === 'number' ?
                             (p.walk_forward_accuracy * 100).toFixed(1) + '% (' +
                                 (p.walk_forward_samples || 0) + ' pruebas)' : 'Muestra insuficiente';
+                    document.getElementById('pred-adaptive-backtest').textContent =
+                        typeof p.adaptive_walk_forward_accuracy === 'number' ?
+                            (p.adaptive_walk_forward_accuracy * 100).toFixed(1) + '% (' +
+                                (p.adaptive_walk_forward_samples || 0) + ' pruebas sin fuga)' :
+                            'Muestra insuficiente';
+                    const modelLabels = {
+                        ema: 'EMA',
+                        linear: 'Regresión',
+                        momentum: 'Momentum',
+                        volatility: 'Volatilidad'
+                    };
+                    const modelPerformance = p.model_performance || {};
+                    const modelWeights = p.model_weights || {};
+                    document.getElementById('pred-model-learning').textContent =
+                        Object.keys(modelLabels).map(name => {
+                            const metrics = modelPerformance[name] || {};
+                            const accuracy = typeof metrics.accuracy === 'number' ?
+                                (metrics.accuracy * 100).toFixed(0) + '%' : 's/d';
+                            const weight = typeof modelWeights[name] === 'number' ?
+                                (modelWeights[name] * 100).toFixed(0) + '%' : '-';
+                            return modelLabels[name] + ' ' + accuracy + ' (' +
+                                (metrics.samples || 0) + ') peso ' + weight;
+                        }).join(' · ');
                     document.getElementById('pred-cooldown').textContent =
                         ' · Actualizado ' + new Date(d.prediction_cache.calculated_at).toLocaleTimeString() +
                         ' · cooldown ' + d.prediction_cache.cooldown_seconds + ' s';

@@ -3,12 +3,14 @@
 import math
 
 try:
+    from .prediction_system import DEFAULT_STOP_ATR_MULTIPLE
     from .technical_indicators import (
         calculate_bollinger_bands,
         calculate_macd,
         calculate_rsi,
     )
 except ImportError:
+    from prediction_system import DEFAULT_STOP_ATR_MULTIPLE
     from technical_indicators import (
         calculate_bollinger_bands,
         calculate_macd,
@@ -88,7 +90,12 @@ def build_prediction_signal(prices, periods=15, engine=None):
     return trade
 
 
-def build_experimental_demo_signal(prices, periods=15, engine=None):
+def build_experimental_demo_signal(
+    prices,
+    periods=15,
+    engine=None,
+    stop_atr_multiple=DEFAULT_STOP_ATR_MULTIPLE
+):
     """Expose raw model direction for an explicitly opted-in demo experiment."""
     signal = build_prediction_signal(prices, periods, engine)
     if signal.get('trade_allowed') or engine is None:
@@ -144,7 +151,12 @@ def build_experimental_demo_signal(prices, periods=15, engine=None):
     if dominant_direction != direction:
         return signal
 
-    levels = engine.get_trading_levels(prices, direction, predicted_price)
+    levels = engine.get_trading_levels(
+        prices,
+        direction,
+        predicted_price,
+        stop_atr_multiple=stop_atr_multiple
+    )
     if (
         levels.get('direction') != direction or
         levels.get('stop_loss') is None or

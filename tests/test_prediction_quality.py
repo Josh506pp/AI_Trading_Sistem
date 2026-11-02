@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.app import app, calculate_bollinger_bands, calculate_macd, calculate_rsi
-from src.prediction_system import PredictionEngine
+from src.prediction_system import (
+    BASE_MODEL_WEIGHTS,
+    DEFAULT_STOP_ATR_MULTIPLE,
+    PredictionEngine,
+)
 
 app_module = importlib.import_module('src.app')
 
@@ -39,6 +43,27 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(signal['signal'], 'ESPERA')
         self.assertIsNone(signal['stop_loss'])
         self.assertIsNone(signal['take_profit'])
+
+    def test_wider_stop_multiplier_scales_atr_distance_without_changing_entry(self):
+        prices = [100.0 + index * 0.1 for index in range(60)]
+        standard = self.engine.get_trading_levels(
+            prices, 'ALCISTA', prices[-1] + 10.0
+        )
+        wider = self.engine.get_trading_levels(
+            prices, 'ALCISTA', prices[-1] + 10.0, stop_atr_multiple=2.0
+        )
+
+        self.assertEqual(standard['entry'], wider['entry'])
+        self.assertAlmostEqual(
+            wider['entry'] - wider['stop_loss'],
+            (standard['entry'] - standard['stop_loss']) * (2.0 / 1.5)
+        )
+        self.assertAlmostEqual(
+            standard['entry'] - standard['stop_loss'],
+            self.engine._calculate_atr(prices[-50:]) * DEFAULT_STOP_ATR_MULTIPLE
+        )
+        self.assertEqual(standard['stop_atr_multiple'], 1.5)
+        self.assertEqual(wider['stop_atr_multiple'], 2.0)
 
     def test_forecast_below_two_to_one_is_rejected(self):
         prices = [100 + index * 0.08 + math.sin(index * 0.7) * 0.4 for index in range(120)]
@@ -97,6 +122,43 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertGreater(prediction['walk_forward_samples'], 0)
         self.assertGreaterEqual(prediction['walk_forward_accuracy'], 0.0)
         self.assertLessEqual(prediction['walk_forward_accuracy'], 1.0)
+
+    def test_walk_forward_learning_reports_per_model_accuracy_and_bounded_weights(self):
+        prices = [100 + index * 0.08 + math.sin(index * 0.7) * 0.4 for index in range(120)]
+        prediction = self.engine.predict_next_price(prices)
+
+        self.assertEqual(set(prediction['model_performance']), set(BASE_MODEL_WEIGHTS))
+        self.assertEqual(set(prediction['model_weights']), set(BASE_MODEL_WEIGHTS))
+        self.assertAlmostEqual(sum(prediction['model_weights'].values()), 1.0)
+        self.assertGreater(prediction['adaptive_walk_forward_samples'], 0)
+        self.assertGreaterEqual(
+            prediction['adaptive_walk_forward_accuracy'], 0.0
+        )
+        self.assertLessEqual(
+            prediction['adaptive_walk_forward_accuracy'], 1.0
+        )
+        self.assertEqual(
+            prediction['learning_basis'],
+            'expanding_walk_forward_market_history'
+        )
+        self.assertEqual(
+            prediction['confidence_basis'],
+            'model_agreement_not_probability'
+        )
+
+    def test_adaptive_model_weights_favor_reliable_models_but_shrink_sparse_history(self):
+        learned = PredictionEngine._adaptive_model_weights({
+            'ema': {'correct': 18, 'samples': 20},
+            'linear': {'correct': 4, 'samples': 20},
+            'momentum': {'correct': 10, 'samples': 20},
+            'volatility': {'correct': 5, 'samples': 5}
+        })
+        sparse = PredictionEngine._adaptive_model_weights({})
+
+        self.assertGreater(learned['ema'], BASE_MODEL_WEIGHTS['ema'])
+        self.assertLess(learned['linear'], BASE_MODEL_WEIGHTS['linear'])
+        self.assertEqual(sparse, BASE_MODEL_WEIGHTS)
+        self.assertAlmostEqual(sum(learned.values()), 1.0)
 
     def test_low_walk_forward_accuracy_suppresses_directional_predictions(self):
         prices = [100.0 + index * 0.1 + math.sin(index) * 0.01 for index in range(120)]

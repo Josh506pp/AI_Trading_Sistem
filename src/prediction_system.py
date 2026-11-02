@@ -9,6 +9,14 @@ import json
 import math
 
 MIN_WALK_FORWARD_ACCURACY = 0.55
+DEFAULT_STOP_ATR_MULTIPLE = 1.5
+BASE_MODEL_WEIGHTS = {
+    'ema': 0.30,
+    'linear': 0.25,
+    'momentum': 0.25,
+    'volatility': 0.20
+}
+MIN_MODEL_LEARNING_SAMPLES = 8
 
 
 class PredictionEngine:
@@ -18,6 +26,10 @@ class PredictionEngine:
         self.historical_predictions = []
         self.accuracy_score = 0.0
         self.prediction_history = []
+        self.model_weights = dict(BASE_MODEL_WEIGHTS)
+        self.model_performance = {}
+        self.adaptive_walk_forward_accuracy = None
+        self.adaptive_walk_forward_samples = 0
         
     def predict_next_price(self, prices: List[float], periods: int = 5) -> Dict:
         """
@@ -47,6 +59,11 @@ class PredictionEngine:
                 'volatility': 0.0,
                 'walk_forward_accuracy': None,
                 'walk_forward_samples': 0,
+                'adaptive_walk_forward_accuracy': None,
+                'adaptive_walk_forward_samples': 0,
+                'effective_walk_forward_accuracy': None,
+                'model_performance': {},
+                'model_weights': dict(BASE_MODEL_WEIGHTS),
                 'method': 'insufficient_data'
             }
         
@@ -61,32 +78,44 @@ class PredictionEngine:
         
         # Método 4: Volatilidad Media
         volatility_prediction = self._volatility_adjusted_prediction(clean_prices, periods)
-        model_prices = [
-            float(ema_prediction['price']),
-            float(linear_prediction['price']),
-            float(momentum_prediction['price']),
-            float(volatility_prediction['price']),
-        ]
-        
-        # Combinar predicciones (promedio ponderado)
+        model_prices = {
+            'ema': float(ema_prediction['price']),
+            'linear': float(linear_prediction['price']),
+            'momentum': float(momentum_prediction['price']),
+            'volatility': float(volatility_prediction['price']),
+        }
+
+        self.model_performance = {
+            name: {'accuracy': None, 'samples': 0, 'correct': 0}
+            for name in BASE_MODEL_WEIGHTS
+        }
+        self.model_weights = dict(BASE_MODEL_WEIGHTS)
+        self.adaptive_walk_forward_accuracy = None
+        self.adaptive_walk_forward_samples = 0
+        walk_forward_accuracy, walk_forward_samples = self._walk_forward_accuracy(
+            clean_prices, periods
+        )
+        self.model_weights = self._adaptive_model_weights(
+            self.model_performance
+        )
+        effective_walk_forward_accuracy = (
+            self.adaptive_walk_forward_accuracy
+            if self.adaptive_walk_forward_samples >= MIN_MODEL_LEARNING_SAMPLES
+            else walk_forward_accuracy
+        )
+
         final_prediction = float(
-            model_prices[0] * 0.30 +
-            model_prices[1] * 0.25 +
-            model_prices[2] * 0.25 +
-            model_prices[3] * 0.20
+            sum(model_prices[name] * self.model_weights[name] for name in BASE_MODEL_WEIGHTS)
         )
         
         current_price = clean_prices[-1]
         price_change = final_prediction - current_price
         change_percent = (price_change / current_price * 100) if current_price != 0 else 0
-        up_votes = sum(price > current_price for price in model_prices)
-        down_votes = sum(price < current_price for price in model_prices)
+        up_votes = sum(price > current_price for price in model_prices.values())
+        down_votes = sum(price < current_price for price in model_prices.values())
         model_agreement = max(up_votes, down_votes) / len(model_prices)
         atr = self._calculate_atr(clean_prices[-50:])
         minimum_move = max(atr * 0.25, current_price * 0.0001)
-        walk_forward_accuracy, walk_forward_samples = self._walk_forward_accuracy(
-            clean_prices, periods
-        )
         
         votes_match_forecast = (
             (up_votes >= 3 and price_change > 0) or
@@ -94,8 +123,8 @@ class PredictionEngine:
         )
         backtest_rejects_signal = (
             walk_forward_samples >= 8 and
-            walk_forward_accuracy is not None and
-            walk_forward_accuracy < MIN_WALK_FORWARD_ACCURACY
+            effective_walk_forward_accuracy is not None and
+            effective_walk_forward_accuracy < MIN_WALK_FORWARD_ACCURACY
         )
         if (
             abs(price_change) < minimum_move or model_agreement < 0.75 or
@@ -132,40 +161,131 @@ class PredictionEngine:
                 round(walk_forward_accuracy, 3) if walk_forward_accuracy is not None else None
             ),
             'walk_forward_samples': walk_forward_samples,
-            'confidence_basis': 'model_agreement_not_probability',
-            'methods': {
-                'ema': round(float(ema_prediction['price']), 6),
-                'linear': round(float(linear_prediction['price']), 6),
-                'momentum': round(float(momentum_prediction['price']), 6),
-                'volatility': round(float(volatility_prediction['price']), 6),
+            'adaptive_walk_forward_accuracy': (
+                round(self.adaptive_walk_forward_accuracy, 3)
+                if self.adaptive_walk_forward_accuracy is not None else None
+            ),
+            'adaptive_walk_forward_samples': self.adaptive_walk_forward_samples,
+            'effective_walk_forward_accuracy': (
+                round(effective_walk_forward_accuracy, 3)
+                if effective_walk_forward_accuracy is not None else None
+            ),
+            'model_performance': {
+                name: {
+                    'accuracy': (
+                        round(metrics['accuracy'], 3)
+                        if metrics['accuracy'] is not None else None
+                    ),
+                    'samples': metrics['samples']
+                }
+                for name, metrics in self.model_performance.items()
             },
+            'model_weights': {
+                name: round(weight, 6)
+                for name, weight in self.model_weights.items()
+            },
+            'confidence_basis': 'model_agreement_not_probability',
+            'learning_basis': 'expanding_walk_forward_market_history',
+            'methods': {name: round(price, 6) for name, price in model_prices.items()},
             'periods': periods,
             'timestamp': __import__('datetime').datetime.now().isoformat()
         }
 
+    @staticmethod
+    def _adaptive_model_weights(model_performance):
+        weighted = {}
+        for name, base_weight in BASE_MODEL_WEIGHTS.items():
+            metrics = model_performance.get(name, {})
+            samples = int(metrics.get('samples', 0))
+            if samples < MIN_MODEL_LEARNING_SAMPLES:
+                multiplier = 1.0
+            else:
+                correct = int(metrics.get('correct', 0))
+                smoothed_accuracy = (correct + 4.0) / (samples + 8.0)
+                multiplier = max(
+                    0.5,
+                    min(1.5, 1.0 + 4.0 * (smoothed_accuracy - 0.5))
+                )
+            weighted[name] = base_weight * multiplier
+        total = sum(weighted.values())
+        return {name: weight / total for name, weight in weighted.items()}
+
     def _walk_forward_accuracy(self, prices: List[float], periods: int, max_windows: int = 40):
+        model_correct = {name: 0 for name in BASE_MODEL_WEIGHTS}
+        model_samples = {name: 0 for name in BASE_MODEL_WEIGHTS}
+        self.model_performance = {
+            name: {'accuracy': None, 'samples': 0, 'correct': 0}
+            for name in BASE_MODEL_WEIGHTS
+        }
+        self.model_weights = dict(BASE_MODEL_WEIGHTS)
+        self.adaptive_walk_forward_accuracy = None
+        self.adaptive_walk_forward_samples = 0
         if len(prices) < 40:
             return None, 0
 
         start = max(30, len(prices) - max_windows - periods)
         correct = 0
         samples = 0
+        adaptive_correct = 0
+        adaptive_samples = 0
         for index in range(start, len(prices) - periods):
             history = prices[:index]
-            forecasts = (
-                self._ema_prediction(history, periods)['price'] * 0.30 +
-                self._linear_regression_prediction(history, periods)['price'] * 0.25 +
-                self._momentum_prediction(history, periods)['price'] * 0.25 +
-                self._volatility_adjusted_prediction(history, periods)['price'] * 0.20
-            )
+            forecasts = {
+                'ema': self._ema_prediction(history, periods)['price'],
+                'linear': self._linear_regression_prediction(history, periods)['price'],
+                'momentum': self._momentum_prediction(history, periods)['price'],
+                'volatility': self._volatility_adjusted_prediction(history, periods)['price']
+            }
             current = history[-1]
             atr = self._calculate_atr(history[-50:])
-            if abs(forecasts - current) < max(atr * 0.25, current * 0.0001):
+            base_forecast = sum(
+                forecasts[name] * BASE_MODEL_WEIGHTS[name]
+                for name in BASE_MODEL_WEIGHTS
+            )
+            minimum_move = max(atr * 0.25, current * 0.0001)
+            if abs(base_forecast - current) < minimum_move:
                 continue
             actual_change = prices[index + periods] - current
             samples += 1
-            if (forecasts - current) * actual_change > 0:
+            if (base_forecast - current) * actual_change > 0:
                 correct += 1
+            adaptive_weights = self._adaptive_model_weights({
+                name: {
+                    'correct': model_correct[name],
+                    'samples': model_samples[name]
+                }
+                for name in BASE_MODEL_WEIGHTS
+            })
+            adaptive_forecast = sum(
+                forecasts[name] * adaptive_weights[name]
+                for name in BASE_MODEL_WEIGHTS
+            )
+            adaptive_samples += 1
+            if (adaptive_forecast - current) * actual_change > 0:
+                adaptive_correct += 1
+            for name, forecast in forecasts.items():
+                if abs(forecast - current) < minimum_move:
+                    continue
+                model_samples[name] += 1
+                if (forecast - current) * actual_change > 0:
+                    model_correct[name] += 1
+
+        self.model_performance = {
+            name: {
+                'accuracy': (
+                    model_correct[name] / model_samples[name]
+                    if model_samples[name] else None
+                ),
+                'samples': model_samples[name],
+                'correct': model_correct[name]
+            }
+            for name in BASE_MODEL_WEIGHTS
+        }
+        self.model_weights = self._adaptive_model_weights(self.model_performance)
+        self.adaptive_walk_forward_accuracy = (
+            adaptive_correct / adaptive_samples if adaptive_samples else None
+        )
+        self.adaptive_walk_forward_samples = adaptive_samples
 
         return (correct / samples, samples) if samples else (None, 0)
     
@@ -237,7 +357,8 @@ class PredictionEngine:
         return {'price': predicted}
     
     def get_trading_levels(self, prices: List[float], direction: str = 'NEUTRAL',
-                           target_price: float = None) -> Dict:
+                           target_price: float = None,
+                           stop_atr_multiple: float = DEFAULT_STOP_ATR_MULTIPLE) -> Dict:
         """
         Calcula niveles clave de soporte y resistencia para operaciones
         
@@ -278,8 +399,16 @@ class PredictionEngine:
         take_profit = None
         risk_reward = 0.0
 
+        try:
+            stop_atr_multiple = float(stop_atr_multiple)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('stop_atr_multiple debe ser un número positivo.')
+        if not math.isfinite(stop_atr_multiple) or stop_atr_multiple <= 0:
+            raise ValueError('stop_atr_multiple debe ser un número positivo.')
+
         if atr > 0 and (is_long or is_short):
-            stop_loss = entry - atr if is_long else entry + atr
+            stop_distance = atr * stop_atr_multiple
+            stop_loss = entry - stop_distance if is_long else entry + stop_distance
             forecast_target = float(target_price) if target_price is not None else entry + (2 * atr if is_long else -2 * atr)
             target_is_valid = forecast_target > entry if is_long else forecast_target < entry
             if target_is_valid:
@@ -302,7 +431,8 @@ class PredictionEngine:
             'take_profit': round(take_profit, 6) if take_profit is not None else None,
             'current_price': round(current, 6),
             'risk_reward': round(risk_reward, 2),
-            'direction': normalized_direction
+            'direction': normalized_direction,
+            'stop_atr_multiple': stop_atr_multiple
         }
     
     def _calculate_atr(self, prices: List[float], period: int = 14) -> float:
@@ -364,8 +494,15 @@ class PredictionEngine:
         
         if len(prices) < 10 or prediction['direction'] == 'NEUTRAL':
             reasons = ['Modelos sin consenso suficiente']
-            if prediction.get('walk_forward_samples', 0) >= 8 and prediction.get('walk_forward_accuracy') is not None:
-                if prediction['walk_forward_accuracy'] < MIN_WALK_FORWARD_ACCURACY:
+            validation_accuracy = prediction.get(
+                'effective_walk_forward_accuracy',
+                prediction.get('walk_forward_accuracy')
+            )
+            if (
+                prediction.get('walk_forward_samples', 0) >= 8 and
+                validation_accuracy is not None
+            ):
+                if validation_accuracy < MIN_WALK_FORWARD_ACCURACY:
                     reasons = [
                         'El backtest direccional reciente no alcanza el '
                         f'{MIN_WALK_FORWARD_ACCURACY:.0%} de aciertos'
