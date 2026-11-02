@@ -56,13 +56,13 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(standard['entry'], wider['entry'])
         self.assertAlmostEqual(
             wider['entry'] - wider['stop_loss'],
-            (standard['entry'] - standard['stop_loss']) * (3.0 / 2.5)
+            (standard['entry'] - standard['stop_loss']) * (3.0 / 2.25)
         )
         self.assertAlmostEqual(
             standard['entry'] - standard['stop_loss'],
             self.engine._calculate_atr(prices[-50:]) * DEFAULT_STOP_ATR_MULTIPLE
         )
-        self.assertEqual(standard['stop_atr_multiple'], 2.5)
+        self.assertEqual(standard['stop_atr_multiple'], 2.25)
         self.assertEqual(wider['stop_atr_multiple'], 3.0)
 
     def test_forecast_below_two_to_one_is_rejected(self):
