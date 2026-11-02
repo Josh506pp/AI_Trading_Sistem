@@ -238,6 +238,22 @@ def prepare_demo_order(
             'el límite de volumen de prueba.'
         )
 
+    estimated_stop = _profit(
+        mt5, order_type, normalized_symbol, volume, entry, stop_loss
+    )
+    if estimated_stop >= 0 or abs(estimated_stop) > max_loss_usd + 1e-6:
+        raise DemoTradeRejected(
+            f'El stop estimado excede la pérdida máxima demo de USD {max_loss_usd:.2f}.'
+        )
+    reward_needed_for_risk = min_risk_reward * abs(estimated_stop)
+    if reward_needed_for_risk > target_goal + 1e-6:
+        if target_range is None or reward_needed_for_risk > target_range[1] + 1e-6:
+            raise DemoTradeRejected(
+                f'El TP necesario para alcanzar {min_risk_reward:.2f}:1 '
+                f'excede el rango autorizado ({target_range or target_profit_usd}).'
+            )
+        target_goal = reward_needed_for_risk
+
     tick_size = float(getattr(symbol_info, 'trade_tick_size', 0) or symbol_info.point)
     if tick_size <= 0 or not math.isfinite(tick_size):
         raise DemoTradeRejected('El tamaño mínimo de tick del símbolo no es válido.')
@@ -272,9 +288,6 @@ def prepare_demo_order(
 
     estimated_target = _profit(
         mt5, order_type, normalized_symbol, volume, entry, take_profit
-    )
-    estimated_stop = _profit(
-        mt5, order_type, normalized_symbol, volume, entry, stop_loss
     )
     if estimated_target < target_goal - 1e-6:
         raise DemoTradeRejected(

@@ -283,7 +283,7 @@ class TestDemoTrading(unittest.TestCase):
         signal = valid_buy_signal()
         signal['stop_loss'] = 1.09950
 
-        with self.assertRaisesRegex(DemoTradeRejected, 'ratio real estimado'):
+        with self.assertRaisesRegex(DemoTradeRejected, 'excede el rango autorizado'):
             self.prepare(signal)
         self.assertEqual(self.mt5.checked_requests, [])
         self.assertEqual(self.mt5.sent_requests, [])
@@ -300,6 +300,20 @@ class TestDemoTrading(unittest.TestCase):
 
         self.assertAlmostEqual(plan.target_goal_usd, 5.0)
         self.assertAlmostEqual(plan.estimated_target_usd, 5.0)
+        self.assertLessEqual(plan.estimated_stop_loss_usd, 5.0)
+
+    def test_dynamic_target_moves_a_few_ticks_to_preserve_two_to_one_ratio(self):
+        signal = valid_buy_signal()
+        signal['stop_loss'] = 1.09959
+
+        plan = self.prepare(
+            signal,
+            target_profit_range=(5, 15),
+            max_loss_usd=5
+        )
+
+        self.assertAlmostEqual(plan.target_goal_usd, 5.1)
+        self.assertGreaterEqual(plan.estimated_risk_reward, 2.0)
         self.assertLessEqual(plan.estimated_stop_loss_usd, 5.0)
 
     def test_dynamic_target_caps_large_ai_target_at_fifteen(self):
