@@ -138,6 +138,7 @@ def main():
             f"TP objetivo=${plan.target_goal_usd:.2f}, "
             f"TP bruto estimado=${plan.estimated_target_usd:.2f}, "
             f"pérdida estimada al SL=${plan.estimated_stop_loss_usd:.2f}, "
+            f"ratio estimado={plan.estimated_risk_reward:.2f}:1, "
             f"TP={plan.request['tp']}."
         )
         if not args.execute_demo_order:

@@ -27,6 +27,7 @@ class DemoOrderPlan:
     request: dict
     estimated_target_usd: float
     estimated_stop_loss_usd: float
+    estimated_risk_reward: float
     volume: float
     entry_price: float
     target_goal_usd: float
@@ -100,7 +101,8 @@ def prepare_demo_order(
     target_profit_usd=DEMO_TARGET_PROFIT_USD,
     max_loss_usd=DEMO_MAX_LOSS_USD,
     allow_unconfirmed_direction=False,
-    target_profit_range=None
+    target_profit_range=None,
+    min_risk_reward=2.0
 ):
     """Validate a fresh IA signal and prepare a checked, USD-bounded demo order."""
     try:
@@ -113,6 +115,12 @@ def prepare_demo_order(
         not math.isfinite(max_loss_usd) or max_loss_usd <= 0
     ):
         raise DemoTradeRejected('El objetivo y el límite de pérdida deben ser positivos.')
+    try:
+        min_risk_reward = float(min_risk_reward)
+    except (TypeError, ValueError, OverflowError):
+        raise DemoTradeRejected('El ratio mínimo riesgo/beneficio debe ser positivo.')
+    if not math.isfinite(min_risk_reward) or min_risk_reward <= 0:
+        raise DemoTradeRejected('El ratio mínimo riesgo/beneficio debe ser positivo.')
     target_range = None
     if target_profit_range is not None:
         try:
@@ -276,6 +284,12 @@ def prepare_demo_order(
         raise DemoTradeRejected(
             f'El stop estimado excede la pérdida máxima demo de USD {max_loss_usd:.2f}.'
         )
+    actual_risk_reward = estimated_target / abs(estimated_stop)
+    if actual_risk_reward < min_risk_reward - 1e-6:
+        raise DemoTradeRejected(
+            f'El ratio real estimado en MT5 es {actual_risk_reward:.2f}:1; '
+            f'se requiere al menos {min_risk_reward:.2f}:1.'
+        )
 
     request = {
         'action': mt5.TRADE_ACTION_DEAL,
@@ -299,6 +313,7 @@ def prepare_demo_order(
                 request=dict(request),
                 estimated_target_usd=estimated_target,
                 estimated_stop_loss_usd=abs(estimated_stop),
+                estimated_risk_reward=actual_risk_reward,
                 volume=volume,
                 entry_price=entry,
                 target_goal_usd=target_goal

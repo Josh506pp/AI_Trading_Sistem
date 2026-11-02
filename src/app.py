@@ -377,7 +377,8 @@ def _run_demo_chat_trade_job(job_id, user_id, symbol):
             volume=plan.volume,
             target_goal_usd=plan.target_goal_usd,
             estimated_target_usd=plan.estimated_target_usd,
-            estimated_stop_loss_usd=plan.estimated_stop_loss_usd
+            estimated_stop_loss_usd=plan.estimated_stop_loss_usd,
+            estimated_risk_reward=plan.estimated_risk_reward
         )
         result = send_demo_order(mt5, symbol, plan)
         order_ticket = int(getattr(result, 'order', 0))

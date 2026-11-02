@@ -275,7 +275,17 @@ class TestDemoTrading(unittest.TestCase):
         self.assertEqual(plan.request['tp'], 1.10110)
         self.assertAlmostEqual(plan.estimated_target_usd, DEMO_TARGET_PROFIT_USD)
         self.assertLessEqual(plan.estimated_stop_loss_usd, DEMO_MAX_LOSS_USD)
+        self.assertAlmostEqual(plan.estimated_risk_reward, 2.0)
         self.assertEqual(len(self.mt5.checked_requests), 1)
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_rejects_live_quote_risk_reward_below_two_to_one(self):
+        signal = valid_buy_signal()
+        signal['stop_loss'] = 1.09950
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'ratio real estimado'):
+            self.prepare(signal)
+        self.assertEqual(self.mt5.checked_requests, [])
         self.assertEqual(self.mt5.sent_requests, [])
 
     def test_tp_moves_toward_entry_to_target_one_gross_dollar(self):
