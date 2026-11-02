@@ -9,7 +9,7 @@ import json
 import math
 
 MIN_WALK_FORWARD_ACCURACY = 0.55
-DEFAULT_STOP_ATR_MULTIPLE = 2.0
+DEFAULT_STOP_ATR_MULTIPLE = 2.5
 BASE_MODEL_WEIGHTS = {
     'ema': 0.30,
     'linear': 0.25,
