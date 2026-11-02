@@ -18,6 +18,45 @@ class TestDashboardChart(unittest.TestCase):
         self.assertTrue(payload['candles'])
         self.assertIn('c', payload['candles'][0])
 
+    def test_status_uses_mt5_ohlc_candles_and_keeps_last_close_in_sync(self):
+        candle_history = [
+            {'time': 1793656800, 'open': 3945.87, 'high': 3945.87,
+             'low': 3943.88, 'close': 3944.65, 'volume': 10.0},
+            {'time': 1793656860, 'open': 3944.65, 'high': 3950.0,
+             'low': 3944.0, 'close': 3948.99, 'volume': 20.0}
+        ]
+        with app_module.PRICE_LOCK:
+            previous = {
+                key: app_module.TRADING_DATA.get(key)
+                for key in (
+                    'symbol', 'price', 'price_history', 'market_candles',
+                    'price_source', 'price_updated_at'
+                )
+            }
+            app_module.TRADING_DATA.update({
+                'symbol': 'XAUUSD',
+                'price': 3949.33,
+                'price_history': [3944.65, 3948.99, 3949.33],
+                'market_candles': candle_history,
+                'price_source': 'MetaTrader 5',
+                'price_updated_at': '2026-11-02T22:04:13+00:00'
+            })
+
+        try:
+            response = app_module.app.test_client().get('/api/status')
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+
+            self.assertEqual(payload['chart_timeframe'], '1m')
+            self.assertEqual(len(payload['chart_candles']), 2)
+            self.assertEqual(payload['chart_candles'][0]['time'], 1793656800)
+            self.assertEqual(payload['chart_candles'][-1]['close'], payload['price'])
+            self.assertEqual(payload['chart_candles'][-1]['high'], 3950.0)
+            self.assertEqual(payload['chart_prices'], [3944.65, 3949.33])
+        finally:
+            with app_module.PRICE_LOCK:
+                app_module.TRADING_DATA.update(previous)
+
     def test_chart_quote_and_series_use_the_same_active_symbol_snapshot(self):
         with app_module.PRICE_LOCK:
             previous_symbol = app_module.TRADING_DATA['symbol']
@@ -53,6 +92,9 @@ class TestDashboardChart(unittest.TestCase):
         self.assertIn('d.price_source', DASHBOARD_HTML)
         self.assertIn("currentSymbol + ': ' + formatPrice(d.price, currentDecimals)", DASHBOARD_HTML)
         self.assertIn("d.chart_prices", DASHBOARD_HTML)
+        self.assertIn("d.chart_candles", DASHBOARD_HTML)
+        self.assertIn('function drawCandlestickChart(candles)', DASHBOARD_HTML)
+        self.assertIn('function normalizeCandleData(chartData)', DASHBOARD_HTML)
 
     def test_market_tick_updates_the_quote_and_chart_history(self):
         with app_module.PRICE_LOCK:

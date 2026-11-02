@@ -12,8 +12,10 @@ from src.market_data import MarketDataProvider, calculate_liquidity_metrics
 class FakeMetaTrader5:
     TIMEFRAME_M1 = 1
 
-    def __init__(self, connected=True):
+    def __init__(self, connected=True, chart_mode=0, last=0.0):
         self.connected = connected
+        self.chart_mode = chart_mode
+        self.last = last
 
     def initialize(self):
         return self.connected
@@ -25,7 +27,10 @@ class FakeMetaTrader5:
         return SimpleNamespace(connected=self.connected)
 
     def symbol_info(self, symbol):
-        return SimpleNamespace(visible=True) if symbol == 'EURUSD' else None
+        return SimpleNamespace(
+            visible=True,
+            chart_mode=self.chart_mode
+        ) if symbol == 'EURUSD' else None
 
     def symbol_select(self, symbol, selected):
         return True
@@ -34,7 +39,7 @@ class FakeMetaTrader5:
         return SimpleNamespace(
             bid=1.1000,
             ask=1.1002,
-            last=0.0,
+            last=self.last,
             time=1730000000,
             time_msc=1730000000123
         )
@@ -58,7 +63,7 @@ class TestMarketDataProvider(unittest.TestCase):
 
         self.assertEqual(quote['source'], 'MetaTrader 5')
         self.assertEqual(quote['mt5_symbol'], 'EURUSD')
-        self.assertAlmostEqual(quote['price'], 1.1001)
+        self.assertAlmostEqual(quote['price'], 1.1000)
         self.assertAlmostEqual(quote['spread'], 0.0002)
         self.assertEqual(quote['candles'][0]['volume'], 12.0)
         self.assertEqual(
@@ -66,6 +71,16 @@ class TestMarketDataProvider(unittest.TestCase):
             datetime.fromtimestamp(1730000000.123, tz=timezone.utc).isoformat()
         )
         download.assert_not_called()
+
+    def test_latest_quote_matches_mt5_last_price_when_chart_mode_is_last(self):
+        provider = MarketDataProvider(
+            mt5_client=FakeMetaTrader5(chart_mode=1, last=1.10015)
+        )
+
+        quote = provider.get_latest_quote('EURUSD')
+
+        self.assertEqual(quote['price'], 1.10015)
+        self.assertEqual(quote['candles'][-1]['close'], 1.1000)
 
     def test_latest_quote_falls_back_to_yahoo_without_connected_mt5(self):
         timestamp = pd.Timestamp('2026-10-30 16:59:00', tz='America/New_York')

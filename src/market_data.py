@@ -278,7 +278,16 @@ class MarketDataProvider:
         bid = float(getattr(tick, 'bid', 0.0) or 0.0)
         ask = float(getattr(tick, 'ask', 0.0) or 0.0)
         last = float(getattr(tick, 'last', 0.0) or 0.0)
-        price = last if last > 0 else (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+        symbol_info = self.mt5.symbol_info(mt5_symbol)
+        chart_mode_last = getattr(self.mt5, 'SYMBOL_CHART_MODE_LAST', 1)
+        if (
+            symbol_info is not None and
+            getattr(symbol_info, 'chart_mode', None) == chart_mode_last and
+            last > 0
+        ):
+            price = last
+        else:
+            price = bid if bid > 0 else last if last > 0 else ask
         if not math.isfinite(price) or price <= 0:
             return None
 

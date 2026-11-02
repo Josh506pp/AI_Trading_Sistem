@@ -113,6 +113,9 @@ Los usuarios se registran desde `/register`; las contraseñas se guardan con has
 
 #### Gráfico de Precios
 - Ver gráfico con colores dinámicos (dorado subida, morado bajada)
+- Con MT5 conectado, mostrar velas OHLC M1 reales y sincronizar el cierre/quote con el modo de gráfico del símbolo (BID o LAST)
+- Velas alcistas verdes y bajistas rojas; al pasar el cursor se muestran hora UTC y valores O/H/L/C
+- Usar gráfico de línea como respaldo cuando la fuente no entrega velas OHLC
 - Cambiar símbolo: EURUSD, XAUUSD, BTCUSD, etc.
 - Indicadores estimados de presión compradora/vendedora, volumen relativo y zona de precio con mayor volumen
 - Ver la cotización actual de la divisa seleccionada, sincronizada con el último punto del gráfico

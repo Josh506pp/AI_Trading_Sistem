@@ -1893,20 +1893,35 @@ def api_status():
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
         decimals, _, _, _, _ = get_symbol_format(symbol)
         current_price = float(TRADING_DATA['price'])
-        chart_prices = [float(price) for price in TRADING_DATA['price_history'][-40:]]
-        if not chart_prices or chart_prices[-1] != current_price:
-            chart_prices.append(current_price)
+        chart_candles = [
+            dict(candle) for candle in TRADING_DATA.get('market_candles', [])[-120:]
+            if all(key in candle for key in ('open', 'high', 'low', 'close'))
+        ]
+        if chart_candles:
+            latest_candle = chart_candles[-1]
+            latest_candle['close'] = current_price
+            latest_candle['high'] = max(float(latest_candle['high']), current_price)
+            latest_candle['low'] = min(float(latest_candle['low']), current_price)
+            chart_prices = [float(candle['close']) for candle in chart_candles]
+        else:
+            chart_prices = [
+                float(price) for price in TRADING_DATA['price_history'][-40:]
+            ]
+            if not chart_prices or chart_prices[-1] != current_price:
+                chart_prices.append(current_price)
         status = {
             'price': current_price,
             'price_updated_at': TRADING_DATA.get('price_updated_at'),
             'price_source': TRADING_DATA.get('price_source'),
+            'chart_timeframe': '1m' if chart_candles else None,
             'recent_tick_count': len(TRADING_DATA['recent_ticks']),
             'liquidity': copy.deepcopy(TRADING_DATA.get('liquidity', {'available': False})),
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
             'prices': TRADING_DATA['price_history'][-30:],
-            'chart_prices': chart_prices
+            'chart_prices': chart_prices,
+            'chart_candles': chart_candles
         }
 
     status['candles'] = [
@@ -3259,20 +3274,29 @@ DASHBOARD_HTML = """
                     }
                     const updateTimeElement = document.getElementById('chart-update-time');
                     if (updateTimeElement) {
-                        const sourceLabel = d.price_source || 'Fuente sin confirmar';
+                        const isMt5Source = d.price_source === 'MetaTrader 5';
+                        const sourceLabel = isMt5Source ?
+                            'MetaTrader 5 · velas ' + (d.chart_timeframe || '1m') :
+                            (d.price_source || 'Fuente sin confirmar');
                         if (d.price_updated_at) {
                             const quoteTime = new Date(d.price_updated_at);
                             const stale = Date.now() - quoteTime.getTime() > 180000;
+                            const timeLabel = quoteTime.toLocaleTimeString(
+                                undefined,
+                                isMt5Source ? { timeZone: 'UTC' } : undefined
+                            );
                             updateTimeElement.textContent = sourceLabel + ' · ' +
                                 (stale ? 'último tick ' : 'tick ') +
-                                quoteTime.toLocaleTimeString() + (stale ? ' · dato atrasado' : '');
+                                timeLabel + (isMt5Source ? ' UTC/MT5' : '') +
+                                (stale ? ' · dato atrasado' : '');
                         } else {
                             updateTimeElement.textContent = sourceLabel + ' · Sin cotización';
                         }
                     }
-                    const chartDataArr = Array.isArray(d.chart_prices) && d.chart_prices.length > 0 ?
-                        d.chart_prices : (Array.isArray(d.candles) && d.candles.length > 0 ?
-                            d.candles : (Array.isArray(d.prices) ? d.prices : []));
+                    const chartDataArr = Array.isArray(d.chart_candles) && d.chart_candles.length > 0 ?
+                        d.chart_candles : (Array.isArray(d.chart_prices) && d.chart_prices.length > 0 ?
+                            d.chart_prices : (Array.isArray(d.candles) && d.candles.length > 0 ?
+                                d.candles : (Array.isArray(d.prices) ? d.prices : [])));
                     drawChart(chartDataArr);
                     updateLiquidityUI(d.liquidity || {});
                     
@@ -3308,6 +3332,156 @@ DASHBOARD_HTML = """
                 const value = Number(rawValue);
                 return Number.isFinite(value) && value > 0 ? value : null;
             }).filter(value => value !== null);
+        }
+
+        function normalizeCandleData(chartData) {
+            if (!Array.isArray(chartData)) return [];
+            return chartData.map(item => {
+                if (!item || typeof item !== 'object' ||
+                    item.open === undefined || item.high === undefined ||
+                    item.low === undefined || item.close === undefined) {
+                    return null;
+                }
+                const candle = {
+                    time: item.time,
+                    open: Number(item.open),
+                    high: Number(item.high),
+                    low: Number(item.low),
+                    close: Number(item.close)
+                };
+                if (
+                    ![candle.open, candle.high, candle.low, candle.close].every(
+                        value => Number.isFinite(value) && value > 0
+                    ) ||
+                    candle.high < Math.max(candle.open, candle.close) ||
+                    candle.low > Math.min(candle.open, candle.close)
+                ) return null;
+                return candle;
+            }).filter(candle => candle !== null);
+        }
+
+        function formatCandleTime(value) {
+            const numeric = Number(value);
+            const date = Number.isFinite(numeric) ?
+                new Date(numeric < 100000000000 ? numeric * 1000 : numeric) :
+                new Date(value);
+            return Number.isFinite(date.getTime()) ?
+                date.toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    timeZone: 'UTC'
+                }) : '';
+        }
+
+        function drawCandlestickChart(candles) {
+            const canvas = document.getElementById('chart');
+            if (!canvas || !canvas.parentElement) return;
+            if (chart && typeof chart.destroy === 'function') {
+                chart.destroy();
+                chart = null;
+            }
+            if (!canvas.dataset.hoverBound) {
+                canvas.addEventListener('mousemove', showChartTooltip);
+                canvas.addEventListener('mouseleave', hideChartTooltip);
+                canvas.dataset.hoverBound = 'true';
+            }
+
+            const bounds = canvas.parentElement.getBoundingClientRect();
+            const width = Math.max(bounds.width, 320);
+            const height = Math.max(bounds.height, 260);
+            const pixelRatio = window.devicePixelRatio || 1;
+            canvas.width = Math.round(width * pixelRatio);
+            canvas.height = Math.round(height * pixelRatio);
+            const context = canvas.getContext('2d');
+            if (!context) return;
+            context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+            context.clearRect(0, 0, width, height);
+
+            if (!candles.length) {
+                chartHoverData = null;
+                hideChartTooltip();
+                context.fillStyle = '#A0A0A0';
+                context.font = '14px sans-serif';
+                context.textAlign = 'center';
+                context.fillText('Esperando datos de mercado...', width / 2, height / 2);
+                return;
+            }
+
+            const padding = { top: 24, right: 78, bottom: 34, left: 16 };
+            const plotWidth = width - padding.left - padding.right;
+            const plotHeight = height - padding.top - padding.bottom;
+            const low = Math.min(...candles.map(candle => candle.low));
+            const high = Math.max(...candles.map(candle => candle.high));
+            const range = high - low || Math.max(Math.abs(high) * 0.001, 0.000001);
+            const minimum = low - range * 0.08;
+            const maximum = high + range * 0.08;
+            const yAt = value => padding.top + (maximum - value) * plotHeight / (maximum - minimum);
+            const xAt = index => padding.left + (index + 0.5) * plotWidth / candles.length;
+            const candleWidth = Math.max(2, Math.min(12, plotWidth / candles.length * 0.68));
+            chartHoverData = {
+                values: candles,
+                left: padding.left,
+                right: padding.left + plotWidth,
+                top: padding.top,
+                bottom: padding.top + plotHeight,
+                plotWidth
+            };
+
+            context.font = '10px monospace';
+            context.textAlign = 'right';
+            context.textBaseline = 'middle';
+            for (let line = 0; line <= 4; line++) {
+                const y = padding.top + line * plotHeight / 4;
+                const value = maximum - line * (maximum - minimum) / 4;
+                context.strokeStyle = 'rgba(255,255,255,0.08)';
+                context.beginPath();
+                context.moveTo(padding.left, y);
+                context.lineTo(width - padding.right, y);
+                context.stroke();
+                context.fillStyle = '#A0A0A0';
+                context.fillText(formatPrice(value, currentDecimals), width - 8, y);
+            }
+
+            candles.forEach((candle, index) => {
+                const x = xAt(index);
+                const rising = candle.close >= candle.open;
+                const color = rising ? '#26A69A' : '#EF5350';
+                context.strokeStyle = color;
+                context.fillStyle = color;
+                context.lineWidth = 1;
+                context.beginPath();
+                context.moveTo(x, yAt(candle.high));
+                context.lineTo(x, yAt(candle.low));
+                context.stroke();
+
+                const openY = yAt(candle.open);
+                const closeY = yAt(candle.close);
+                const bodyTop = Math.min(openY, closeY);
+                const bodyHeight = Math.max(1, Math.abs(closeY - openY));
+                context.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+            });
+
+            const lastCandle = candles[candles.length - 1];
+            const currentY = yAt(lastCandle.close);
+            context.strokeStyle = 'rgba(212,175,55,0.75)';
+            context.setLineDash([4, 3]);
+            context.beginPath();
+            context.moveTo(padding.left, currentY);
+            context.lineTo(width - padding.right, currentY);
+            context.stroke();
+            context.setLineDash([]);
+
+            const labelCount = Math.min(5, candles.length);
+            context.fillStyle = '#A0A0A0';
+            context.font = '10px monospace';
+            context.textBaseline = 'top';
+            for (let label = 0; label < labelCount; label++) {
+                const index = Math.round(label * (candles.length - 1) / Math.max(1, labelCount - 1));
+                const x = xAt(index);
+                context.textAlign = label === 0 ? 'left' :
+                    label === labelCount - 1 ? 'right' : 'center';
+                context.fillText(formatCandleTime(candles[index].time), x, height - padding.bottom + 8);
+            }
         }
 
         function drawFallbackChart(dataPoints) {
@@ -3426,8 +3600,18 @@ DASHBOARD_HTML = """
 
             const relativeX = (x - chartHoverData.left) / chartHoverData.plotWidth;
             const index = Math.round(relativeX * (chartHoverData.values.length - 1));
-            const price = chartHoverData.values[index];
-            tooltip.textContent = currentSymbol + ': ' + formatPrice(price, currentDecimals);
+            const item = chartHoverData.values[index];
+            if (item && typeof item === 'object' && item.open !== undefined) {
+                tooltip.textContent = currentSymbol + ' · ' +
+                    formatCandleTime(item.time) + ' UTC · O ' +
+                    formatPrice(item.open, currentDecimals) + ' H ' +
+                    formatPrice(item.high, currentDecimals) + ' L ' +
+                    formatPrice(item.low, currentDecimals) + ' C ' +
+                    formatPrice(item.close, currentDecimals);
+            } else {
+                tooltip.textContent = currentSymbol + ': ' +
+                    formatPrice(item, currentDecimals);
+            }
             tooltip.style.display = 'block';
 
             const containerRect = canvas.parentElement.getBoundingClientRect();
@@ -3443,6 +3627,11 @@ DASHBOARD_HTML = """
         }
 
         function drawChart(chartData) {
+            const candles = normalizeCandleData(chartData);
+            if (candles.length) {
+                drawCandlestickChart(candles);
+                return;
+            }
             const dataPoints = normalizeChartData(chartData);
             if (!dataPoints.length) {
                 if (chart) {
