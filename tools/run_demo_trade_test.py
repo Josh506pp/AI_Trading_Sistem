@@ -13,7 +13,10 @@ import MetaTrader5 as mt5
 
 from src.demo_trading import DemoTradeRejected, prepare_demo_order, send_demo_order
 from src.prediction_system import prediction_engine
-from src.trading_signals import build_prediction_signal
+from src.trading_signals import (
+    build_experimental_demo_signal,
+    build_prediction_signal,
+)
 
 
 def main():
@@ -35,6 +38,11 @@ def main():
         type=float,
         default=1.0,
         help='Maximum broker-estimated stop loss in USD (default: 1.00).'
+    )
+    parser.add_argument(
+        '--experimental-raw-direction-demo-only',
+        action='store_true',
+        help='Use raw model direction in demo despite the normal WAIT filter.'
     )
     args = parser.parse_args()
 
@@ -58,7 +66,12 @@ def main():
             return 0
 
         latest_bar_time = int(rates[-1]['time'])
-        signal = build_prediction_signal(
+        signal_builder = (
+            build_experimental_demo_signal
+            if args.experimental_raw_direction_demo_only
+            else build_prediction_signal
+        )
+        signal = signal_builder(
             [float(rate['close']) for rate in rates],
             periods=15,
             engine=prediction_engine
@@ -66,9 +79,12 @@ def main():
         print(
             f"{args.symbol}: señal={signal['signal']}, "
             f"permitida={signal['trade_allowed']}, "
+            f"experimental={signal.get('experimental_demo_only', False)}, "
             f"walk-forward={signal['prediction'].get('walk_forward_accuracy')}, "
             f"muestras={signal['prediction'].get('walk_forward_samples')}"
         )
+        for warning in signal.get('experimental_conflicts', []):
+            print(f'ADVERTENCIA: {warning}')
 
         try:
             plan = prepare_demo_order(
@@ -77,7 +93,8 @@ def main():
                 signal,
                 latest_bar_time,
                 target_profit_usd=args.target_profit_usd,
-                max_loss_usd=args.max_loss_usd
+                max_loss_usd=args.max_loss_usd,
+                allow_unconfirmed_direction=args.experimental_raw_direction_demo_only
             )
         except DemoTradeRejected as exc:
             print(f'No se envió ninguna orden: {exc}')

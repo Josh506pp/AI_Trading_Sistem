@@ -1,5 +1,7 @@
 """Prediction signal assembly shared by the dashboard and demo harness."""
 
+import math
+
 try:
     from .technical_indicators import (
         calculate_bollinger_bands,
@@ -84,3 +86,93 @@ def build_prediction_signal(prices, periods=15, engine=None):
         'horizon_minutes': periods
     }
     return trade
+
+
+def build_experimental_demo_signal(prices, periods=15, engine=None):
+    """Expose raw model direction for an explicitly opted-in demo experiment."""
+    signal = build_prediction_signal(prices, periods, engine)
+    if signal.get('trade_allowed') or engine is None:
+        return signal
+
+    prediction = signal.get('prediction') or {}
+    try:
+        price_change = float(prediction['price_change'])
+        current_price = float(prediction['current_price'])
+        predicted_price = float(prediction['predicted_price'])
+        model_agreement = float(prediction['model_agreement'])
+        walk_forward_samples = int(prediction.get('walk_forward_samples', 0))
+        atr = float(engine._calculate_atr([float(price) for price in prices[-50:]]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return signal
+
+    minimum_move = max(atr * 0.25, current_price * 0.0001)
+    if (
+        not all(math.isfinite(value) for value in (
+            price_change, current_price, predicted_price, model_agreement, atr
+        )) or
+        current_price <= 0 or atr <= 0 or
+        model_agreement < 0.75 or
+        walk_forward_samples < 8 or
+        abs(price_change) < minimum_move
+    ):
+        return signal
+
+    direction = 'ALCISTA' if price_change > 0 else 'BAJISTA'
+    if (direction == 'ALCISTA' and predicted_price <= current_price) or (
+        direction == 'BAJISTA' and predicted_price >= current_price
+    ):
+        return signal
+
+    levels = engine.get_trading_levels(prices, direction, predicted_price)
+    if (
+        levels.get('direction') != direction or
+        levels.get('stop_loss') is None or
+        levels.get('take_profit') is None
+    ):
+        return signal
+
+    experimental = dict(signal)
+    experimental_prediction = dict(prediction)
+    experimental_prediction['direction'] = direction
+    experimental['prediction'] = experimental_prediction
+    methods = prediction.get('methods') or {}
+    method_prices = []
+    for value in methods.values():
+        try:
+            method_price = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(method_price):
+            method_prices.append(method_price)
+    up_votes = sum(value > current_price for value in method_prices)
+    down_votes = sum(value < current_price for value in method_prices)
+    dominant_direction = (
+        'ALCISTA' if up_votes > down_votes else
+        'BAJISTA' if down_votes > up_votes else
+        None
+    )
+    conflicts = (
+        [f'La dirección ponderada {direction} contradice los votos componentes {dominant_direction}.']
+        if dominant_direction and dominant_direction != direction else
+        []
+    )
+    experimental['signal'] = 'COMPRA' if direction == 'ALCISTA' else 'VENTA'
+    experimental['trade_allowed'] = True
+    experimental['experimental_demo_only'] = True
+    experimental['direction'] = direction
+    experimental['model_agreement'] = model_agreement
+    experimental['entry'] = levels['entry']
+    experimental['stop_loss'] = levels['stop_loss']
+    experimental['take_profit'] = levels['take_profit']
+    experimental['levels'] = levels
+    experimental['risk_reward'] = levels['risk_reward']
+    experimental['confidence_basis'] = 'unvalidated_raw_model_direction'
+    experimental['experimental_conflicts'] = conflicts
+    experimental_range = dict(experimental.get('prediction_range') or {})
+    experimental_range['direction'] = direction
+    experimental['prediction_range'] = experimental_range
+    experimental['reasons'] = [
+        'Prueba demo experimental: dirección cruda, sin validación del filtro habitual.',
+        *conflicts
+    ]
+    return experimental

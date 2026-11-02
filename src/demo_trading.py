@@ -91,7 +91,8 @@ def prepare_demo_order(
     signal,
     latest_bar_time,
     target_profit_usd=DEMO_TARGET_PROFIT_USD,
-    max_loss_usd=DEMO_MAX_LOSS_USD
+    max_loss_usd=DEMO_MAX_LOSS_USD,
+    allow_unconfirmed_direction=False
 ):
     """Validate a fresh IA signal and prepare a checked, USD-bounded demo order."""
     try:
@@ -111,7 +112,14 @@ def prepare_demo_order(
     _require_demo_permissions(mt5)
     _require_no_existing_orders(mt5, normalized_symbol)
 
-    if not isinstance(signal, dict) or signal.get('trade_allowed') is not True:
+    experimental_raw = (
+        allow_unconfirmed_direction is True and
+        isinstance(signal, dict) and
+        signal.get('experimental_demo_only') is True
+    )
+    if not isinstance(signal, dict) or (
+        signal.get('trade_allowed') is not True and not experimental_raw
+    ):
         raise DemoTradeRejected('La IA no autorizó una entrada; no se fuerza la señal.')
     direction = signal.get('signal')
     if direction not in ('COMPRA', 'VENTA'):
@@ -121,9 +129,11 @@ def prepare_demo_order(
     samples = prediction.get('walk_forward_samples', 0)
     if (
         accuracy is None or not math.isfinite(float(accuracy)) or
-        float(accuracy) < 0.55 or int(samples) < 8
+        (float(accuracy) < 0.55 and not experimental_raw) or int(samples) < 8
     ):
         raise DemoTradeRejected('La validación walk-forward no alcanza el 55% con 8 muestras.')
+    if experimental_raw and float(signal.get('model_agreement', 0)) < 0.75:
+        raise DemoTradeRejected('La dirección experimental no alcanza el 75% de consenso.')
 
     symbol_info = mt5.symbol_info(normalized_symbol)
     tick = mt5.symbol_info_tick(normalized_symbol)
