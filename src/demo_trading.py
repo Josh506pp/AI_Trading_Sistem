@@ -1,14 +1,20 @@
 """Guarded, explicit MT5 demo-order preparation for manual test runs."""
 
 import math
+import time
 from dataclasses import dataclass
 
 
 DEMO_TARGET_PROFIT_USD = 1.0
-DEMO_MAX_LOSS_USD = 1.0
+DEMO_MIN_TARGET_PROFIT_USD = 5.0
+DEMO_MAX_TARGET_PROFIT_USD = 15.0
+DEMO_EARLY_CLOSE_PROFIT_USD = 1.0
+DEMO_MAX_LOSS_USD = 5.0
 DEMO_MAX_VOLUME = 0.10
 DEMO_MAX_BAR_AGE_SECONDS = 120
 DEMO_MAGIC = 26110101
+DEMO_REVERSAL_VOLATILITY_MULTIPLIER = 1.5
+DEMO_MONITOR_MAX_SECONDS = 900
 SUPPORTED_TEST_SYMBOLS = frozenset({'EURUSD', 'XAUUSD'})
 
 
@@ -23,6 +29,7 @@ class DemoOrderPlan:
     estimated_stop_loss_usd: float
     volume: float
     entry_price: float
+    target_goal_usd: float
 
 
 def _require_demo_permissions(mt5):
@@ -92,7 +99,8 @@ def prepare_demo_order(
     latest_bar_time,
     target_profit_usd=DEMO_TARGET_PROFIT_USD,
     max_loss_usd=DEMO_MAX_LOSS_USD,
-    allow_unconfirmed_direction=False
+    allow_unconfirmed_direction=False,
+    target_profit_range=None
 ):
     """Validate a fresh IA signal and prepare a checked, USD-bounded demo order."""
     try:
@@ -105,6 +113,21 @@ def prepare_demo_order(
         not math.isfinite(max_loss_usd) or max_loss_usd <= 0
     ):
         raise DemoTradeRejected('El objetivo y el límite de pérdida deben ser positivos.')
+    target_range = None
+    if target_profit_range is not None:
+        try:
+            target_min, target_max = (
+                float(target_profit_range[0]),
+                float(target_profit_range[1])
+            )
+        except (IndexError, TypeError, ValueError, OverflowError):
+            raise DemoTradeRejected('El rango del TP debe contener dos cantidades válidas.')
+        if (
+            not math.isfinite(target_min) or not math.isfinite(target_max) or
+            target_min <= 0 or target_max < target_min
+        ):
+            raise DemoTradeRejected('El rango del TP no es válido.')
+        target_range = (target_min, target_max)
     normalized_symbol = str(symbol).upper()
     if normalized_symbol not in SUPPORTED_TEST_SYMBOLS:
         raise DemoTradeRejected('El harness solo admite EURUSD y XAUUSD.')
@@ -190,15 +213,21 @@ def prepare_demo_order(
     )
     if target_at_minimum <= 0:
         raise DemoTradeRejected('El TP no produce beneficio bruto con el tamaño mínimo.')
+    target_goal = (
+        min(target_range[1], max(target_range[0], target_at_minimum))
+        if target_range else
+        target_profit_usd
+    )
     raw_volume = max(
         volume_min,
-        volume_min * DEMO_TARGET_PROFIT_USD / target_at_minimum
+        volume_min * target_goal / target_at_minimum
     )
     steps = math.ceil(max(0.0, raw_volume - volume_min) / volume_step - 1e-12)
     volume = round(volume_min + steps * volume_step, _volume_precision(volume_step))
     if volume > volume_max + 1e-9:
         raise DemoTradeRejected(
-            'No se puede buscar USD 1 bruto sin superar el límite de volumen de prueba.'
+            f'No se puede buscar USD {target_goal:.2f} bruto sin superar '
+            'el límite de volumen de prueba.'
         )
 
     tick_size = float(getattr(symbol_info, 'trade_tick_size', 0) or symbol_info.point)
@@ -222,7 +251,7 @@ def prepare_demo_order(
         candidate_profit = _profit(
             mt5, order_type, normalized_symbol, volume, entry, candidate_tp
         )
-        if candidate_profit >= target_profit_usd - 1e-8:
+        if candidate_profit >= target_goal - 1e-8:
             high_tick = middle_tick
         else:
             low_tick = middle_tick + 1
@@ -239,9 +268,9 @@ def prepare_demo_order(
     estimated_stop = _profit(
         mt5, order_type, normalized_symbol, volume, entry, stop_loss
     )
-    if estimated_target < target_profit_usd - 1e-6:
+    if estimated_target < target_goal - 1e-6:
         raise DemoTradeRejected(
-            f'El beneficio bruto estimado no alcanza USD {target_profit_usd:.2f}.'
+            f'El beneficio bruto estimado no alcanza USD {target_goal:.2f}.'
         )
     if estimated_stop >= 0 or abs(estimated_stop) > max_loss_usd + 1e-6:
         raise DemoTradeRejected(
@@ -271,7 +300,8 @@ def prepare_demo_order(
                 estimated_target_usd=estimated_target,
                 estimated_stop_loss_usd=abs(estimated_stop),
                 volume=volume,
-                entry_price=entry
+                entry_price=entry,
+                target_goal_usd=target_goal
             )
         check_errors.append(
             getattr(check, 'comment', None) or
@@ -301,3 +331,216 @@ def send_demo_order(mt5, symbol, plan):
             f'comentario={getattr(result, "comment", "")}).'
         )
     return result
+
+
+def should_close_early_for_reversal(
+    profit_usd,
+    is_long,
+    reversal_direction,
+    recent_volatility,
+    baseline_volatility,
+    min_profit_usd=DEMO_EARLY_CLOSE_PROFIT_USD,
+    volatility_multiplier=DEMO_REVERSAL_VOLATILITY_MULTIPLIER
+):
+    values = (
+        profit_usd,
+        recent_volatility,
+        baseline_volatility,
+        min_profit_usd,
+        volatility_multiplier
+    )
+    try:
+        profit_usd, recent_volatility, baseline_volatility, min_profit_usd, volatility_multiplier = (
+            float(value) for value in values
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not all(math.isfinite(value) for value in (
+        profit_usd, recent_volatility, baseline_volatility,
+        min_profit_usd, volatility_multiplier
+    )):
+        return False
+    if (
+        profit_usd < min_profit_usd or
+        baseline_volatility <= 0 or
+        recent_volatility < baseline_volatility * volatility_multiplier
+    ):
+        return False
+    reversal = 'BAJISTA' if is_long else 'ALCISTA'
+    return reversal_direction == reversal
+
+
+def close_demo_position(mt5, position, min_profit_usd=DEMO_EARLY_CLOSE_PROFIT_USD):
+    _require_demo_permissions(mt5)
+    if int(getattr(position, 'magic', 0)) != DEMO_MAGIC:
+        raise DemoTradeRejected('El monitor solo puede cerrar posiciones creadas por este arnés.')
+
+    symbol = str(position.symbol)
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        raise DemoTradeRejected(f'No hay cotización para cerrar {symbol}.')
+    is_long = position.type == getattr(mt5, 'POSITION_TYPE_BUY', 0)
+    close_type = mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY
+    close_price = float(tick.bid if is_long else tick.ask)
+    estimated_profit = _profit(
+        mt5,
+        position.type,
+        symbol,
+        float(position.volume),
+        float(position.price_open),
+        close_price
+    )
+    if estimated_profit < float(min_profit_usd):
+        raise DemoTradeRejected(
+            f'No se cerró: PnL bruto estimado ${estimated_profit:.2f} '
+            f'es menor al mínimo ${float(min_profit_usd):.2f}.'
+        )
+
+    request = {
+        'action': mt5.TRADE_ACTION_DEAL,
+        'symbol': symbol,
+        'volume': float(position.volume),
+        'type': close_type,
+        'position': int(position.ticket),
+        'price': round(close_price, int(info.digits)),
+        'deviation': 20,
+        'magic': DEMO_MAGIC,
+        'comment': 'AI demo reversal exit',
+        'type_time': mt5.ORDER_TIME_GTC
+    }
+    errors = []
+    checked = False
+    for filling_mode in _candidate_filling_modes(mt5, info):
+        request['type_filling'] = filling_mode
+        check = mt5.order_check(request)
+        if check is not None and getattr(check, 'retcode', None) == 0:
+            checked = True
+            break
+        errors.append(
+            getattr(check, 'comment', None) or
+            f'retcod={getattr(check, "retcode", "sin respuesta")}'
+        )
+    if not checked:
+        raise DemoTradeRejected(
+            'MT5 rechazó la comprobación del cierre: ' +
+            '; '.join(errors or ['no hay modo de llenado disponible'])
+        )
+
+    result = mt5.order_send(request)
+    if result is None:
+        raise DemoTradeRejected(f'MT5 no devolvió resultado al cerrar: {mt5.last_error()}')
+    if getattr(result, 'retcode', None) != getattr(mt5, 'TRADE_RETCODE_DONE', 10009):
+        raise DemoTradeRejected(
+            f'MT5 no confirmó el cierre temprano (retcode={getattr(result, "retcode", None)}, '
+            f'comentario={getattr(result, "comment", "")}).'
+        )
+    return result
+
+
+def monitor_demo_position(
+    mt5,
+    symbol,
+    ticket,
+    prediction_engine,
+    min_profit_usd=DEMO_EARLY_CLOSE_PROFIT_USD,
+    volatility_multiplier=DEMO_REVERSAL_VOLATILITY_MULTIPLIER,
+    poll_seconds=5,
+    max_wait_seconds=DEMO_MONITOR_MAX_SECONDS
+):
+    try:
+        from .trading_signals import build_experimental_demo_signal
+    except ImportError:
+        from trading_signals import build_experimental_demo_signal
+
+    normalized_symbol = str(symbol).upper()
+    deadline = time.monotonic() + max_wait_seconds
+    last_analyzed_bar = None
+
+    while time.monotonic() < deadline:
+        _require_demo_permissions(mt5)
+        positions = mt5.positions_get(symbol=normalized_symbol)
+        if positions is None:
+            raise DemoTradeRejected(f'No se pudieron leer posiciones: {mt5.last_error()}')
+        position = next(
+            (item for item in positions if int(item.ticket) == int(ticket)),
+            None
+        )
+        if position is None:
+            return {'status': 'closed_by_server', 'ticket': int(ticket)}
+        if int(getattr(position, 'magic', 0)) != DEMO_MAGIC:
+            raise DemoTradeRejected('El monitor encontró una posición que no pertenece al arnés.')
+
+        tick = mt5.symbol_info_tick(normalized_symbol)
+        rates = mt5.copy_rates_from_pos(
+            normalized_symbol, mt5.TIMEFRAME_M1, 0, 80
+        )
+        if tick is not None and rates is not None and len(rates) >= 40:
+            prices = [float(rate['close']) for rate in rates]
+            latest_bar_time = int(rates[-1]['time'])
+            if (
+                0 <= int(tick.time) - latest_bar_time <= DEMO_MAX_BAR_AGE_SECONDS and
+                latest_bar_time != last_analyzed_bar
+            ):
+                last_analyzed_bar = latest_bar_time
+                recent_volatility = float(
+                    prediction_engine._calculate_atr(prices[-10:])
+                )
+                baseline_volatility = float(
+                    prediction_engine._calculate_atr(prices[-40:-10])
+                )
+                reversal_signal = build_experimental_demo_signal(
+                    prices, periods=15, engine=prediction_engine
+                )
+                reversal_direction = (
+                    reversal_signal.get('direction')
+                    if reversal_signal.get('trade_allowed')
+                    else 'NEUTRAL'
+                )
+                is_long = position.type == getattr(mt5, 'POSITION_TYPE_BUY', 0)
+                close_price = float(tick.bid if is_long else tick.ask)
+                estimated_profit = _profit(
+                    mt5,
+                    position.type,
+                    normalized_symbol,
+                    float(position.volume),
+                    float(position.price_open),
+                    close_price
+                )
+                if should_close_early_for_reversal(
+                    estimated_profit,
+                    is_long,
+                    reversal_direction,
+                    recent_volatility,
+                    baseline_volatility,
+                    min_profit_usd,
+                    volatility_multiplier
+                ):
+                    result = close_demo_position(
+                        mt5, position, min_profit_usd=min_profit_usd
+                    )
+                    return {
+                        'status': 'closed_early_on_reversal',
+                        'ticket': int(ticket),
+                        'estimated_profit_usd': estimated_profit,
+                        'close_order': getattr(result, 'order', 0)
+                    }
+
+        time.sleep(max(0.1, float(poll_seconds)))
+
+    positions = mt5.positions_get(symbol=normalized_symbol)
+    if positions is None:
+        raise DemoTradeRejected(f'No se pudieron leer posiciones al terminar el monitor: {mt5.last_error()}')
+    position = next(
+        (item for item in positions if int(item.ticket) == int(ticket)),
+        None
+    )
+    if position is None:
+        return {'status': 'closed_by_server', 'ticket': int(ticket)}
+    return {
+        'status': 'still_open_with_server_sl_tp',
+        'ticket': int(ticket),
+        'profit_usd': float(position.profit),
+        'stop_loss': float(position.sl),
+        'take_profit': float(position.tp)
+    }

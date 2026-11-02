@@ -11,7 +11,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import MetaTrader5 as mt5
 
-from src.demo_trading import DemoTradeRejected, prepare_demo_order, send_demo_order
+from src.demo_trading import (
+    DEMO_MAX_LOSS_USD,
+    DEMO_MAX_TARGET_PROFIT_USD,
+    DEMO_MIN_TARGET_PROFIT_USD,
+    DemoTradeRejected,
+    monitor_demo_position,
+    prepare_demo_order,
+    send_demo_order,
+)
 from src.prediction_system import prediction_engine
 from src.trading_signals import (
     build_experimental_demo_signal,
@@ -30,14 +38,32 @@ def main():
     parser.add_argument(
         '--target-profit-usd',
         type=float,
-        default=1.0,
-        help='Gross broker-estimated TP objective in USD (default: 1.00).'
+        default=None,
+        help='Use a fixed gross TP objective instead of the default dynamic range.'
+    )
+    parser.add_argument(
+        '--min-target-profit-usd',
+        type=float,
+        default=DEMO_MIN_TARGET_PROFIT_USD,
+        help='Minimum dynamic TP based on the AI forecast (default: 5.00).'
+    )
+    parser.add_argument(
+        '--max-target-profit-usd',
+        type=float,
+        default=DEMO_MAX_TARGET_PROFIT_USD,
+        help='Maximum dynamic TP based on the AI forecast (default: 15.00).'
     )
     parser.add_argument(
         '--max-loss-usd',
         type=float,
-        default=1.0,
-        help='Maximum broker-estimated stop loss in USD (default: 1.00).'
+        default=DEMO_MAX_LOSS_USD,
+        help='Maximum broker-estimated stop loss in USD (default: 5.00).'
+    )
+    parser.add_argument(
+        '--max-monitor-seconds',
+        type=int,
+        default=900,
+        help='Maximum time to monitor an order; server SL/TP remain active afterwards.'
     )
     parser.add_argument(
         '--experimental-raw-direction-demo-only',
@@ -92,9 +118,16 @@ def main():
                 args.symbol,
                 signal,
                 latest_bar_time,
-                target_profit_usd=args.target_profit_usd,
+                target_profit_usd=(
+                    1.0 if args.target_profit_usd is None else
+                    args.target_profit_usd
+                ),
                 max_loss_usd=args.max_loss_usd,
-                allow_unconfirmed_direction=args.experimental_raw_direction_demo_only
+                allow_unconfirmed_direction=args.experimental_raw_direction_demo_only,
+                target_profit_range=(
+                    None if args.target_profit_usd is not None else
+                    (args.min_target_profit_usd, args.max_target_profit_usd)
+                )
             )
         except DemoTradeRejected as exc:
             print(f'No se envió ninguna orden: {exc}')
@@ -102,6 +135,7 @@ def main():
 
         print(
             f"Plan validado: volumen={plan.volume}, "
+            f"TP objetivo=${plan.target_goal_usd:.2f}, "
             f"TP bruto estimado=${plan.estimated_target_usd:.2f}, "
             f"pérdida estimada al SL=${plan.estimated_stop_loss_usd:.2f}, "
             f"TP={plan.request['tp']}."
@@ -119,7 +153,24 @@ def main():
             f"Orden demo enviada: retcode={result.retcode}, "
             f"order={getattr(result, 'order', 0)}, deal={getattr(result, 'deal', 0)}."
         )
-        print('El TP/SL queda en el servidor MT5; el PnL final puede variar por costos y ejecución.')
+        ticket = int(getattr(result, 'order', 0))
+        if not ticket:
+            print('No se pudo identificar la posición para el monitor; el TP/SL del servidor sigue activo.')
+            return 0
+        try:
+            monitor_result = monitor_demo_position(
+                mt5,
+                args.symbol,
+                ticket,
+                prediction_engine,
+                min_profit_usd=1.0,
+                max_wait_seconds=max(1, args.max_monitor_seconds)
+            )
+        except DemoTradeRejected as exc:
+            print(f'El monitor se detuvo; el TP/SL del servidor permanece activo: {exc}')
+            return 1
+        print(f"Estado del monitor: {monitor_result}")
+        print('El TP/SL permanece en MT5; ejecución, costos y deslizamiento pueden alterar el PnL.')
         return 0
     finally:
         mt5.shutdown()

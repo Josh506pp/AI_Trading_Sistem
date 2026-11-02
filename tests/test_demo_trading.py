@@ -6,8 +6,10 @@ from src.demo_trading import (
     DEMO_MAX_LOSS_USD,
     DEMO_TARGET_PROFIT_USD,
     DemoTradeRejected,
+    close_demo_position,
     prepare_demo_order,
     send_demo_order,
+    should_close_early_for_reversal,
 )
 from src.trading_signals import build_experimental_demo_signal
 
@@ -144,7 +146,8 @@ class TestDemoTrading(unittest.TestCase):
         latest_bar_time=1000,
         target_profit_usd=1.0,
         max_loss_usd=1.0,
-        allow_unconfirmed_direction=False
+        allow_unconfirmed_direction=False,
+        target_profit_range=None
     ):
         return prepare_demo_order(
             self.mt5,
@@ -153,7 +156,8 @@ class TestDemoTrading(unittest.TestCase):
             latest_bar_time,
             target_profit_usd=target_profit_usd,
             max_loss_usd=max_loss_usd,
-            allow_unconfirmed_direction=allow_unconfirmed_direction
+            allow_unconfirmed_direction=allow_unconfirmed_direction,
+            target_profit_range=target_profit_range
         )
 
     def test_raw_direction_experiment_is_explicit_and_unvalidated(self):
@@ -269,6 +273,26 @@ class TestDemoTrading(unittest.TestCase):
         self.assertAlmostEqual(plan.estimated_target_usd, 1.0)
         self.assertLessEqual(plan.estimated_stop_loss_usd, 5.12)
 
+    def test_dynamic_target_uses_ai_projected_profit_clamped_to_five_to_fifteen(self):
+        plan = self.prepare(target_profit_range=(5, 15), max_loss_usd=5)
+
+        self.assertAlmostEqual(plan.target_goal_usd, 5.0)
+        self.assertAlmostEqual(plan.estimated_target_usd, 5.0)
+        self.assertLessEqual(plan.estimated_stop_loss_usd, 5.0)
+
+    def test_dynamic_target_caps_large_ai_target_at_fifteen(self):
+        signal = valid_buy_signal()
+        signal['take_profit'] = 1.12010
+
+        plan = self.prepare(
+            signal,
+            target_profit_range=(5, 15),
+            max_loss_usd=5
+        )
+
+        self.assertAlmostEqual(plan.target_goal_usd, 15.0)
+        self.assertAlmostEqual(plan.estimated_target_usd, 15.0)
+
     def test_rejects_stop_loss_above_custom_demo_cap(self):
         signal = valid_buy_signal()
         signal['stop_loss'] = 1.09480
@@ -359,6 +383,55 @@ class TestDemoTrading(unittest.TestCase):
         with self.assertRaisesRegex(DemoTradeRejected, 'solo permite cuentas demo'):
             send_demo_order(self.mt5, 'EURUSD', plan)
 
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_early_close_requires_minimum_profit_reversal_and_volatility_expansion(self):
+        self.assertFalse(should_close_early_for_reversal(
+            0.99, True, 'BAJISTA', 2.0, 1.0
+        ))
+        self.assertFalse(should_close_early_for_reversal(
+            1.2, True, 'BAJISTA', 1.4, 1.0
+        ))
+        self.assertFalse(should_close_early_for_reversal(
+            1.2, True, 'ALCISTA', 2.0, 1.0
+        ))
+        self.assertTrue(should_close_early_for_reversal(
+            1.0, True, 'BAJISTA', 1.5, 1.0
+        ))
+
+    def test_early_close_checks_current_gross_profit_and_demo_owned_position(self):
+        position = SimpleNamespace(
+            symbol='EURUSD',
+            magic=26110101,
+            type=FakeMT5.ORDER_TYPE_BUY,
+            volume=0.01,
+            price_open=1.1001,
+            ticket=23
+        )
+        self.mt5.tick.bid = 1.1012
+        result = close_demo_position(self.mt5, position, min_profit_usd=1.0)
+
+        self.assertEqual(result.order, 23)
+        self.assertEqual(len(self.mt5.sent_requests), 1)
+        self.assertEqual(self.mt5.sent_requests[0]['position'], 23)
+
+    def test_early_close_refuses_below_one_dollar_or_foreign_position(self):
+        position = SimpleNamespace(
+            symbol='EURUSD',
+            magic=26110101,
+            type=FakeMT5.ORDER_TYPE_BUY,
+            volume=0.01,
+            price_open=1.1001,
+            ticket=23
+        )
+        self.mt5.tick.bid = 1.1002
+        with self.assertRaisesRegex(DemoTradeRejected, 'menor al mínimo'):
+            close_demo_position(self.mt5, position, min_profit_usd=1.0)
+        self.assertEqual(self.mt5.sent_requests, [])
+
+        position.magic = 7
+        with self.assertRaisesRegex(DemoTradeRejected, 'solo puede cerrar posiciones'):
+            close_demo_position(self.mt5, position, min_profit_usd=0.0)
         self.assertEqual(self.mt5.sent_requests, [])
 
 
