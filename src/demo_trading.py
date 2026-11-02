@@ -85,8 +85,25 @@ def _candidate_filling_modes(mt5, symbol_info):
     return list(dict.fromkeys(modes))
 
 
-def prepare_demo_order(mt5, symbol, signal, latest_bar_time):
+def prepare_demo_order(
+    mt5,
+    symbol,
+    signal,
+    latest_bar_time,
+    target_profit_usd=DEMO_TARGET_PROFIT_USD,
+    max_loss_usd=DEMO_MAX_LOSS_USD
+):
     """Validate a fresh IA signal and prepare a checked, USD-bounded demo order."""
+    try:
+        target_profit_usd = float(target_profit_usd)
+        max_loss_usd = float(max_loss_usd)
+    except (TypeError, ValueError, OverflowError):
+        raise DemoTradeRejected('El objetivo y el límite de pérdida deben ser números.')
+    if (
+        not math.isfinite(target_profit_usd) or target_profit_usd <= 0 or
+        not math.isfinite(max_loss_usd) or max_loss_usd <= 0
+    ):
+        raise DemoTradeRejected('El objetivo y el límite de pérdida deben ser positivos.')
     normalized_symbol = str(symbol).upper()
     if normalized_symbol not in SUPPORTED_TEST_SYMBOLS:
         raise DemoTradeRejected('El harness solo admite EURUSD y XAUUSD.')
@@ -174,17 +191,51 @@ def prepare_demo_order(mt5, symbol, signal, latest_bar_time):
             'No se puede buscar USD 1 bruto sin superar el límite de volumen de prueba.'
         )
 
+    tick_size = float(getattr(symbol_info, 'trade_tick_size', 0) or symbol_info.point)
+    if tick_size <= 0 or not math.isfinite(tick_size):
+        raise DemoTradeRejected('El tamaño mínimo de tick del símbolo no es válido.')
+    direction_sign = 1 if is_buy else -1
+    available_ticks = math.floor(
+        direction_sign * (take_profit - entry) / tick_size + 1e-9
+    )
+    if available_ticks < 1:
+        raise DemoTradeRejected('El TP de la IA no deja espacio para ajustar el objetivo.')
+
+    low_tick = 1
+    high_tick = available_ticks
+    while low_tick < high_tick:
+        middle_tick = (low_tick + high_tick) // 2
+        candidate_tp = round(
+            entry + direction_sign * middle_tick * tick_size,
+            int(symbol_info.digits)
+        )
+        candidate_profit = _profit(
+            mt5, order_type, normalized_symbol, volume, entry, candidate_tp
+        )
+        if candidate_profit >= target_profit_usd - 1e-8:
+            high_tick = middle_tick
+        else:
+            low_tick = middle_tick + 1
+    take_profit = round(
+        entry + direction_sign * low_tick * tick_size,
+        int(symbol_info.digits)
+    )
+    if abs(take_profit - entry) < minimum_distance:
+        raise DemoTradeRejected('El TP ajustado queda demasiado cerca según MT5.')
+
     estimated_target = _profit(
         mt5, order_type, normalized_symbol, volume, entry, take_profit
     )
     estimated_stop = _profit(
         mt5, order_type, normalized_symbol, volume, entry, stop_loss
     )
-    if estimated_target < DEMO_TARGET_PROFIT_USD - 1e-6:
-        raise DemoTradeRejected('El beneficio bruto estimado no alcanza USD 1.')
-    if estimated_stop >= 0 or abs(estimated_stop) > DEMO_MAX_LOSS_USD + 1e-6:
+    if estimated_target < target_profit_usd - 1e-6:
         raise DemoTradeRejected(
-            'El stop estimado excede la pérdida máxima demo de USD 1.'
+            f'El beneficio bruto estimado no alcanza USD {target_profit_usd:.2f}.'
+        )
+    if estimated_stop >= 0 or abs(estimated_stop) > max_loss_usd + 1e-6:
+        raise DemoTradeRejected(
+            f'El stop estimado excede la pérdida máxima demo de USD {max_loss_usd:.2f}.'
         )
 
     request = {

@@ -96,10 +96,10 @@ El ejecutor de prueba no forma parte del servidor web y nunca admite cuentas rea
 
 ```powershell
 python tools\run_demo_trade_test.py --symbol EURUSD
-python tools\run_demo_trade_test.py --symbol EURUSD --execute-demo-order
+python tools\run_demo_trade_test.py --symbol XAUUSD --target-profit-usd 1 --max-loss-usd 5.12 --execute-demo-order
 ```
 
-Solo usa EURUSD/XAUUSD, exige una señal confirmada con datos M1 recientes, cuenta demo USD y permisos MT5 activos. Busca un objetivo bruto estimado de USD 1, con pérdida estimada al stop de hasta USD 1 y volumen máximo de 0.10 lotes; spread, comisiones, deslizamiento y gaps pueden cambiar el resultado real. La prueba no promete alcanzar el TP ni el resultado neto. Una señal ESPERA, datos desfasados, otra posición u orden pendiente hacen que el ejecutor se abstenga.
+Solo usa EURUSD/XAUUSD, exige una señal confirmada con datos M1 recientes, cuenta demo USD y permisos MT5 activos. Por defecto limita tanto el objetivo bruto como la pérdida estimada al stop a USD 1; los topes pueden cambiarse explícitamente para una prueba demo. La prueba busca el TP más cercano compatible con el beneficio bruto solicitado y la resolución de precio del símbolo; el lote mínimo puede hacer que el resultado estimado supere el objetivo. Spread, comisiones, deslizamiento y gaps pueden cambiar el resultado real. Una señal ESPERA, datos desfasados, otra posición u orden pendiente hacen que el ejecutor se abstenga.
 
 Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
 

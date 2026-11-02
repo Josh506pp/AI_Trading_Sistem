@@ -42,6 +42,7 @@ class FakeMT5:
             trade_exemode=self.SYMBOL_TRADE_EXECUTION_MARKET,
             trade_stops_level=0,
             point=0.00001,
+            trade_tick_size=0.00001,
             digits=5,
             volume_min=0.01,
             volume_step=0.01,
@@ -113,12 +114,20 @@ class TestDemoTrading(unittest.TestCase):
     def setUp(self):
         self.mt5 = FakeMT5()
 
-    def prepare(self, signal=None, latest_bar_time=1000):
+    def prepare(
+        self,
+        signal=None,
+        latest_bar_time=1000,
+        target_profit_usd=1.0,
+        max_loss_usd=1.0
+    ):
         return prepare_demo_order(
             self.mt5,
             'EURUSD',
             signal or valid_buy_signal(),
-            latest_bar_time
+            latest_bar_time,
+            target_profit_usd=target_profit_usd,
+            max_loss_usd=max_loss_usd
         )
 
     def test_prepares_usd_bounded_bracketed_demo_order(self):
@@ -126,10 +135,26 @@ class TestDemoTrading(unittest.TestCase):
 
         self.assertEqual(plan.request['volume'], 0.01)
         self.assertEqual(plan.request['sl'], 1.09960)
-        self.assertEqual(plan.request['tp'], 1.10120)
-        self.assertGreaterEqual(plan.estimated_target_usd, DEMO_TARGET_PROFIT_USD)
+        self.assertEqual(plan.request['tp'], 1.10110)
+        self.assertAlmostEqual(plan.estimated_target_usd, DEMO_TARGET_PROFIT_USD)
         self.assertLessEqual(plan.estimated_stop_loss_usd, DEMO_MAX_LOSS_USD)
         self.assertEqual(len(self.mt5.checked_requests), 1)
+        self.assertEqual(self.mt5.sent_requests, [])
+
+    def test_tp_moves_toward_entry_to_target_one_gross_dollar(self):
+        plan = self.prepare(target_profit_usd=1.0, max_loss_usd=5.12)
+
+        self.assertEqual(plan.request['tp'], 1.10110)
+        self.assertAlmostEqual(plan.estimated_target_usd, 1.0)
+        self.assertLessEqual(plan.estimated_stop_loss_usd, 5.12)
+
+    def test_rejects_stop_loss_above_custom_demo_cap(self):
+        signal = valid_buy_signal()
+        signal['stop_loss'] = 1.09480
+        signal['take_profit'] = 1.11000
+
+        with self.assertRaisesRegex(DemoTradeRejected, 'USD 5.12'):
+            self.prepare(signal, max_loss_usd=5.12)
         self.assertEqual(self.mt5.sent_requests, [])
 
     def test_rejects_live_account_before_order_check(self):

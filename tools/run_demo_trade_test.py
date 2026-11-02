@@ -24,6 +24,18 @@ def main():
         action='store_true',
         help='Send one checked order on a verified demo account; otherwise preview only.'
     )
+    parser.add_argument(
+        '--target-profit-usd',
+        type=float,
+        default=1.0,
+        help='Gross broker-estimated TP objective in USD (default: 1.00).'
+    )
+    parser.add_argument(
+        '--max-loss-usd',
+        type=float,
+        default=1.0,
+        help='Maximum broker-estimated stop loss in USD (default: 1.00).'
+    )
     args = parser.parse_args()
 
     if not mt5.initialize():
@@ -60,7 +72,12 @@ def main():
 
         try:
             plan = prepare_demo_order(
-                mt5, args.symbol, signal, latest_bar_time
+                mt5,
+                args.symbol,
+                signal,
+                latest_bar_time,
+                target_profit_usd=args.target_profit_usd,
+                max_loss_usd=args.max_loss_usd
             )
         except DemoTradeRejected as exc:
             print(f'No se envió ninguna orden: {exc}')
@@ -68,8 +85,9 @@ def main():
 
         print(
             f"Plan validado: volumen={plan.volume}, "
-            f"objetivo bruto estimado=${plan.estimated_target_usd:.2f}, "
-            f"pérdida estimada al SL=${plan.estimated_stop_loss_usd:.2f}."
+            f"TP bruto estimado=${plan.estimated_target_usd:.2f}, "
+            f"pérdida estimada al SL=${plan.estimated_stop_loss_usd:.2f}, "
+            f"TP={plan.request['tp']}."
         )
         if not args.execute_demo_order:
             print('Vista previa solamente. Usa --execute-demo-order para una orden demo.')
