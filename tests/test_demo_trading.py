@@ -167,7 +167,7 @@ class TestDemoTrading(unittest.TestCase):
                 'model_agreement': 0.75,
                 'walk_forward_accuracy': 0.40,
                 'walk_forward_samples': 12,
-                'methods': {'ema': 97.0, 'linear': 98.0, 'momentum': 99.0, 'volatility': 101.0}
+                'methods': {'ema': 103.0, 'linear': 104.0, 'momentum': 102.0, 'volatility': 99.0}
             }
         }
         with patch(
@@ -182,8 +182,32 @@ class TestDemoTrading(unittest.TestCase):
         self.assertTrue(signal['trade_allowed'])
         self.assertTrue(signal['experimental_demo_only'])
         self.assertEqual(signal['confidence_basis'], 'unvalidated_raw_model_direction')
-        self.assertIn('contradice', signal['experimental_conflicts'][0])
         self.assertEqual(signal['risk_reward'], 0.5)
+
+    def test_raw_direction_experiment_rejects_conflict_with_component_votes(self):
+        waiting_signal = {
+            'signal': 'ESPERA',
+            'trade_allowed': False,
+            'prediction': {
+                'price_change': 3.0,
+                'current_price': 100.0,
+                'predicted_price': 103.0,
+                'model_agreement': 0.75,
+                'walk_forward_accuracy': 0.40,
+                'walk_forward_samples': 12,
+                'methods': {'ema': 97.0, 'linear': 98.0, 'momentum': 99.0, 'volatility': 101.0}
+            }
+        }
+        with patch(
+            'src.trading_signals.build_prediction_signal',
+            return_value=waiting_signal
+        ):
+            signal = build_experimental_demo_signal(
+                [100.0] * 60, engine=RawDirectionEngine()
+            )
+
+        self.assertEqual(signal['signal'], 'ESPERA')
+        self.assertFalse(signal.get('experimental_demo_only', False))
 
     def test_raw_direction_experiment_rejects_low_model_agreement(self):
         waiting_signal = {

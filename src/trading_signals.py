@@ -123,6 +123,27 @@ def build_experimental_demo_signal(prices, periods=15, engine=None):
     ):
         return signal
 
+    methods = prediction.get('methods') or {}
+    method_prices = []
+    for value in methods.values():
+        try:
+            method_price = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(method_price):
+            method_prices.append(method_price)
+    if len(method_prices) < 4:
+        return signal
+    up_votes = sum(value > current_price for value in method_prices)
+    down_votes = sum(value < current_price for value in method_prices)
+    dominant_direction = (
+        'ALCISTA' if up_votes > down_votes else
+        'BAJISTA' if down_votes > up_votes else
+        None
+    )
+    if dominant_direction != direction:
+        return signal
+
     levels = engine.get_trading_levels(prices, direction, predicted_price)
     if (
         levels.get('direction') != direction or
@@ -135,27 +156,6 @@ def build_experimental_demo_signal(prices, periods=15, engine=None):
     experimental_prediction = dict(prediction)
     experimental_prediction['direction'] = direction
     experimental['prediction'] = experimental_prediction
-    methods = prediction.get('methods') or {}
-    method_prices = []
-    for value in methods.values():
-        try:
-            method_price = float(value)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(method_price):
-            method_prices.append(method_price)
-    up_votes = sum(value > current_price for value in method_prices)
-    down_votes = sum(value < current_price for value in method_prices)
-    dominant_direction = (
-        'ALCISTA' if up_votes > down_votes else
-        'BAJISTA' if down_votes > up_votes else
-        None
-    )
-    conflicts = (
-        [f'La dirección ponderada {direction} contradice los votos componentes {dominant_direction}.']
-        if dominant_direction and dominant_direction != direction else
-        []
-    )
     experimental['signal'] = 'COMPRA' if direction == 'ALCISTA' else 'VENTA'
     experimental['trade_allowed'] = True
     experimental['experimental_demo_only'] = True
@@ -167,12 +167,11 @@ def build_experimental_demo_signal(prices, periods=15, engine=None):
     experimental['levels'] = levels
     experimental['risk_reward'] = levels['risk_reward']
     experimental['confidence_basis'] = 'unvalidated_raw_model_direction'
-    experimental['experimental_conflicts'] = conflicts
+    experimental['experimental_conflicts'] = []
     experimental_range = dict(experimental.get('prediction_range') or {})
     experimental_range['direction'] = direction
     experimental['prediction_range'] = experimental_range
     experimental['reasons'] = [
-        'Prueba demo experimental: dirección cruda, sin validación del filtro habitual.',
-        *conflicts
+        'Prueba demo experimental: dirección cruda, sin validación del filtro habitual.'
     ]
     return experimental
