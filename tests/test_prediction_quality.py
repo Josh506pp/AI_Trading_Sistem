@@ -1,5 +1,6 @@
 import math
 import importlib
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -8,6 +9,7 @@ from src.app import app, calculate_bollinger_bands, calculate_macd, calculate_rs
 from src.prediction_system import (
     BASE_MODEL_WEIGHTS,
     DEFAULT_STOP_ATR_MULTIPLE,
+    DEFAULT_WALK_FORWARD_WINDOWS,
     PredictionEngine,
 )
 
@@ -26,7 +28,8 @@ class TestPredictionQuality(unittest.TestCase):
             calculate_rsi(prices),
             calculate_macd(prices)['histogram'],
             bands['upper'],
-            bands['lower']
+            bands['lower'],
+            periods=15
         )
 
         self.assertTrue(signal['trade_allowed'])
@@ -65,6 +68,20 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(standard['stop_atr_multiple'], 2.25)
         self.assertEqual(wider['stop_atr_multiple'], 3.0)
 
+    def test_risk_reward_uses_the_actual_atr_stop_distance(self):
+        prices = [100.0 + index * 0.1 for index in range(60)]
+        target = prices[-1] + 10.0
+        levels = self.engine.get_trading_levels(
+            prices, 'ALCISTA', target, stop_atr_multiple=2.25
+        )
+        actual_stop_distance = levels['entry'] - levels['stop_loss']
+
+        self.assertAlmostEqual(
+            levels['risk_reward'],
+            abs(levels['take_profit'] - levels['entry']) / actual_stop_distance,
+            places=2
+        )
+
     def test_forecast_below_two_to_one_is_rejected(self):
         prices = [100 + index * 0.08 + math.sin(index * 0.7) * 0.4 for index in range(120)]
         current = prices[-1]
@@ -85,7 +102,8 @@ class TestPredictionQuality(unittest.TestCase):
                 calculate_rsi(prices),
                 calculate_macd(prices)['histogram'],
                 bands['upper'],
-                bands['lower']
+                bands['lower'],
+                periods=15
             )
 
         self.assertFalse(signal['trade_allowed'])
@@ -100,7 +118,8 @@ class TestPredictionQuality(unittest.TestCase):
             calculate_rsi(prices),
             calculate_macd(prices)['histogram'],
             bands['upper'],
-            bands['lower']
+            bands['lower'],
+            periods=15
         )
 
         self.assertTrue(signal['trade_allowed'])
@@ -113,6 +132,14 @@ class TestPredictionQuality(unittest.TestCase):
         prices = [100.0 + index * 0.1 for index in range(60)]
 
         self.assertGreater(calculate_macd(prices)['histogram'], 0)
+
+    def test_ema_forecast_projects_the_smoothed_ema_slope(self):
+        prediction = self.engine._ema_prediction(
+            [10.0, 10.0, 10.0, 10.0, 20.0],
+            periods=4
+        )
+
+        self.assertAlmostEqual(prediction['price'], 21.6666666667)
 
     def test_prediction_includes_out_of_sample_directional_accuracy_and_range(self):
         prices = [100 + index * 0.08 + math.sin(index * 0.7) * 0.4 for index in range(120)]
@@ -160,6 +187,12 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(sparse, BASE_MODEL_WEIGHTS)
         self.assertAlmostEqual(sum(learned.values()), 1.0)
 
+    def test_oos_calibrated_base_weights_keep_linear_as_largest_component(self):
+        self.assertEqual(
+            BASE_MODEL_WEIGHTS,
+            {'ema': 0.20, 'linear': 0.40, 'momentum': 0.20, 'volatility': 0.20}
+        )
+
     def test_low_walk_forward_accuracy_suppresses_directional_predictions(self):
         prices = [100.0 + index * 0.1 + math.sin(index) * 0.01 for index in range(120)]
         with patch.object(self.engine, '_walk_forward_accuracy', return_value=(0.54, 12)):
@@ -168,6 +201,60 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(prediction['direction'], 'NEUTRAL')
         self.assertEqual(prediction['confidence'], 0.0)
         self.assertEqual(prediction['walk_forward_accuracy'], 0.54)
+
+    def test_walk_forward_targets_exact_forecast_horizon_without_one_bar_leak(self):
+        prices = [100.0 + (index % 2) for index in range(50)]
+
+        def forecast_up(history, _periods):
+            return {'price': history[-1] + float(_periods)}
+
+        with patch.object(self.engine, '_ema_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_linear_regression_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_momentum_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_volatility_adjusted_prediction', side_effect=forecast_up):
+            accuracy, samples = self.engine._walk_forward_accuracy(
+                prices, periods=1, max_windows=20
+            )
+
+        self.assertEqual(samples, 20)
+        self.assertEqual(accuracy, 0.5)
+
+    def test_walk_forward_accuracy_excludes_model_vote_conflicts(self):
+        prices = [100.0 + (index % 2) for index in range(50)]
+
+        def forecast_up(history, _periods):
+            return {'price': history[-1] + 1.0}
+
+        def forecast_far_down(history, _periods):
+            return {'price': history[-1] - 20.0}
+
+        with patch.object(self.engine, '_ema_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_linear_regression_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_momentum_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_volatility_adjusted_prediction', side_effect=forecast_far_down):
+            accuracy, samples = self.engine._walk_forward_accuracy(
+                prices, periods=1, max_windows=20
+            )
+
+        self.assertIsNone(accuracy)
+        self.assertEqual(samples, 0)
+
+    def test_walk_forward_uses_longer_rolling_sample_for_market_learning(self):
+        windows = inspect.signature(
+            self.engine._walk_forward_accuracy
+        ).parameters['max_windows'].default
+
+        self.assertEqual(windows, DEFAULT_WALK_FORWARD_WINDOWS)
+        self.assertGreater(windows, 40)
+
+    def test_prediction_suppresses_direction_when_walk_forward_sample_is_insufficient(self):
+        prices = [100 + index * 0.08 + math.sin(index * 0.7) * 0.4 for index in range(120)]
+        with patch.object(self.engine, '_walk_forward_accuracy', return_value=(None, 0)):
+            prediction = self.engine.predict_next_price(prices)
+
+        self.assertEqual(prediction['direction'], 'NEUTRAL')
+        self.assertEqual(prediction['confidence'], 0.0)
+        self.assertIsNone(prediction['effective_walk_forward_accuracy'])
 
     def test_prediction_calculation_is_cached_per_symbol_during_cooldown(self):
         app_module._prediction_cache.clear()
@@ -208,7 +295,7 @@ class TestPredictionQuality(unittest.TestCase):
                     self.assertEqual(client.get(endpoint).status_code, 403, endpoint)
 
 
-    def test_build_prediction_signal_uses_fifteen_minute_forecast_horizon(self):
+    def test_build_prediction_signal_uses_requested_forecast_horizon(self):
         app_module.invalidate_prediction_cache('HORIZON_TEST')
         prices = [100.0 + index * 0.1 + math.sin(index) * 0.01 for index in range(60)]
         with patch.object(
@@ -268,7 +355,7 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(first.get_json()['prediction_cache']['status'], 'calculated')
         self.assertEqual(second.get_json()['prediction_cache']['status'], 'calculated')
         self.assertEqual(third.get_json()['prediction_cache']['status'], 'cached')
-        self.assertEqual(first.get_json()['prediction']['periods'], 15)
+        self.assertEqual(first.get_json()['prediction']['periods'], 10)
         self.assertEqual(third.get_json()['prediction_cache']['cooldown_seconds'], 120)
         app_module.invalidate_prediction_cache(symbol)
 
@@ -282,7 +369,7 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertIn('function showChartTooltip(event)', DASHBOARD_HTML)
         self.assertIn('id="liquidity-bias"', DASHBOARD_HTML)
         self.assertIn('PREDICTION_COOLDOWN_MS = 15000', DASHBOARD_HTML)
-        self.assertIn('PREDICTION_HORIZON_MINUTES = 15', DASHBOARD_HTML)
+        self.assertIn('PREDICTION_HORIZON_MINUTES = 10', DASHBOARD_HTML)
         self.assertIn('function startAdvancedCooldown(seconds)', DASHBOARD_HTML)
         self.assertIn('id="predictions-plan-locked"', DASHBOARD_HTML)
         self.assertIn('id="chat-plan-locked"', DASHBOARD_HTML)

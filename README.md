@@ -25,10 +25,11 @@ Asistente de Trading Inteligente es una aplicación Flask de análisis de mercad
 ### Sistema de IA
 - Análisis de señales usando múltiples indicadores
 - Predicciones combinadas con puntuación de confianza
+- Horizonte predictivo por defecto de 10 minutos (dentro del límite de 15 minutos)
 - Detección de patrones en movimientos
 - Asistente de IA conversacional
 - Alertas inteligentes por volatilidad
-- Pesos adaptativos por modelo, calculados con validación walk-forward expansiva sobre precios históricos
+- Pesos adaptativos por modelo, calculados con hasta 240 ventanas walk-forward; el prior da 40% a regresión lineal y 20% a cada otro modelo. Las etiquetas usan exactamente el horizonte solicitado y la precisión solo cuenta señales alineadas
 - La confianza representa acuerdo de modelos, no probabilidad de ganar; no se ingieren operaciones privadas de traders profesionales
 
 ### Sistema de Suscripciones
@@ -221,7 +222,7 @@ proyectos/
 **Filtro de operaciones**
 - Requiere consenso entre modelos e indicadores técnicos alineados
 - Solo muestra operaciones con riesgo/beneficio estimado de al menos 2:1
-- Limita el horizonte de predicción a 15 velas de un minuto (máximo 15 minutos)
+- Usa horizonte de 10 velas de un minuto; el máximo soportado por endpoint es 15 minutos
 - Aplica cooldown del análisis avanzado de 5 minutos en PRO y 2 minutos en PREMIUM; los endpoints básicos usan su caché breve
 - Solo permite una dirección si el backtest reciente tiene al menos 55% de aciertos con 8 o más muestras
 - El consenso del modelo y el backtest son referencias históricas, no probabilidades ni garantías de resultados

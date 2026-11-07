@@ -4,16 +4,17 @@ Utiliza series temporales, análisis técnico y machine learning para predecir m
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
-import json
+from typing import Dict, List
 import math
 
 MIN_WALK_FORWARD_ACCURACY = 0.55
+MIN_WALK_FORWARD_SAMPLES = 8
+DEFAULT_WALK_FORWARD_WINDOWS = 240
 DEFAULT_STOP_ATR_MULTIPLE = 2.25
 BASE_MODEL_WEIGHTS = {
-    'ema': 0.30,
-    'linear': 0.25,
-    'momentum': 0.25,
+    'ema': 0.20,
+    'linear': 0.40,
+    'momentum': 0.20,
     'volatility': 0.20
 }
 MIN_MODEL_LEARNING_SAMPLES = 8
@@ -93,7 +94,7 @@ class PredictionEngine:
         self.adaptive_walk_forward_accuracy = None
         self.adaptive_walk_forward_samples = 0
         walk_forward_accuracy, walk_forward_samples = self._walk_forward_accuracy(
-            clean_prices, periods
+            clean_prices, periods, DEFAULT_WALK_FORWARD_WINDOWS
         )
         self.model_weights = self._adaptive_model_weights(
             self.model_performance
@@ -122,8 +123,8 @@ class PredictionEngine:
             (down_votes >= 3 and price_change < 0)
         )
         backtest_rejects_signal = (
-            walk_forward_samples >= 8 and
-            effective_walk_forward_accuracy is not None and
+            walk_forward_samples < MIN_WALK_FORWARD_SAMPLES or
+            effective_walk_forward_accuracy is None or
             effective_walk_forward_accuracy < MIN_WALK_FORWARD_ACCURACY
         )
         if (
@@ -181,7 +182,7 @@ class PredictionEngine:
                 for name, metrics in self.model_performance.items()
             },
             'model_weights': {
-                name: round(weight, 6)
+                name: round(weight, 8)
                 for name, weight in self.model_weights.items()
             },
             'confidence_basis': 'model_agreement_not_probability',
@@ -210,7 +211,12 @@ class PredictionEngine:
         total = sum(weighted.values())
         return {name: weight / total for name, weight in weighted.items()}
 
-    def _walk_forward_accuracy(self, prices: List[float], periods: int, max_windows: int = 40):
+    def _walk_forward_accuracy(
+        self,
+        prices: List[float],
+        periods: int,
+        max_windows: int = DEFAULT_WALK_FORWARD_WINDOWS
+    ):
         model_correct = {name: 0 for name in BASE_MODEL_WEIGHTS}
         model_samples = {name: 0 for name in BASE_MODEL_WEIGHTS}
         self.model_performance = {
@@ -223,12 +229,12 @@ class PredictionEngine:
         if len(prices) < 40:
             return None, 0
 
-        start = max(30, len(prices) - max_windows - periods)
+        start = max(30, len(prices) - max_windows - periods + 1)
         correct = 0
         samples = 0
         adaptive_correct = 0
         adaptive_samples = 0
-        for index in range(start, len(prices) - periods):
+        for index in range(start, len(prices) - periods + 1):
             history = prices[:index]
             forecasts = {
                 'ema': self._ema_prediction(history, periods)['price'],
@@ -243,12 +249,20 @@ class PredictionEngine:
                 for name in BASE_MODEL_WEIGHTS
             )
             minimum_move = max(atr * 0.25, current * 0.0001)
-            if abs(base_forecast - current) < minimum_move:
-                continue
-            actual_change = prices[index + periods] - current
-            samples += 1
-            if (base_forecast - current) * actual_change > 0:
-                correct += 1
+            up_votes = sum(forecast > current for forecast in forecasts.values())
+            down_votes = sum(forecast < current for forecast in forecasts.values())
+            base_signal_valid = (
+                abs(base_forecast - current) >= minimum_move and
+                (
+                    (up_votes >= 3 and base_forecast > current) or
+                    (down_votes >= 3 and base_forecast < current)
+                )
+            )
+            actual_change = prices[index + periods - 1] - current
+            if base_signal_valid:
+                samples += 1
+                if (base_forecast - current) * actual_change > 0:
+                    correct += 1
             adaptive_weights = self._adaptive_model_weights({
                 name: {
                     'correct': model_correct[name],
@@ -260,9 +274,17 @@ class PredictionEngine:
                 forecasts[name] * adaptive_weights[name]
                 for name in BASE_MODEL_WEIGHTS
             )
-            adaptive_samples += 1
-            if (adaptive_forecast - current) * actual_change > 0:
-                adaptive_correct += 1
+            adaptive_signal_valid = (
+                abs(adaptive_forecast - current) >= minimum_move and
+                (
+                    (up_votes >= 3 and adaptive_forecast > current) or
+                    (down_votes >= 3 and adaptive_forecast < current)
+                )
+            )
+            if adaptive_signal_valid:
+                adaptive_samples += 1
+                if (adaptive_forecast - current) * actual_change > 0:
+                    adaptive_correct += 1
             for name, forecast in forecasts.items():
                 if abs(forecast - current) < minimum_move:
                     continue
@@ -293,17 +315,21 @@ class PredictionEngine:
         """Predicción usando Media Móvil Exponencial"""
         if len(prices) < 2:
             return {'price': prices[-1] if prices else 0}
-        
+
         period = min(12, len(prices))
         alpha = 2 / (period + 1)
         ema = float(prices[0])
+        ema_values = [ema]
         for price in prices[1:]:
             ema = alpha * price + (1 - alpha) * ema
-        
-        slope_window = min(6, len(prices))
-        trend_per_period = (prices[-1] - prices[-slope_window]) / (slope_window - 1)
+            ema_values.append(ema)
+
+        slope_window = min(6, len(ema_values))
+        trend_per_period = (
+            (ema_values[-1] - ema_values[-slope_window]) / (slope_window - 1)
+        )
         predicted = prices[-1] + trend_per_period * periods * 0.5
-        
+
         return {'price': predicted}
     
     def _linear_regression_prediction(self, prices: List[float], periods: int) -> Dict:
@@ -413,7 +439,7 @@ class PredictionEngine:
             target_is_valid = forecast_target > entry if is_long else forecast_target < entry
             if target_is_valid:
                 take_profit = forecast_target
-                risk_reward = float(abs(take_profit - entry) / atr)
+                risk_reward = float(abs(take_profit - entry) / stop_distance)
             else:
                 stop_loss = None
                 normalized_direction = 'NEUTRAL'
@@ -499,7 +525,7 @@ class PredictionEngine:
                 prediction.get('walk_forward_accuracy')
             )
             if (
-                prediction.get('walk_forward_samples', 0) >= 8 and
+                prediction.get('walk_forward_samples', 0) >= MIN_WALK_FORWARD_SAMPLES and
                 validation_accuracy is not None
             ):
                 if validation_accuracy < MIN_WALK_FORWARD_ACCURACY:

@@ -5,9 +5,12 @@ import time
 from dataclasses import dataclass
 
 try:
-    from .prediction_system import MIN_WALK_FORWARD_ACCURACY
+    from .prediction_system import (
+        MIN_WALK_FORWARD_ACCURACY,
+        MIN_WALK_FORWARD_SAMPLES,
+    )
 except ImportError:
-    from prediction_system import MIN_WALK_FORWARD_ACCURACY
+    from prediction_system import MIN_WALK_FORWARD_ACCURACY, MIN_WALK_FORWARD_SAMPLES
 
 
 DEMO_TARGET_PROFIT_USD = 1.0
@@ -168,11 +171,13 @@ def prepare_demo_order(
     samples = prediction.get('walk_forward_samples', 0)
     if (
         accuracy is None or not math.isfinite(float(accuracy)) or
-        float(accuracy) < MIN_WALK_FORWARD_ACCURACY or int(samples) < 8
+        float(accuracy) < MIN_WALK_FORWARD_ACCURACY or
+        int(samples) < MIN_WALK_FORWARD_SAMPLES
     ):
         raise DemoTradeRejected(
             f'La validación walk-forward no alcanza el '
-            f'{MIN_WALK_FORWARD_ACCURACY:.0%} con 8 muestras.'
+            f'{MIN_WALK_FORWARD_ACCURACY:.0%} con '
+            f'{MIN_WALK_FORWARD_SAMPLES} muestras.'
         )
     if experimental_raw and float(signal.get('model_agreement', 0)) < 0.75:
         raise DemoTradeRejected('La dirección experimental no alcanza el 75% de consenso.')

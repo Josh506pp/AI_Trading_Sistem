@@ -6,6 +6,7 @@ try:
     from .prediction_system import (
         DEFAULT_STOP_ATR_MULTIPLE,
         MIN_WALK_FORWARD_ACCURACY,
+        MIN_WALK_FORWARD_SAMPLES,
     )
     from .technical_indicators import (
         calculate_bollinger_bands,
@@ -13,7 +14,11 @@ try:
         calculate_rsi,
     )
 except ImportError:
-    from prediction_system import DEFAULT_STOP_ATR_MULTIPLE, MIN_WALK_FORWARD_ACCURACY
+    from prediction_system import (
+        DEFAULT_STOP_ATR_MULTIPLE,
+        MIN_WALK_FORWARD_ACCURACY,
+        MIN_WALK_FORWARD_SAMPLES,
+    )
     from technical_indicators import (
         calculate_bollinger_bands,
         calculate_macd,
@@ -128,7 +133,7 @@ def build_experimental_demo_signal(
         current_price <= 0 or atr <= 0 or
         walk_forward_accuracy < MIN_WALK_FORWARD_ACCURACY or
         model_agreement < 0.75 or
-        walk_forward_samples < 8 or
+        walk_forward_samples < MIN_WALK_FORWARD_SAMPLES or
         abs(price_change) < minimum_move
     ):
         return signal

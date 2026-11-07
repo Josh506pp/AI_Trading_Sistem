@@ -341,7 +341,7 @@ def _run_demo_chat_trade_job(job_id, user_id, symbol):
             raise DemoTradeRejected(f'MT5 no entregó suficientes velas M1 para {symbol}.')
         prices = [float(rate['close']) for rate in rates]
         signal = build_experimental_demo_signal(
-            prices, periods=15, engine=prediction_engine
+            prices, periods=PREDICTION_HORIZON_MINUTES, engine=prediction_engine
         )
         plan = prepare_demo_order(
             mt5,
@@ -844,7 +844,7 @@ def analyze_signal(prices, symbol=None):
 PREDICTION_COOLDOWN_SECONDS = 15
 FREE_ANALYSIS_COOLDOWN_SECONDS = 900
 PAID_ANALYSIS_COOLDOWN_SECONDS = 300
-PREDICTION_HORIZON_MINUTES = 15
+PREDICTION_HORIZON_MINUTES = 10
 PREMIUM_ANALYSIS_COOLDOWN_SECONDS = 300
 ADVANCED_PREDICTION_COOLDOWN_SECONDS = {'PRO': 300, 'PREMIUM': 120}
 _prediction_cache = {}
@@ -1996,7 +1996,7 @@ def api_news_alerts():
 @login_required
 @check_subscription('PRO')
 def api_advanced_prediction():
-    """Predicción avanzada 15m con cooldown por plan."""
+    """Predicción avanzada a 10 minutos con cooldown por plan."""
     with PRICE_LOCK:
         prices = list(TRADING_DATA['price_history'])
         symbol = TRADING_DATA.get('symbol', DEFAULT_SYMBOL)
@@ -3018,7 +3018,7 @@ DASHBOARD_HTML = """
                 <button class="btn btn-purple" onclick="openPlansModal()" style="margin-left:8px;">Ver planes</button>
             </div>
             <div id="predictions-content">
-            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción (máx. 15 min):</strong> <span id="pred-direction">-</span></div>
+            <div style="margin: 12px 0;"><strong style="color: var(--gold);">Predicción (10 min):</strong> <span id="pred-direction">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Precio Previsto:</strong> <span id="pred-price">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Consenso de modelos:</strong> <span id="pred-confidence">-</span></div>
             <div style="margin: 12px 0;"><strong style="color: var(--gold);">Backtest direccional:</strong> <span id="pred-backtest">-</span> <small id="pred-cooldown" style="color:var(--text-dim);"></small></div>
@@ -3237,7 +3237,7 @@ DASHBOARD_HTML = """
         const PREDICTION_COOLDOWN_MS = 15000;
         const BASIC_ANALYSIS_COOLDOWN_MS = 300000;
         const FREE_ANALYSIS_COOLDOWN_MS = 900000;
-        const PREDICTION_HORIZON_MINUTES = 15;
+        const PREDICTION_HORIZON_MINUTES = 10;
         let lastPredictionRequestAt = 0;
         let predictionRequestInFlight = false;
         let lastAIRequestAt = 0;
