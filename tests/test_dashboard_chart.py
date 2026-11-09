@@ -17,6 +17,54 @@ class TestDashboardChart(unittest.TestCase):
         self.assertTrue(payload['prices'])
         self.assertTrue(payload['candles'])
         self.assertIn('c', payload['candles'][0])
+        self.assertIn('liquidity_map', payload)
+
+    def test_status_prefers_mt5_dom_and_falls_back_to_estimated_volume_profile(self):
+        candles = [
+            {
+                'time': 1730000000 + index * 60,
+                'open': 1.1000,
+                'high': 1.1020,
+                'low': 1.0990,
+                'close': 1.1010,
+                'volume': 100.0 + index
+            }
+            for index in range(12)
+        ]
+        with app_module.PRICE_LOCK:
+            previous = {
+                key: app_module.TRADING_DATA.get(key)
+                for key in ('symbol', 'price', 'price_history', 'market_candles', 'market_depth')
+            }
+            app_module.TRADING_DATA.update({
+                'symbol': 'EURUSD',
+                'price': 1.1010,
+                'price_history': [1.1000, 1.1010],
+                'market_candles': candles,
+                'market_depth': {
+                    'available': True,
+                    'bids': [{'price': 1.1009, 'volume': 5.0}],
+                    'asks': [{'price': 1.1011, 'volume': 4.0}]
+                }
+            })
+
+        try:
+            client = app_module.app.test_client()
+            dom_map = client.get('/api/status').get_json()['liquidity_map']
+            self.assertEqual(dom_map['mode'], 'dom')
+            self.assertEqual(dom_map['source'], 'mt5_dom')
+            self.assertEqual(dom_map['bids'][0]['volume'], 5.0)
+
+            with app_module.PRICE_LOCK:
+                app_module.TRADING_DATA['market_depth'] = {'available': False}
+            profile_map = client.get('/api/status').get_json()['liquidity_map']
+            self.assertEqual(profile_map['mode'], 'volume_profile')
+            self.assertEqual(profile_map['source'], 'ohlcv_estimate')
+            self.assertTrue(profile_map['levels'])
+            self.assertIn('no representa órdenes en espera', profile_map['note'])
+        finally:
+            with app_module.PRICE_LOCK:
+                app_module.TRADING_DATA.update(previous)
 
     def test_status_uses_mt5_ohlc_candles_and_keeps_last_close_in_sync(self):
         candle_history = [
@@ -93,8 +141,11 @@ class TestDashboardChart(unittest.TestCase):
         self.assertIn("currentSymbol + ': ' + formatPrice(d.price, currentDecimals)", DASHBOARD_HTML)
         self.assertIn("d.chart_prices", DASHBOARD_HTML)
         self.assertIn("d.chart_candles", DASHBOARD_HTML)
-        self.assertIn('function drawCandlestickChart(candles)', DASHBOARD_HTML)
+        self.assertIn('function drawCandlestickChart(candles, liquidityMap)', DASHBOARD_HTML)
         self.assertIn('function normalizeCandleData(chartData)', DASHBOARD_HTML)
+        self.assertIn('function drawLiquidityMapPanel(', DASHBOARD_HTML)
+        self.assertIn('function updateLiquidityMapUI(liquidityMap)', DASHBOARD_HTML)
+        self.assertIn('id="liquidity-map-status"', DASHBOARD_HTML)
 
     def test_market_tick_updates_the_quote_and_chart_history(self):
         with app_module.PRICE_LOCK:
@@ -104,6 +155,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
             previous_source = app_module.TRADING_DATA.get('price_source')
             previous_ticks = app_module.TRADING_DATA['recent_ticks']
+            previous_depth = app_module.TRADING_DATA['market_depth']
             app_module.TRADING_DATA['symbol'] = 'USDJPY'
             app_module.TRADING_DATA['price'] = 149.123
             app_module.TRADING_DATA['price_history'] = [149.0, 149.123]
@@ -115,6 +167,12 @@ class TestDashboardChart(unittest.TestCase):
                         'timestamp': '2026-10-30T16:59:00-04:00',
                         'history': [149.0, 149.123],
                         'source': 'MetaTrader 5'
+                    }), \
+                    patch.object(app_module.market_data, 'get_market_depth', return_value={
+                        'available': True,
+                        'source': 'mt5_dom',
+                        'bids': [],
+                        'asks': []
                     }), \
                     patch.object(app_module.market_data, 'get_intraday_prices', return_value=[]):
                 updated = app_module.update_market_price_once()
@@ -132,6 +190,7 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
                 app_module.TRADING_DATA['price_source'] = previous_source
                 app_module.TRADING_DATA['recent_ticks'] = previous_ticks
+                app_module.TRADING_DATA['market_depth'] = previous_depth
 
     def test_market_tick_publishes_liquidity_for_the_active_symbol(self):
         candle = {
@@ -148,6 +207,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_history = app_module.TRADING_DATA['price_history']
             previous_candles = app_module.TRADING_DATA['market_candles']
             previous_liquidity = app_module.TRADING_DATA['liquidity']
+            previous_depth = app_module.TRADING_DATA['market_depth']
             previous_timestamp = app_module.TRADING_DATA.get('price_updated_at')
             previous_source = app_module.TRADING_DATA.get('price_source')
             previous_ticks = app_module.TRADING_DATA['recent_ticks']
@@ -159,17 +219,27 @@ class TestDashboardChart(unittest.TestCase):
                 'price': 149.8,
                 'timestamp': candle['time'],
                 'history': [149.0, 149.8],
-                'candles': [candle] * 12
+                'candles': [candle] * 12,
+                'source': 'MetaTrader 5'
             }
             with patch.object(app_module, 'MARKET_DATA_AVAILABLE', True), \
-                    patch.object(app_module.market_data, 'get_latest_quote', return_value=quote):
+                    patch.object(app_module.market_data, 'get_latest_quote', return_value=quote), \
+                    patch.object(app_module.market_data, 'get_market_depth', return_value={
+                        'available': True,
+                        'source': 'mt5_dom',
+                        'bids': [{'price': 149.7, 'volume': 3.0}],
+                        'asks': [{'price': 149.9, 'volume': 2.0}]
+                    }):
                 app_module.update_market_price_once()
 
             response = app_module.app.test_client().get('/api/status')
             liquidity = response.get_json()['liquidity']
+            depth = response.get_json()['liquidity_map']
             self.assertTrue(liquidity['available'])
             self.assertEqual(liquidity['window_candles'], 12)
             self.assertEqual(liquidity['flow_bias'], 'PRESIÓN COMPRADORA')
+            self.assertEqual(depth['mode'], 'dom')
+            self.assertEqual(depth['bids'][0]['price'], 149.7)
         finally:
             with app_module.PRICE_LOCK:
                 app_module.TRADING_DATA['symbol'] = previous_symbol
@@ -177,6 +247,7 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['price_history'] = previous_history
                 app_module.TRADING_DATA['market_candles'] = previous_candles
                 app_module.TRADING_DATA['liquidity'] = previous_liquidity
+                app_module.TRADING_DATA['market_depth'] = previous_depth
                 app_module.TRADING_DATA['price_updated_at'] = previous_timestamp
                 app_module.TRADING_DATA['price_source'] = previous_source
                 app_module.TRADING_DATA['recent_ticks'] = previous_ticks
@@ -191,6 +262,7 @@ class TestDashboardChart(unittest.TestCase):
             previous_source = app_module.TRADING_DATA.get('price_source')
             previous_candles = app_module.TRADING_DATA['market_candles']
             previous_liquidity = app_module.TRADING_DATA['liquidity']
+            previous_depth = app_module.TRADING_DATA['market_depth']
             app_module.TRADING_DATA['symbol'] = 'EURUSD'
             app_module.TRADING_DATA['recent_ticks'] = []
 
@@ -216,7 +288,13 @@ class TestDashboardChart(unittest.TestCase):
         ]
         try:
             with patch.object(app_module, 'MARKET_DATA_AVAILABLE', True), \
-                    patch.object(app_module.market_data, 'get_latest_quote', side_effect=quotes):
+                    patch.object(app_module.market_data, 'get_latest_quote', side_effect=quotes), \
+                    patch.object(app_module.market_data, 'get_market_depth', return_value={
+                        'available': True,
+                        'source': 'mt5_dom',
+                        'bids': [{'price': 1.1006, 'volume': 1.0}],
+                        'asks': []
+                    }):
                 app_module.update_market_price_once()
                 app_module.update_market_price_once()
 
@@ -235,6 +313,7 @@ class TestDashboardChart(unittest.TestCase):
                 app_module.TRADING_DATA['price_source'] = previous_source
                 app_module.TRADING_DATA['market_candles'] = previous_candles
                 app_module.TRADING_DATA['liquidity'] = previous_liquidity
+                app_module.TRADING_DATA['market_depth'] = previous_depth
 
     def test_changing_symbol_updates_the_chart_to_that_symbols_latest_quote(self):
         with app_module.PRICE_LOCK:

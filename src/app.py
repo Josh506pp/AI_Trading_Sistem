@@ -52,15 +52,20 @@ except ImportError:
         SYMBOLS_AVAILABLE = False
 
 try:
-    from .market_data import market_data, calculate_liquidity_metrics
+    from .market_data import (
+        market_data, calculate_liquidity_metrics, calculate_volume_profile
+    )
     MARKET_DATA_AVAILABLE = True
 except ImportError:
     try:
-        from market_data import market_data, calculate_liquidity_metrics
+        from market_data import (
+            market_data, calculate_liquidity_metrics, calculate_volume_profile
+        )
         MARKET_DATA_AVAILABLE = True
     except ImportError:
         market_data = None
         calculate_liquidity_metrics = None
+        calculate_volume_profile = None
         MARKET_DATA_AVAILABLE = False
 
 try:
@@ -245,6 +250,9 @@ TRADING_DATA = {
     'recent_ticks': [],
     'market_candles': [],
     'liquidity': {'available': False, 'flow_bias': 'SIN DATOS'},
+    'market_depth': {
+        'available': False, 'source': 'mt5_dom', 'bids': [], 'asks': []
+    },
     'balance': 10000.0,
     'equity': 10000.0,
     'trades_open': 0,
@@ -743,6 +751,9 @@ def reset_price_history(symbol):
         TRADING_DATA['recent_ticks'] = []
         TRADING_DATA['market_candles'] = []
         TRADING_DATA['liquidity'] = {'available': False, 'flow_bias': 'SIN DATOS'}
+        TRADING_DATA['market_depth'] = {
+            'available': False, 'source': 'mt5_dom', 'bids': [], 'asks': []
+        }
         invalidate_prediction_cache(symbol)
         return decimals, volatility, TRADING_DATA['price'], default_volume
 
@@ -1113,7 +1124,16 @@ def update_market_price_once():
     updated = False
     if MARKET_DATA_AVAILABLE and market_data:
         quote = market_data.get_latest_quote(symbol)
+        market_depth = {
+            'available': False, 'source': 'mt5_dom', 'bids': [], 'asks': []
+        }
+        if quote and quote.get('source') == 'MetaTrader 5':
+            get_market_depth = getattr(market_data, 'get_market_depth', None)
+            if callable(get_market_depth):
+                market_depth = get_market_depth(symbol)
         with PRICE_LOCK:
+            if symbol == TRADING_DATA.get('symbol'):
+                TRADING_DATA['market_depth'] = market_depth
             if symbol == TRADING_DATA.get('symbol') and quote:
                 try:
                     latest_price = float(quote['price'])
@@ -2484,12 +2504,42 @@ def api_status():
             'chart_timeframe': '1m' if chart_candles else None,
             'recent_tick_count': len(TRADING_DATA['recent_ticks']),
             'liquidity': copy.deepcopy(TRADING_DATA.get('liquidity', {'available': False})),
+            'market_depth': copy.deepcopy(
+                TRADING_DATA.get('market_depth', {'available': False})
+            ),
             'decimals': decimals,
             'signal': TRADING_DATA['signal'],
             'symbol': symbol,
             'prices': TRADING_DATA['price_history'][-30:],
             'chart_prices': chart_prices,
             'chart_candles': chart_candles
+        }
+
+    depth = status.pop('market_depth')
+    if depth.get('available'):
+        status['liquidity_map'] = {
+            'available': True,
+            'mode': 'dom',
+            'source': 'mt5_dom',
+            'label': 'Libro real MT5',
+            'bids': depth.get('bids', []),
+            'asks': depth.get('asks', []),
+            'note': depth.get('note', '')
+        }
+    else:
+        profile = (
+            calculate_volume_profile(chart_candles)
+            if calculate_volume_profile and chart_candles else
+            {'available': False, 'levels': [], 'note': 'No hay volumen OHLCV disponible.'}
+        )
+        status['liquidity_map'] = {
+            'available': bool(profile.get('available')),
+            'mode': 'volume_profile',
+            'source': 'ohlcv_estimate',
+            'label': 'Volumen por precio estimado',
+            'levels': profile.get('levels', []),
+            'max_volume': profile.get('max_volume', 0),
+            'note': profile.get('note', '')
         }
 
     status['candles'] = [
@@ -3521,6 +3571,7 @@ DASHBOARD_HTML = """
                 <div style="display: flex; gap: 10px; align-items: center;">
                         <span id="chart-current-quote" style="color:var(--gold); font:12px 'SF Mono',Consolas,monospace; white-space:nowrap;">XAUUSD: -</span>
                         <span id="chart-update-time" style="color:var(--text-dim); font-size:11px; white-space:nowrap;">Conectando fuente...</span>
+                        <span id="liquidity-map-status" style="color:var(--text-dim); font-size:11px; white-space:nowrap;">Mapa: esperando datos</span>
                         <label style="color:var(--gold); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Divisa:</label>
                     <select id="symbol-select" onchange="changeSymbol(this.value)" style="padding: 6px 12px; background:#0d0d0d; border:1px solid var(--gold); color:var(--text); border-radius:6px; font-family:'SF Mono',Consolas,monospace; font-size:12px;">
                         <option value="XAUUSD">XAUUSD (Oro)</option>
@@ -3851,7 +3902,8 @@ DASHBOARD_HTML = """
                         d.chart_candles : (Array.isArray(d.chart_prices) && d.chart_prices.length > 0 ?
                             d.chart_prices : (Array.isArray(d.candles) && d.candles.length > 0 ?
                                 d.candles : (Array.isArray(d.prices) ? d.prices : [])));
-                    drawChart(chartDataArr);
+                    drawChart(chartDataArr, d.liquidity_map || {});
+                    updateLiquidityMapUI(d.liquidity_map || {});
                     updateLiquidityUI(d.liquidity || {});
                     
                     // Actualizar otros elementos
@@ -3927,7 +3979,80 @@ DASHBOARD_HTML = """
                 }) : '';
         }
 
-        function drawCandlestickChart(candles) {
+        function drawLiquidityMapPanel(context, liquidityMap, left, right, top, bottom, yAt) {
+            const panelWidth = right - left;
+            if (panelWidth <= 0) return;
+            context.save();
+            context.beginPath();
+            context.rect(left, top, panelWidth, bottom - top);
+            context.clip();
+            context.strokeStyle = 'rgba(255,255,255,0.12)';
+            context.beginPath();
+            context.moveTo(left, top);
+            context.lineTo(left, bottom);
+            context.stroke();
+
+            const mode = liquidityMap && liquidityMap.mode;
+            const center = left + panelWidth / 2;
+            const halfWidth = Math.max(2, panelWidth / 2 - 3);
+            const levels = mode === 'dom' ?
+                [...(liquidityMap.bids || []), ...(liquidityMap.asks || [])] :
+                (liquidityMap.levels || []);
+            const maxVolume = Math.max(
+                Number(liquidityMap.max_volume) || 0,
+                ...levels.map(level => Number(level.volume) || 0),
+                0
+            );
+            if (!liquidityMap.available || maxVolume <= 0) {
+                context.fillStyle = '#777';
+                context.font = '9px monospace';
+                context.textAlign = 'center';
+                context.textBaseline = 'middle';
+                context.fillText('s/d', center, (top + bottom) / 2);
+                context.restore();
+                return;
+            }
+
+            if (mode === 'dom') {
+                for (const side of ['bids', 'asks']) {
+                    for (const level of liquidityMap[side] || []) {
+                        const y = yAt(Number(level.price));
+                        const volume = Number(level.volume) || 0;
+                        if (!Number.isFinite(y) || y < top || y > bottom || volume <= 0) continue;
+                        const width = Math.max(2, volume / maxVolume * halfWidth);
+                        context.fillStyle = side === 'bids' ?
+                            'rgba(38,166,154,0.78)' : 'rgba(239,83,80,0.78)';
+                        context.fillRect(
+                            side === 'bids' ? center - width : center,
+                            y - 2,
+                            width,
+                            4
+                        );
+                    }
+                }
+            } else {
+                for (const level of levels) {
+                    const low = Number(level.low);
+                    const high = Number(level.high);
+                    const volume = Number(level.volume) || 0;
+                    if (!Number.isFinite(low) || !Number.isFinite(high) || volume <= 0) continue;
+                    const yTop = Math.max(top, yAt(high));
+                    const yBottom = Math.min(bottom, yAt(low));
+                    if (yBottom < top || yTop > bottom || yBottom < yTop) continue;
+                    const intensity = Math.min(1, volume / maxVolume);
+                    context.fillStyle = 'rgba(212,175,55,' + (0.18 + intensity * 0.62) + ')';
+                    context.fillRect(
+                        right - Math.max(2, intensity * (panelWidth - 4)),
+                        yTop,
+                        Math.max(2, intensity * (panelWidth - 4)),
+                        Math.max(1, yBottom - yTop)
+                    );
+                }
+            }
+            context.restore();
+        }
+
+        function drawCandlestickChart(candles, liquidityMap) {
             const canvas = document.getElementById('chart');
             if (!canvas || !canvas.parentElement) return;
             if (chart && typeof chart.destroy === 'function') {
@@ -3961,7 +4086,8 @@ DASHBOARD_HTML = """
                 return;
             }
 
-            const padding = { top: 24, right: 78, bottom: 34, left: 16 };
+            const mapWidth = Math.max(54, Math.min(88, width * 0.2));
+            const padding = { top: 34, right: mapWidth + 72, bottom: 34, left: 16 };
             const plotWidth = width - padding.left - padding.right;
             const plotHeight = height - padding.top - padding.bottom;
             const low = Math.min(...candles.map(candle => candle.low));
@@ -3995,6 +4121,16 @@ DASHBOARD_HTML = """
                 context.fillStyle = '#A0A0A0';
                 context.fillText(formatPrice(value, currentDecimals), width - 8, y);
             }
+
+            drawLiquidityMapPanel(
+                context,
+                liquidityMap || {},
+                width - padding.right + 8,
+                width - 72,
+                padding.top,
+                height - padding.bottom,
+                yAt
+            );
 
             candles.forEach((candle, index) => {
                 const x = xAt(index);
@@ -4180,10 +4316,10 @@ DASHBOARD_HTML = """
             if (tooltip) tooltip.style.display = 'none';
         }
 
-        function drawChart(chartData) {
+        function drawChart(chartData, liquidityMap) {
             const candles = normalizeCandleData(chartData);
             if (candles.length) {
-                drawCandlestickChart(candles);
+                drawCandlestickChart(candles, liquidityMap);
                 return;
             }
             const dataPoints = normalizeChartData(chartData);
@@ -4782,6 +4918,22 @@ DASHBOARD_HTML = """
             document.getElementById('liquidity-total').textContent =
                 volumeFormat.format(liquidity.volume_total) + ' ' + liquidity.volume_unit;
             if (note && liquidity.flow_note) note.textContent = liquidity.flow_note;
+        }
+
+        function updateLiquidityMapUI(liquidityMap) {
+            const status = document.getElementById('liquidity-map-status');
+            if (!status) return;
+            if (!liquidityMap.available) {
+                status.textContent = 'Mapa: sin datos';
+                status.style.color = 'var(--text-dim)';
+            } else if (liquidityMap.mode === 'dom') {
+                status.textContent = 'Libro real MT5';
+                status.style.color = 'var(--green)';
+            } else {
+                status.textContent = 'Perfil estimado OHLCV';
+                status.style.color = 'var(--gold)';
+            }
+            status.title = liquidityMap.note || '';
         }
 
         function loadSymbols() {

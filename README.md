@@ -16,6 +16,7 @@ Asistente de Trading Inteligente es una aplicación Flask de análisis de mercad
 
 ### Análisis de Mercado Tiempo Real
 - Gráfico de precios en canvas nativo, sin dependencia de CDN
+- Mapa de liquidez dentro del gráfico: libro DOM real de MT5 cuando el bróker lo publica; perfil de volumen estimado desde OHLCV cuando no hay DOM, claramente etiquetado
 - Datos en vivo desde yfinance (12+ símbolos)
 - Análisis técnico: RSI, MACD, Bandas de Bollinger, Estocástico, ATR
 - Predicciones con consenso técnico y filtro mínimo de riesgo/beneficio 2:1
