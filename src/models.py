@@ -7,7 +7,6 @@ Users, subscriptions, trades, etc.
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
-import os
 
 db = SQLAlchemy()
 
@@ -66,7 +65,7 @@ class User(db.Model):
             return False
         return datetime.utcnow() < self.subscription_expires and self.subscription_status == 'active'
     
-    def upgrade_subscription(self, plan, stripe_sub_id=None):
+    def upgrade_subscription(self, plan):
         """Mejorar plan de suscripción"""
         # Precios y duraciones
         plan_config = {
@@ -79,7 +78,6 @@ class User(db.Model):
             return False
         
         self.subscription_plan = plan
-        self.stripe_subscription_id = stripe_sub_id
         
         config = plan_config[plan]
         if config['duration_days']:
@@ -237,70 +235,58 @@ class BillingHistory(db.Model):
         }
 
 
+class PaymentTransaction(db.Model):
+    """Local reference for a payment-provider subscription."""
+    __tablename__ = 'payment_transactions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    provider = db.Column(db.String(32), nullable=False)
+    provider_reference = db.Column(db.String(255), nullable=False, unique=True, index=True)
+    plan = db.Column(db.String(50), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    currency = db.Column(db.String(3), nullable=False, default='USD')
+    status = db.Column(db.String(32), nullable=False, default='pending', index=True)
+    last_payment_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = db.relationship('User')
+
+
+class PaymentWebhookEvent(db.Model):
+    """Persist webhook IDs to process provider retries idempotently."""
+    __tablename__ = 'payment_webhook_events'
+
+    id = db.Column(db.Integer, primary_key=True)
+    provider = db.Column(db.String(32), nullable=False)
+    event_id = db.Column(db.String(255), nullable=False)
+    event_type = db.Column(db.String(128), nullable=False)
+    received_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint('provider', 'event_id', name='uq_payment_webhook_provider_event'),
+    )
+
+
 def init_db(app):
-    """Inicializar base de datos y usuarios demo"""
+    """Initialize tables without shared demo accounts or passwords."""
     with app.app_context():
         db.create_all()
-        if User.query.count() == 0:
-            try:
-                admin = User(
-                    email='admin@example.com',
-                    username='admin',
-                    full_name='Administrador',
-                    subscription_plan='PREMIUM',
-                    subscription_status='active',
-                    subscription_expires=datetime.utcnow() + timedelta(days=365)
-                )
-                admin.set_password('RyzA_jjITjuPQtV66Wwf0A')
-                
-                trader = User(
-                    email='trader@example.com',
-                    username='trader',
-                    full_name='Trader Profesional',
-                    subscription_plan='PRO',
-                    subscription_status='active',
-                    subscription_expires=datetime.utcnow() + timedelta(days=30)
-                )
-                trader.set_password('SecurePass123')
-                
-                demo = User(
-                    email='demo@example.com',
-                    username='demo',
-                    full_name='Usuario Demo',
-                    subscription_plan='FREE',
-                    subscription_status='active'
-                )
-                demo.set_password('password123')
-                
-                db.session.add_all([admin, trader, demo])
-                db.session.commit()
-            except Exception as e:
-                db.session.rollback()
-                print(f"Error al crear usuarios iniciales: {e}")
-
-        if os.environ.get('FLASK_ENV', '').lower() != 'production':
-            now = datetime.utcnow()
-            demo_profiles = (
-                ('admin', 'admin@example.com', 'PREMIUM', 365),
-                ('trader', 'trader@example.com', 'PRO', 30),
-                ('demo', 'demo@example.com', 'FREE', None),
-            )
-            for username, email, plan, duration_days in demo_profiles:
-                user = User.query.filter_by(username=username, email=email).first()
-                if not user:
-                    continue
-                subscription_expired = (
-                    duration_days is not None and
-                    (not user.subscription_expires or user.subscription_expires <= now)
-                )
-                if (
-                    user.subscription_plan != plan or
-                    user.subscription_status != 'active' or
-                    subscription_expired
-                ):
-                    user.subscription_plan = plan
-                    user.subscription_status = 'active'
-                    user.subscription_expires = (
-                        now + timedelta(days=duration_days) if duration_days else None
-                    )
+        legacy_shared_accounts = (
+            ('admin', 'admin@example.com'),
+            ('trader', 'trader@example.com'),
+            ('demo', 'demo@example.com'),
+        )
+        revoked_legacy_account = False
+        for username, email in legacy_shared_accounts:
+            user = User.query.filter_by(username=username, email=email).first()
+            if user and user.is_active:
+                user.is_active = False
+                LoginSession.query.filter_by(
+                    user_id=user.id,
+                    is_active=True
+                ).update({'is_active': False})
+                revoked_legacy_account = True
+        if revoked_legacy_account:
             db.session.commit()

@@ -16,8 +16,15 @@ import secrets
 import math
 import copy
 import logging
+import smtplib
+import ssl
+import hashlib
+from email.message import EmailMessage
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import urlparse
+from sqlalchemy.exc import IntegrityError
 
 # Asegurar que el directorio src esté en el path para imports absolutos
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -118,14 +125,27 @@ except ImportError:
         send_demo_order,
     )
 
+try:
+    from . import paypal_payments
+    from .paypal_payments import PayPalConfigurationError, PayPalProviderError
+except ImportError:
+    import paypal_payments
+    from paypal_payments import PayPalConfigurationError, PayPalProviderError
+
 logger = logging.getLogger(__name__)
 
 try:
-    from .models import db, User, LoginSession, BillingHistory, PasswordResetToken, init_db
+    from .models import (
+        db, User, LoginSession, BillingHistory, PasswordResetToken,
+        PaymentTransaction, PaymentWebhookEvent, init_db
+    )
     DB_AVAILABLE = True
 except ImportError:
     try:
-        from models import db, User, LoginSession, BillingHistory, PasswordResetToken, init_db
+        from models import (
+            db, User, LoginSession, BillingHistory, PasswordResetToken,
+            PaymentTransaction, PaymentWebhookEvent, init_db
+        )
         DB_AVAILABLE = True
     except ImportError:
         db = None
@@ -154,13 +174,31 @@ except ImportError:
 TRADING_SYMBOL = os.environ.get('TRADING_SYMBOL', 'EURUSD')
 DEFAULT_VOLUME = float(os.environ.get('DEFAULT_VOLUME', 0.01))
 
+def resolve_flask_secret_key(environment):
+    configured_secret = environment.get('FLASK_SECRET_KEY')
+    if not configured_secret:
+        if environment.get('FLASK_ENV', '').lower() == 'production':
+            raise RuntimeError('FLASK_SECRET_KEY must be configured in production.')
+        return secrets.token_urlsafe(48)
+    if len(configured_secret) < 32 and environment.get('FLASK_ENV', '').lower() == 'production':
+        raise RuntimeError('FLASK_SECRET_KEY must contain at least 32 characters in production.')
+    return configured_secret
+
+
+def resolve_database_path(environment, default_path):
+    return os.path.abspath(environment.get('DATABASE_PATH') or default_path)
+
+
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'trading-system-secret-2026')
+app.secret_key = resolve_flask_secret_key(os.environ)
 
 # Configuración de base de datos
-db_path = os.path.join(os.path.dirname(__file__), '..', 'trading_platform.db')
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+default_db_path = os.path.join(os.path.dirname(__file__), '..', 'trading_platform.db')
+db_path = resolve_database_path(os.environ, default_db_path)
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
+app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{db_path.replace(os.sep, '/')}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
 
 if DB_AVAILABLE:
     db.init_app(app)
@@ -296,7 +334,8 @@ def _run_demo_chat_trade_job(job_id, user_id, symbol):
                 user = db.session.get(User, user_id) if DB_AVAILABLE else None
                 if (
                     user is None or user.subscription_plan != 'PREMIUM' or
-                    not user.has_active_subscription()
+                    not user.has_active_subscription() or
+                    not has_verified_paid_subscription(user)
                 ):
                     raise DemoTradeRejected(
                         'El comando de operación demo requiere una suscripción PREMIUM activa.'
@@ -1174,10 +1213,30 @@ def ensure_market_data_service():
 
 def get_current_user():
     """Obtener usuario actual de la sesión con verificación de expiración de plan"""
-    if not DB_AVAILABLE or 'user_id' not in session:
+    if not DB_AVAILABLE or 'user_id' not in session or 'session_token' not in session:
+        session.clear()
         return None
     try:
+        login_session = LoginSession.query.filter_by(
+            user_id=session['user_id'],
+            session_token=session['session_token'],
+            is_active=True
+        ).first()
+        if not login_session:
+            session.clear()
+            return None
+        if not login_session.is_valid():
+            login_session.is_active = False
+            db.session.commit()
+            session.clear()
+            return None
+
         user = db.session.get(User, session['user_id'])
+        if not user or not user.is_active:
+            login_session.is_active = False
+            db.session.commit()
+            session.clear()
+            return None
         if user and user.subscription_plan in ('PRO', 'PREMIUM') and user.subscription_expires:
             if datetime.utcnow() > user.subscription_expires:
                 user.subscription_plan = 'FREE'
@@ -1185,7 +1244,24 @@ def get_current_user():
                 db.session.commit()
         return user
     except Exception:
+        logger.exception('Could not validate the current login session.')
+        db.session.rollback()
+        session.clear()
         return None
+
+
+def has_verified_paid_subscription(user):
+    if not user or user.subscription_plan == 'FREE':
+        return bool(user)
+    if not DB_AVAILABLE:
+        return False
+    return PaymentTransaction.query.filter_by(
+        user_id=user.id,
+        provider='paypal',
+        plan=user.subscription_plan,
+        status='active'
+    ).first() is not None
+
 
 def login_required(f):
     """Decorador para rutas que requieren autenticación"""
@@ -1208,14 +1284,22 @@ def check_subscription(required_plan='FREE'):
                 return jsonify({'success': False, 'error': 'Autenticación requerida'}), 401
             
             if required_plan == 'PRO':
-                if user.subscription_plan not in ('PRO', 'PREMIUM') or not user.has_active_subscription():
+                if (
+                    user.subscription_plan not in ('PRO', 'PREMIUM') or
+                    not user.has_active_subscription() or
+                    not has_verified_paid_subscription(user)
+                ):
                     return jsonify({
                         'success': False, 
                         'error': 'Esta función requiere un plan PRO ($9.99/mes) o PREMIUM ($19.99/mes)',
                         'upgrade_required': True
                     }), 403
             elif required_plan == 'PREMIUM':
-                if user.subscription_plan != 'PREMIUM' or not user.has_active_subscription():
+                if (
+                    user.subscription_plan != 'PREMIUM' or
+                    not user.has_active_subscription() or
+                    not has_verified_paid_subscription(user)
+                ):
                     return jsonify({
                         'success': False, 
                         'error': 'Esta función requiere un plan PREMIUM ($19.99/mes)',
@@ -1398,9 +1482,13 @@ def api_get_current_user():
     if not user:
         return jsonify({'success': False, 'error': 'No autenticado'}), 401
     
+    user_data = user.to_dict(include_sensitive=True)
+    if user.subscription_plan != 'FREE' and not has_verified_paid_subscription(user):
+        user_data['subscription_plan'] = 'FREE'
+        user_data['subscription_status'] = 'payment_required'
     return jsonify({
         'success': True,
-        'user': user.to_dict(include_sensitive=True)
+        'user': user_data
     })
 
 
@@ -1463,6 +1551,83 @@ def api_change_password():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+class PasswordResetDeliveryError(RuntimeError):
+    """Raised when account recovery email delivery is not configured or fails."""
+
+
+def _password_reset_email_settings():
+    host = os.environ.get('SMTP_HOST', '').strip()
+    sender = os.environ.get('SMTP_FROM', '').strip()
+    if not host or not sender:
+        raise PasswordResetDeliveryError(
+            'Configura SMTP_HOST y SMTP_FROM para habilitar recuperación de contraseña.'
+        )
+    try:
+        port = int(os.environ.get('SMTP_PORT', '587'))
+    except ValueError as exc:
+        raise PasswordResetDeliveryError('SMTP_PORT debe ser un puerto válido.') from exc
+    username = os.environ.get('SMTP_USERNAME', '').strip()
+    password = os.environ.get('SMTP_PASSWORD', '')
+    if bool(username) != bool(password):
+        raise PasswordResetDeliveryError(
+            'SMTP_USERNAME y SMTP_PASSWORD deben configurarse juntos.'
+        )
+    use_ssl = os.environ.get('SMTP_USE_SSL', '').lower() == 'true'
+    use_starttls = os.environ.get('SMTP_STARTTLS', 'true').lower() == 'true'
+    if use_ssl and use_starttls:
+        raise PasswordResetDeliveryError(
+            'Usa SMTP_USE_SSL o SMTP_STARTTLS, no ambos.'
+        )
+    return {
+        'host': host,
+        'port': port,
+        'sender': sender,
+        'username': username,
+        'password': password,
+        'use_ssl': use_ssl,
+        'use_starttls': use_starttls
+    }
+
+
+def _send_password_reset_email(email, token):
+    settings = _password_reset_email_settings()
+    message = EmailMessage()
+    message['Subject'] = 'Restablece tu contraseña'
+    message['From'] = settings['sender']
+    message['To'] = email
+    message.set_content(
+        'Recibimos una solicitud para restablecer la contraseña de tu cuenta.\n\n'
+        f'Tu código de recuperación es: {token}\n\n'
+        'El código vence en una hora y solo puede utilizarse una vez. '
+        'Si no solicitaste este cambio, ignora este correo.'
+    )
+
+    if settings['use_ssl']:
+        smtp_client = smtplib.SMTP_SSL(
+            settings['host'],
+            settings['port'],
+            timeout=15,
+            context=ssl.create_default_context()
+        )
+    else:
+        smtp_client = smtplib.SMTP(
+            settings['host'],
+            settings['port'],
+            timeout=15
+        )
+
+    with smtp_client as smtp:
+        if settings['use_starttls']:
+            smtp.starttls(context=ssl.create_default_context())
+        if settings['username']:
+            smtp.login(settings['username'], settings['password'])
+        smtp.send_message(message)
+
+
+def _password_reset_token_digest(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
 @app.route('/api/auth/forgot-password', methods=['POST'])
 @rate_limit(5)
 def api_forgot_password():
@@ -1470,31 +1635,55 @@ def api_forgot_password():
     if not DB_AVAILABLE:
         return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
         
-    data = request.get_json() or {}
-    email = data.get('email', '').strip().lower()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or not isinstance(data.get('email'), str):
+        return jsonify({'success': False, 'error': 'Solicitud no válida'}), 400
+    email = data['email'].strip().lower()
     
     if not email:
         return jsonify({'success': False, 'error': 'Email requerido'}), 400
+
+    try:
+        _password_reset_email_settings()
+    except PasswordResetDeliveryError:
+        return jsonify({
+            'success': False,
+            'error': 'La recuperación por correo no está configurada.'
+        }), 503
         
     user = User.query.filter_by(email=email).first()
     if not user:
-        return jsonify({'success': True, 'message': 'Si el email está registrado, se generó el token de recuperación.'})
+        return jsonify({
+            'success': True,
+            'message': 'Si el email está registrado, recibirás instrucciones de recuperación.'
+        }), 202
         
     try:
         token_str = secrets.token_urlsafe(32)
         reset_token = PasswordResetToken(
             user_id=user.id,
-            token=token_str,
+            token=_password_reset_token_digest(token_str),
             expires_at=datetime.utcnow() + timedelta(hours=1)
         )
         db.session.add(reset_token)
         db.session.commit()
-        
+        try:
+            _send_password_reset_email(email, token_str)
+        except (PasswordResetDeliveryError, smtplib.SMTPException, OSError):
+            reset_token.is_used = True
+            db.session.commit()
+            logger.exception('Password reset email delivery failed.')
+            return jsonify({
+                'success': False,
+                'message': (
+                    'Si el email está registrado, recibirás instrucciones de recuperación.'
+                )
+            }), 202
+
         return jsonify({
             'success': True,
-            'message': 'Token de recuperación generado exitosamente',
-            'reset_token': token_str
-        })
+            'message': 'Si el email está registrado, recibirás instrucciones de recuperación.'
+        }), 202
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1507,9 +1696,14 @@ def api_reset_password():
     if not DB_AVAILABLE:
         return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
         
-    data = request.get_json() or {}
-    token_str = data.get('token', '').strip()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'error': 'Solicitud no válida'}), 400
+    token_str = data.get('token', '')
     new_password = data.get('new_password', '')
+    if not isinstance(token_str, str) or not isinstance(new_password, str):
+        return jsonify({'success': False, 'error': 'Token y contraseña deben ser texto'}), 400
+    token_str = token_str.strip()
     
     if not token_str or not new_password:
         return jsonify({'success': False, 'error': 'Token y nueva contraseña requeridos'}), 400
@@ -1518,14 +1712,25 @@ def api_reset_password():
         return jsonify({'success': False, 'error': 'La contraseña debe tener al menos 8 caracteres'}), 400
         
     try:
-        reset_token = PasswordResetToken.query.filter_by(token=token_str).first()
+        reset_token = PasswordResetToken.query.filter_by(
+            token=_password_reset_token_digest(token_str)
+        ).first()
         if not reset_token or not reset_token.is_valid():
             return jsonify({'success': False, 'error': 'Token inválido o expirado'}), 400
             
         user = reset_token.user
         user.set_password(new_password)
-        reset_token.is_used = True
+        reset_tokens = PasswordResetToken.query.filter_by(
+            user_id=user.id,
+            is_used=False
+        ).all()
+        for token in reset_tokens:
+            token.is_used = True
+        LoginSession.query.filter_by(user_id=user.id, is_active=True).update(
+            {'is_active': False}
+        )
         db.session.commit()
+        session.clear()
         
         return jsonify({
             'success': True,
@@ -1586,7 +1791,132 @@ def api_get_plans():
             ]
         }
     }
-    return jsonify({'success': True, 'plans': plans})
+    return jsonify({
+        'success': True,
+        'plans': plans,
+        'payment_provider': 'PayPal',
+        'payment_available': paypal_payments.is_configured()
+    })
+
+
+def _paypal_subscription_matches_transaction(transaction, provider_subscription):
+    expected_custom_id = (
+        f'trading-platform:user:{transaction.user_id}:plan:{transaction.plan}'
+    )
+    if (
+        provider_subscription.get('id') != transaction.provider_reference or
+        provider_subscription.get('status') != 'ACTIVE' or
+        provider_subscription.get('plan_id') != paypal_payments.plan_id(transaction.plan) or
+        provider_subscription.get('custom_id') != expected_custom_id
+    ):
+        return False
+
+    last_payment = (
+        provider_subscription.get('billing_info', {})
+        .get('last_payment', {})
+    )
+    amount = last_payment.get('amount') or {}
+    try:
+        paid_amount = Decimal(str(amount.get('value')))
+        expected_amount = Decimal(str(transaction.amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if (
+        amount.get('currency_code') != transaction.currency or
+        paid_amount.quantize(Decimal('0.01')) != expected_amount.quantize(Decimal('0.01'))
+    ):
+        return False
+
+    plan_details = paypal_payments.get_plan_details(
+        paypal_payments.plan_id(transaction.plan)
+    )
+    if plan_details.get('id') != provider_subscription.get('plan_id'):
+        return False
+    regular_cycles = [
+        cycle for cycle in plan_details.get('billing_cycles', [])
+        if cycle.get('tenure_type') == 'REGULAR'
+    ]
+    for cycle in regular_cycles:
+        frequency = cycle.get('frequency') or {}
+        fixed_price = (cycle.get('pricing_scheme') or {}).get('fixed_price') or {}
+        try:
+            configured_amount = Decimal(str(fixed_price.get('value')))
+            interval_count = int(frequency.get('interval_count', 0))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if (
+            frequency.get('interval_unit') == 'MONTH' and
+            interval_count == 1 and
+            fixed_price.get('currency_code') == transaction.currency and
+            configured_amount.quantize(Decimal('0.01')) ==
+            expected_amount.quantize(Decimal('0.01'))
+        ):
+            return True
+    return False
+
+
+def _paypal_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).replace(
+            tzinfo=None
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _activate_paypal_transaction(transaction, provider_subscription):
+    if not _paypal_subscription_matches_transaction(
+        transaction, provider_subscription
+    ):
+        return False
+    if transaction.status == 'active':
+        return True
+
+    user = db.session.get(User, transaction.user_id)
+    if not user or not user.is_active:
+        return False
+    now = datetime.utcnow()
+    user.subscription_plan = transaction.plan
+    user.subscription_status = 'active'
+    billing_info = provider_subscription.get('billing_info', {})
+    user.subscription_expires = (
+        _paypal_datetime(billing_info.get('next_billing_time')) or
+        now + timedelta(days=30)
+    )
+    transaction.status = 'active'
+    last_payment = billing_info.get('last_payment') or {}
+    payment_reference = last_payment.get('id') or transaction.provider_reference
+    payment_description = f'PayPal payment {payment_reference}'
+    transaction.last_payment_at = _paypal_datetime(last_payment.get('time')) or now
+    if not BillingHistory.query.filter_by(
+        user_id=user.id,
+        description=payment_description
+    ).first():
+        db.session.add(BillingHistory(
+            user_id=user.id,
+            plan=transaction.plan,
+            amount=transaction.amount,
+            currency=transaction.currency,
+            status='succeeded',
+            description=payment_description
+        ))
+    return True
+
+
+def _paypal_public_approval_url(provider_subscription):
+    for link in provider_subscription.get('links', []):
+        if link.get('rel') != 'approve':
+            continue
+        href = link.get('href', '')
+        parsed = urlparse(href)
+        if (
+            parsed.scheme == 'https' and parsed.hostname and
+            (parsed.hostname == 'paypal.com' or parsed.hostname.endswith('.paypal.com'))
+        ):
+            return href
+    return None
 
 
 @app.route('/api/subscription/current')
@@ -1594,146 +1924,384 @@ def api_get_plans():
 def api_get_subscription():
     """Obtener suscripción actual del usuario"""
     user = get_current_user()
+    verified = has_verified_paid_subscription(user)
+    effective_plan = user.subscription_plan if verified else 'FREE'
     
     return jsonify({
         'success': True,
         'subscription': {
-            'plan': user.subscription_plan,
-            'status': user.subscription_status,
+            'plan': effective_plan,
+            'status': user.subscription_status if verified else 'payment_required',
             'expires_at': user.subscription_expires.isoformat() if user.subscription_expires else None,
-            'is_active': user.has_active_subscription()
+            'is_active': user.has_active_subscription() and verified
         }
     })
+
+
+@app.route('/api/subscription/checkout', methods=['POST'])
+@login_required
+@rate_limit(5)
+def api_subscription_checkout():
+    if not DB_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or data.get('plan') not in ('PRO', 'PREMIUM'):
+        return jsonify({'success': False, 'error': 'Plan de pago no válido'}), 400
+    user = request.user
+    plan = data['plan']
+    if user.subscription_plan == plan and user.has_active_subscription() and \
+            has_verified_paid_subscription(user):
+        return jsonify({'success': False, 'error': f'Ya tienes el plan {plan} activo'}), 409
+    active_provider_subscription = PaymentTransaction.query.filter_by(
+        user_id=user.id,
+        provider='paypal',
+        status='active'
+    ).first()
+    if active_provider_subscription:
+        return jsonify({
+            'success': False,
+            'error': 'Cancela tu suscripción PayPal actual antes de iniciar otro plan.'
+        }), 409
+    pending = PaymentTransaction.query.filter_by(
+        user_id=user.id,
+        provider='paypal',
+        status='pending'
+    ).order_by(PaymentTransaction.created_at.desc()).first()
+    if pending and pending.created_at < datetime.utcnow() - timedelta(minutes=30):
+        pending.status = 'expired'
+        db.session.commit()
+        pending = None
+    if pending:
+        return jsonify({
+            'success': False,
+            'error': 'Ya existe un checkout pendiente. Termínalo o espera 30 minutos para que expire.'
+        }), 409
+
+    try:
+        provider_subscription = paypal_payments.create_subscription(
+            plan,
+            user.id,
+            request_id=secrets.token_urlsafe(24)
+        )
+    except PayPalConfigurationError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 503
+    except PayPalProviderError as exc:
+        logger.warning('PayPal checkout creation failed: %s', exc)
+        return jsonify({
+            'success': False,
+            'error': 'PayPal sandbox no pudo iniciar el checkout.'
+        }), 502
+
+    subscription_id = provider_subscription.get('id')
+    approval_url = _paypal_public_approval_url(provider_subscription)
+    if not subscription_id or not approval_url:
+        logger.error('PayPal returned a subscription without a valid approval link.')
+        return jsonify({
+            'success': False,
+            'error': 'PayPal no devolvió un enlace de aprobación válido.'
+        }), 502
+
+    try:
+        transaction = PaymentTransaction(
+            user_id=user.id,
+            provider='paypal',
+            provider_reference=subscription_id,
+            plan=plan,
+            amount=paypal_payments.plan_amount(plan),
+            currency='USD',
+            status='pending'
+        )
+        db.session.add(transaction)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception('Could not persist PayPal checkout reference.')
+        return jsonify({
+            'success': False,
+            'error': 'No se pudo guardar el intento de pago.'
+        }), 500
+
+    return jsonify({
+        'success': True,
+        'provider': 'PayPal',
+        'status': 'pending',
+        'approval_url': approval_url
+    }), 201
+
+
+@app.route('/billing/paypal/return')
+def paypal_subscription_return():
+    user = get_current_user()
+    if not user:
+        return redirect('/login')
+    subscription_id = request.args.get('subscription_id', '').strip()
+    if not subscription_id:
+        return redirect('/dashboard?payment=missing')
+
+    transaction = PaymentTransaction.query.filter_by(
+        user_id=user.id,
+        provider='paypal',
+        provider_reference=subscription_id
+    ).first()
+    if not transaction:
+        return redirect('/dashboard?payment=not-found')
+    if transaction.status == 'active':
+        return redirect('/dashboard?payment=success')
+
+    try:
+        provider_subscription = paypal_payments.get_subscription(subscription_id)
+        if not _activate_paypal_transaction(transaction, provider_subscription):
+            db.session.commit()
+            return redirect('/dashboard?payment=pending')
+        db.session.commit()
+    except PayPalConfigurationError:
+        db.session.rollback()
+        logger.exception('PayPal return validation is not configured.')
+        return redirect('/dashboard?payment=unavailable')
+    except PayPalProviderError as exc:
+        db.session.rollback()
+        logger.warning('PayPal return validation failed: %s', exc)
+        return redirect('/dashboard?payment=verification-failed')
+    except Exception:
+        db.session.rollback()
+        logger.exception('Could not apply the verified PayPal subscription.')
+        return redirect('/dashboard?payment=verification-failed')
+    return redirect('/dashboard?payment=success')
+
+
+@app.route('/billing/paypal/cancel')
+def paypal_subscription_cancel():
+    user = get_current_user()
+    if not user:
+        return redirect('/login')
+    subscription_id = request.args.get('subscription_id', '').strip()
+    if subscription_id:
+        pending = PaymentTransaction.query.filter_by(
+            user_id=user.id,
+            provider='paypal',
+            provider_reference=subscription_id,
+            status='pending'
+        ).first()
+        if pending:
+            pending.status = 'cancelled'
+            db.session.commit()
+    return redirect('/dashboard?payment=cancelled')
+
+
+@app.route('/api/payments/paypal/webhook', methods=['POST'])
+def api_paypal_webhook():
+    event = request.get_json(silent=True)
+    if not isinstance(event, dict) or not isinstance(event.get('id'), str):
+        return jsonify({'success': False, 'error': 'Evento PayPal no válido'}), 400
+    try:
+        if not paypal_payments.verify_webhook(request.headers, event):
+            return jsonify({'success': False, 'error': 'Firma PayPal no válida'}), 400
+    except PayPalConfigurationError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 503
+    except PayPalProviderError as exc:
+        logger.warning('PayPal webhook verification failed: %s', exc)
+        return jsonify({'success': False, 'error': 'No se pudo verificar el evento PayPal'}), 502
+
+    if PaymentWebhookEvent.query.filter_by(
+        provider='paypal',
+        event_id=event['id']
+    ).first():
+        return jsonify({'success': True, 'duplicate': True}), 200
+
+    try:
+        db.session.add(PaymentWebhookEvent(
+            provider='paypal',
+            event_id=event['id'],
+            event_type=str(event.get('event_type', 'unknown'))[:128]
+        ))
+        db.session.flush()
+
+        event_type = event.get('event_type')
+        resource = event.get('resource') or {}
+        subscription_id = (
+            resource.get('id')
+            if event_type and event_type.startswith('BILLING.SUBSCRIPTION.')
+            else resource.get('billing_agreement_id') or resource.get('subscription_id')
+        )
+        transaction = None
+        if isinstance(subscription_id, str) and subscription_id:
+            transaction = PaymentTransaction.query.filter_by(
+                provider='paypal',
+                provider_reference=subscription_id
+            ).first()
+
+        if transaction and event_type in (
+            'BILLING.SUBSCRIPTION.ACTIVATED',
+            'PAYMENT.SALE.COMPLETED'
+        ):
+            provider_subscription = paypal_payments.get_subscription(subscription_id)
+            _activate_paypal_transaction(transaction, provider_subscription)
+            if (
+                event_type == 'PAYMENT.SALE.COMPLETED' and
+                transaction.status == 'active'
+            ):
+                amount_info = resource.get('amount') or {}
+                try:
+                    sale_amount = Decimal(str(amount_info.get('total')))
+                    expected_amount = Decimal(str(transaction.amount))
+                except (InvalidOperation, TypeError, ValueError):
+                    raise PayPalProviderError('El monto del evento PayPal no es válido.')
+                if (
+                    amount_info.get('currency') != transaction.currency or
+                    sale_amount.quantize(Decimal('0.01')) !=
+                    expected_amount.quantize(Decimal('0.01'))
+                ):
+                    raise PayPalProviderError('El monto del evento no coincide con el plan.')
+
+                sale_reference = resource.get('id', event['id'])
+                description = f'PayPal payment {sale_reference}'
+                user = db.session.get(User, transaction.user_id)
+                event_time = (
+                    _paypal_datetime(event.get('create_time')) or
+                    datetime.utcnow()
+                )
+                is_new_billing_cycle = (
+                    transaction.last_payment_at is None or
+                    event_time > transaction.last_payment_at + timedelta(days=1)
+                )
+                if is_new_billing_cycle:
+                    if user and transaction.last_payment_at:
+                        next_billing = _paypal_datetime(
+                            provider_subscription.get('billing_info', {}).get(
+                                'next_billing_time'
+                            )
+                        )
+                        user.subscription_expires = next_billing or max(
+                            user.subscription_expires or event_time,
+                            event_time
+                        ) + timedelta(days=30)
+                    if user and not BillingHistory.query.filter_by(
+                        user_id=transaction.user_id,
+                        description=description
+                    ).first():
+                        db.session.add(BillingHistory(
+                            user_id=transaction.user_id,
+                            plan=transaction.plan,
+                            amount=float(sale_amount),
+                            currency=transaction.currency,
+                            status='succeeded',
+                            description=description
+                        ))
+                    transaction.last_payment_at = event_time
+
+        elif transaction and event_type in (
+            'BILLING.SUBSCRIPTION.CANCELLED',
+            'BILLING.SUBSCRIPTION.EXPIRED',
+            'BILLING.SUBSCRIPTION.SUSPENDED'
+        ):
+            provider_subscription = paypal_payments.get_subscription(subscription_id)
+            provider_status = provider_subscription.get('status')
+            if provider_status in ('CANCELLED', 'EXPIRED', 'SUSPENDED'):
+                transaction.status = provider_status.lower()
+                user = db.session.get(User, transaction.user_id)
+                other_active = PaymentTransaction.query.filter(
+                    PaymentTransaction.user_id == transaction.user_id,
+                    PaymentTransaction.provider == 'paypal',
+                    PaymentTransaction.status == 'active',
+                    PaymentTransaction.id != transaction.id
+                ).first()
+                if user and not other_active and user.subscription_plan == transaction.plan:
+                    user.subscription_plan = 'FREE'
+                    user.subscription_status = 'canceled'
+                    user.subscription_expires = None
+
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        if PaymentWebhookEvent.query.filter_by(
+            provider='paypal',
+            event_id=event['id']
+        ).first():
+            return jsonify({'success': True, 'duplicate': True}), 200
+        logger.exception('Could not store the PayPal webhook event.')
+        return jsonify({'success': False, 'error': 'Evento PayPal no procesado'}), 500
+    except PayPalProviderError as exc:
+        db.session.rollback()
+        logger.warning('PayPal webhook event processing failed: %s', exc)
+        return jsonify({'success': False, 'error': 'Evento PayPal no procesado'}), 502
+    except Exception:
+        db.session.rollback()
+        logger.exception('Unexpected PayPal webhook processing error.')
+        return jsonify({'success': False, 'error': 'Evento PayPal no procesado'}), 500
+
+    return jsonify({'success': True}), 200
 
 
 @app.route('/api/subscription/upgrade', methods=['POST'])
 @login_required
 def api_upgrade_subscription():
-    """Mejorar a plan de pago"""
-    if not DB_AVAILABLE:
-        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
-    
-    user = get_current_user()
-    data = request.get_json() or {}
-    plan = data.get('plan', '').upper()
-    
-    if plan not in ('PRO', 'PREMIUM'):
-        return jsonify({'success': False, 'error': 'Plan inválido'}), 400
-    
-    if user.subscription_plan == plan:
-        return jsonify({'success': False, 'error': f'Ya tienes el plan {plan}'}), 400
-    
-    try:
-        # Simulación de pago con Stripe (en producción usar Stripe API real)
-        user.upgrade_subscription(plan, stripe_sub_id=f"sub_{user.id}_{plan}")
-        
-        # Registrar en historial de billing
-        billing = BillingHistory(
-            user_id=user.id,
-            plan=plan,
-            amount=9.99 if plan == 'PRO' else 19.99,
-            currency='USD',
-            status='succeeded',
-            description=f'Upgrade to {plan}'
-        )
-        
-        db.session.add(billing)
-        db.session.commit()
-        
-        return jsonify({
-            'success': True,
-            'message': f'Actualizado a plan {plan}',
-            'subscription': {
-                'plan': user.subscription_plan,
-                'expires_at': user.subscription_expires.isoformat() if user.subscription_expires else None
-            }
-        })
-    
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
+    """Prevent client requests from granting paid access without provider payment."""
+    return jsonify({
+        'success': False,
+        'error': 'El upgrade directo está deshabilitado. Inicia el pago con PayPal checkout.'
+    }), 410
 
 
 @app.route('/api/subscription/cancel', methods=['POST'])
 @login_required
 def api_cancel_subscription():
-    """Cancelar suscripción"""
+    """Cancel the authenticated user's PayPal recurring subscription."""
     if not DB_AVAILABLE:
         return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
-    
-    user = get_current_user()
-    
+
+    user = request.user
     if user.subscription_plan == 'FREE':
         return jsonify({'success': False, 'error': 'No hay suscripción activa para cancelar'}), 400
-    
+
+    transaction = PaymentTransaction.query.filter_by(
+        user_id=user.id,
+        provider='paypal',
+        plan=user.subscription_plan,
+        status='active'
+    ).order_by(PaymentTransaction.created_at.desc()).first()
+    if not transaction:
+        return jsonify({
+            'success': False,
+            'error': 'No encontramos una suscripción PayPal verificada para cancelar. Contacta soporte.'
+        }), 409
+
     try:
-        user.cancel_subscription()
-        
-        # Registrar cancelación
-        billing = BillingHistory(
-            user_id=user.id,
-            plan='CANCELED',
-            amount=0,
-            status='succeeded',
-            description='Subscription canceled'
+        paypal_payments.cancel_subscription(
+            transaction.provider_reference,
+            'Cancellation requested by subscriber'
         )
-        
-        db.session.add(billing)
+        transaction.status = 'cancelled'
+        user.cancel_subscription()
         db.session.commit()
-        
         return jsonify({
             'success': True,
-            'message': 'Suscripción cancelada. Vuelviste al plan FREE.',
-            'subscription': {
-                'plan': user.subscription_plan,
-                'status': user.subscription_status
-            }
+            'message': 'La suscripción recurrente de PayPal fue cancelada.',
+            'subscription': {'plan': user.subscription_plan, 'status': user.subscription_status}
         })
-    
-    except Exception as e:
+    except PayPalConfigurationError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 503
+    except PayPalProviderError as exc:
         db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.warning('PayPal subscription cancellation failed: %s', exc)
+        return jsonify({
+            'success': False,
+            'error': 'PayPal no pudo cancelar la suscripción. Inténtalo más tarde.'
+        }), 502
+    except Exception:
+        db.session.rollback()
+        logger.exception('Could not persist PayPal subscription cancellation.')
+        return jsonify({'success': False, 'error': 'No se pudo registrar la cancelación.'}), 500
 
 
 @app.route('/api/subscription/renew', methods=['POST'])
 @login_required
 def api_renew_subscription():
-    """Renovar suscripción actual"""
-    if not DB_AVAILABLE:
-        return jsonify({'success': False, 'error': 'Sistema no disponible'}), 503
-        
-    user = get_current_user()
-    if user.subscription_plan == 'FREE':
-        return jsonify({'success': False, 'error': 'El plan FREE no requiere renovación'}), 400
-        
-    try:
-        base_time = user.subscription_expires if (user.subscription_expires and user.subscription_expires > datetime.utcnow()) else datetime.utcnow()
-        user.subscription_expires = base_time + timedelta(days=30)
-        user.subscription_status = 'active'
-        
-        amount = 9.99 if user.subscription_plan == 'PRO' else 19.99
-        billing = BillingHistory(
-            user_id=user.id,
-            plan=user.subscription_plan,
-            amount=amount,
-            currency='USD',
-            status='succeeded',
-            description=f'Renewal of {user.subscription_plan} plan'
-        )
-        db.session.add(billing)
-        db.session.commit()
-        
-        return jsonify({
-            'success': True,
-            'message': f'Suscripción {user.subscription_plan} renovada exitosamente por 30 días',
-            'subscription': {
-                'plan': user.subscription_plan,
-                'expires_at': user.subscription_expires.isoformat()
-            }
-        })
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
+    """Renewal is handled automatically by the verified PayPal subscription."""
+    return jsonify({
+        'success': False,
+        'error': 'La renovación se procesa automáticamente por PayPal; no se puede simular.'
+    }), 410
 
 
 @app.route('/api/billing/history')
@@ -1793,7 +2361,7 @@ def view_login():
             (User.email == email_or_user.lower()) | (User.username == email_or_user)
         ).first() if DB_AVAILABLE else None
         
-        if user and user.check_password(password):
+        if user and user.is_active and user.check_password(password):
             token = secrets.token_urlsafe(32)
             login_sess = LoginSession(
                 user_id=user.id,
@@ -2244,7 +2812,8 @@ def api_chat_command():
     if command_parts and command_parts[0].lower() == '/trade':
         if (
             request.user.subscription_plan != 'PREMIUM' or
-            not request.user.has_active_subscription()
+            not request.user.has_active_subscription() or
+            not has_verified_paid_subscription(request.user)
         ):
             return jsonify({
                 'success': False,
@@ -2438,14 +3007,6 @@ LOGIN_HTML = """
         .links { margin-top: 20px; text-align: center; font-size: 13px; color: var(--text-dim); }
         .links a { color: var(--gold); text-decoration: none; font-weight: 600; }
         .links a:hover { text-decoration: underline; }
-        .creds {
-            margin-top: 24px;
-            padding-top: 20px;
-            border-top: 1px solid rgba(255,255,255,0.06);
-            font-size: 12px;
-            color: var(--text-dim);
-        }
-        .creds code { background: #111; padding: 3px 6px; border-radius: 4px; color: var(--gold); }
     </style>
 </head>
 <body>
@@ -2467,12 +3028,6 @@ LOGIN_HTML = """
             <p>¿No tienes cuenta? <a href="/register">Regístrate gratis</a></p>
             <p style="margin-top:8px;"><a href="#" onclick="showForgotModal()">¿Olvidaste tu contraseña?</a></p>
         </div>
-        <div class="creds">
-            <strong>Cuentas Demo:</strong><br>
-            Admin: <code>admin</code> / <code>RyzA_jjITjuPQtV66Wwf0A</code><br>
-            Trader: <code>trader</code> / <code>SecurePass123</code><br>
-            Demo: <code>demo</code> / <code>password123</code>
-        </div>
     </div>
 
     <!-- Modal Recuperación -->
@@ -2480,7 +3035,7 @@ LOGIN_HTML = """
         <div style="background:var(--surface); padding:30px; border-radius:14px; border:1px solid var(--gold); max-width:400px; width:90%;">
             <h3 style="color:var(--gold); margin-bottom:15px;">Recuperar Contraseña</h3>
             <div id="forgot-step-1">
-                <p style="font-size:13px; color:var(--text-dim); margin-bottom:12px;">Introduce tu correo electrónico para solicitar el token de recuperación.</p>
+                <p style="font-size:13px; color:var(--text-dim); margin-bottom:12px;">Introduce tu correo electrónico y te enviaremos un código de recuperación si la cuenta existe.</p>
                 <input id="forgot-email" type="email" placeholder="correo@ejemplo.com" style="width:100%; padding:10px; background:#0d0d0d; border:1px solid var(--border); color:#fff; border-radius:6px; margin-bottom:12px;">
                 <button onclick="requestForgotToken()" style="width:100%;">Solicitar Token</button>
             </div>
@@ -2509,7 +3064,6 @@ LOGIN_HTML = """
                     document.getElementById('forgot-step-1').style.display = 'none';
                     document.getElementById('forgot-step-2').style.display = 'block';
                     document.getElementById('forgot-msg').textContent = d.message;
-                    if (d.reset_token) document.getElementById('reset-token-input').value = d.reset_token;
                 } else {
                     alert(d.error || 'Error al solicitar token');
                 }
@@ -3169,7 +3723,7 @@ DASHBOARD_HTML = """
                         <li>✓ Indicadores RSI, MACD, BB</li>
                         <li>✗ Análisis Profesional</li>
                     </ul>
-                    <button onclick="changePlan('PRO')" class="btn btn-purple" style="width:100%; margin:0;">Mejorar a PRO</button>
+                    <button onclick="changePlan('PRO')" class="btn btn-purple" style="width:100%; margin:0;">Continuar con PayPal</button>
                 </div>
                 <!-- PREMIUM -->
                 <div style="background:var(--surface-2); padding:20px; border-radius:12px; border:1px solid var(--gold); text-align:center;">
@@ -3182,7 +3736,7 @@ DASHBOARD_HTML = """
                         <li>✓ Acceso Prioritario</li>
                         <li>✓ Soporte 24/7</li>
                     </ul>
-                    <button onclick="changePlan('PREMIUM')" class="btn" style="width:100%; margin:0; background:var(--gold); color:#000;">Mejorar a PREMIUM</button>
+                    <button onclick="changePlan('PREMIUM')" class="btn" style="width:100%; margin:0; background:var(--gold); color:#000;">Continuar con PayPal</button>
                 </div>
             </div>
 
@@ -3887,21 +4441,23 @@ DASHBOARD_HTML = """
             if (plan === 'FREE') {
                 return cancelPlan();
             }
-            fetch('/api/subscription/upgrade', {
+            fetch('/api/subscription/checkout', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ plan })
             })
-                .then(r => r.json())
-                .then(d => {
-                    if (d.success) {
-                        alert(d.message);
-                        loadCurrentUser().then(() => update());
-                        loadBillingHistory();
-                    } else {
-                        alert(d.error || 'Error cambiando plan');
+                .then(async r => {
+                    const data = await r.json();
+                    if (!r.ok || !data.success) {
+                        throw new Error(data.error || 'No se pudo iniciar el checkout.');
                     }
-                });
+                    return data;
+                })
+                .then(d => {
+                    if (!d.approval_url) throw new Error('PayPal no devolvió el enlace de aprobación.');
+                    window.location.assign(d.approval_url);
+                })
+                .catch(e => alert(e.message));
         }
 
         function cancelPlan() {

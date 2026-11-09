@@ -1,7 +1,7 @@
 import importlib
 import os
+import tempfile
 import unittest
-from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from flask import Flask
@@ -25,23 +25,25 @@ class TestDemoProfiles(unittest.TestCase):
             db.session.remove()
             db.drop_all()
 
-    def test_expired_demo_plan_is_restored_for_local_feature_testing(self):
-        with patch.dict(os.environ, {'FLASK_ENV': 'development'}):
-            init_db(self.app)
-            with self.app.app_context():
-                trader = User.query.filter_by(username='trader').one()
-                trader.subscription_plan = 'FREE'
-                trader.subscription_status = 'expired'
-                trader.subscription_expires = datetime.utcnow() - timedelta(days=1)
-                db.session.commit()
+    def test_database_path_can_use_a_persistent_host_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            configured_path = os.path.join(directory, 'persistent', 'trading.db')
+            resolved_path = app_module.resolve_database_path(
+                {'DATABASE_PATH': configured_path},
+                'default.db'
+            )
 
-            init_db(self.app)
+        self.assertEqual(resolved_path, os.path.abspath(configured_path))
 
+    def test_database_initialization_does_not_seed_shared_demo_accounts(self):
+        init_db(self.app)
         with self.app.app_context():
-            trader = User.query.filter_by(username='trader').one()
-            self.assertEqual(trader.subscription_plan, 'PRO')
-            self.assertTrue(trader.has_active_subscription())
-            self.assertGreater(trader.subscription_expires, datetime.utcnow())
+            self.assertEqual(
+                User.query.filter(
+                    User.username.in_(('admin', 'trader', 'demo'))
+                ).count(),
+                0
+            )
 
     def test_login_page_reports_database_unavailable(self):
         with patch.object(app_module, 'DB_AVAILABLE', False):

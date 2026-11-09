@@ -6,6 +6,7 @@ Tests for authentication, subscription, security
 
 import sys
 import os
+import smtplib
 
 # Add root and src to path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -22,10 +23,16 @@ from unittest.mock import patch
 
 # Import app and modules
 try:
-    from src.app import app, db, User, LoginSession, BillingHistory
+    from src.app import (
+        app, db, User, LoginSession, BillingHistory, PasswordResetToken,
+        PaymentTransaction, PaymentWebhookEvent
+    )
     from src.security import SecurityValidator, request_counts
 except ImportError:
-    from app import app, db, User, LoginSession, BillingHistory
+    from app import (
+        app, db, User, LoginSession, BillingHistory, PasswordResetToken,
+        PaymentTransaction, PaymentWebhookEvent
+    )
     from security import SecurityValidator, request_counts
 
 from sqlalchemy import create_engine
@@ -68,6 +75,22 @@ class IsolatedDatabaseTestCase(unittest.TestCase):
             db.session.remove()
             db.drop_all()
             db.create_all()
+
+    def grant_test_subscription(self, user_id, plan):
+        amount = 9.99 if plan == 'PRO' else 19.99
+        with self.app.app_context():
+            user = db.session.get(User, user_id)
+            user.upgrade_subscription(plan)
+            db.session.add(PaymentTransaction(
+                user_id=user_id,
+                provider='paypal',
+                provider_reference=f'test-{user_id}-{plan}-{datetime.utcnow().timestamp()}',
+                plan=plan,
+                amount=amount,
+                currency='USD',
+                status='active'
+            ))
+            db.session.commit()
 
 
 class TestAuthentication(IsolatedDatabaseTestCase):
@@ -134,16 +157,232 @@ class TestAuthentication(IsolatedDatabaseTestCase):
         with self.app.app_context():
             self.assertIsNone(User.query.filter_by(email='short@example.com').first())
 
-    def test_registration_rejects_sql_injection_shaped_username(self):
-        response = self.client.post('/api/auth/register', json={
-            'email': 'attack@example.com',
-            'username': "admin' OR '1'='1",
+    def test_login_page_does_not_expose_default_demo_credentials(self):
+        response = self.client.get('/login')
+        body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('RyzA_', body)
+        self.assertNotIn('SecurePass123', body)
+        self.assertNotIn('password123', body)
+
+    def test_authenticated_routes_reject_missing_and_invalid_session_tokens(self):
+        self.client.post('/api/auth/register', json={
+            'email': 'session@example.com',
+            'username': 'sessionuser',
             'password': 'password123'
         })
+        with self.client.session_transaction() as state:
+            state.pop('session_token', None)
+        self.assertEqual(self.client.get('/api/auth/me').status_code, 401)
 
-        self.assertEqual(response.status_code, 400)
+        self.client.post('/api/auth/login', json={
+            'email': 'session@example.com',
+            'password': 'password123'
+        })
+        with self.client.session_transaction() as state:
+            state['session_token'] = 'not-an-active-database-session'
+        self.assertEqual(self.client.get('/api/auth/me').status_code, 401)
+
+    def test_logout_revokes_database_session_token(self):
+        self.client.post('/api/auth/register', json={
+            'email': 'logout@example.com',
+            'username': 'logoutuser',
+            'password': 'password123'
+        })
+        with self.client.session_transaction() as state:
+            token = state['session_token']
+
+        response = self.client.post('/api/auth/logout')
+
+        self.assertEqual(response.status_code, 200)
         with self.app.app_context():
-            self.assertIsNone(User.query.filter_by(email='attack@example.com').first())
+            login_session = LoginSession.query.filter_by(
+                session_token=token
+            ).one()
+            self.assertFalse(login_session.is_active)
+        self.assertEqual(self.client.get('/api/auth/me').status_code, 401)
+
+    def test_seeded_legacy_accounts_are_disabled_and_their_sessions_revoked(self):
+        with self.app.app_context():
+            seeded = User(
+                email='admin@example.com',
+                username='admin',
+                subscription_plan='PREMIUM',
+                subscription_status='active'
+            )
+            seeded.set_password('old_shared_password')
+            db.session.add(seeded)
+            db.session.commit()
+            db.session.add(LoginSession(
+                user_id=seeded.id,
+                session_token='legacy-seeded-session',
+                expires_at=datetime.utcnow() + timedelta(days=10),
+                is_active=True
+            ))
+            db.session.commit()
+
+        app_module.init_db(self.app)
+
+        with self.app.app_context():
+            seeded = User.query.filter_by(
+                username='admin',
+                email='admin@example.com'
+            ).one()
+            active_sessions = LoginSession.query.filter_by(
+                user_id=seeded.id,
+                is_active=True
+            ).count()
+            self.assertFalse(seeded.is_active)
+            self.assertEqual(active_sessions, 0)
+
+    def test_flask_secret_key_is_ephemeral_in_dev_and_required_in_production(self):
+        first = app_module.resolve_flask_secret_key({'FLASK_ENV': 'development'})
+        second = app_module.resolve_flask_secret_key({'FLASK_ENV': 'development'})
+
+        self.assertNotEqual(first, second)
+        with self.assertRaises(RuntimeError):
+            app_module.resolve_flask_secret_key({'FLASK_ENV': 'production'})
+        with self.assertRaises(RuntimeError):
+            app_module.resolve_flask_secret_key({
+                'FLASK_ENV': 'production',
+                'FLASK_SECRET_KEY': 'short'
+            })
+        configured = 'x' * 48
+        self.assertEqual(
+            app_module.resolve_flask_secret_key({
+                'FLASK_ENV': 'production',
+                'FLASK_SECRET_KEY': configured
+            }),
+            configured
+        )
+
+    def test_empty_database_initialization_does_not_seed_shared_accounts(self):
+        with patch.dict(os.environ, {'FLASK_ENV': 'production'}):
+            app_module.init_db(self.app)
+
+        with self.app.app_context():
+            self.assertEqual(User.query.count(), 0)
+
+    def test_initialization_disables_legacy_shared_accounts_and_revokes_sessions(self):
+        with self.app.app_context():
+            legacy = User(
+                email='admin@example.com',
+                username='admin',
+                subscription_plan='PREMIUM'
+            )
+            legacy.set_password('legacy-password-123')
+            customer = User(
+                email='customer@example.com',
+                username='customer',
+                subscription_plan='FREE'
+            )
+            customer.set_password('customer-password-123')
+            db.session.add_all((legacy, customer))
+            db.session.commit()
+            legacy_id = legacy.id
+            customer_id = customer.id
+            db.session.add(LoginSession(
+                user_id=legacy_id,
+                session_token='legacy-demo-session',
+                expires_at=datetime.utcnow() + timedelta(days=1),
+                is_active=True
+            ))
+            db.session.commit()
+
+        app_module.init_db(self.app)
+
+        with self.app.app_context():
+            self.assertFalse(db.session.get(User, legacy_id).is_active)
+            self.assertTrue(db.session.get(User, customer_id).is_active)
+            self.assertEqual(
+                LoginSession.query.filter_by(
+                    user_id=legacy_id,
+                    is_active=True
+                ).count(),
+                0
+            )
+
+    def test_production_secret_must_be_unique_configured_and_long_enough(self):
+        first = app_module.resolve_flask_secret_key({'FLASK_ENV': 'development'})
+        second = app_module.resolve_flask_secret_key({'FLASK_ENV': 'development'})
+        self.assertNotEqual(first, second)
+        with self.assertRaises(RuntimeError):
+            app_module.resolve_flask_secret_key({'FLASK_ENV': 'production'})
+        with self.assertRaises(RuntimeError):
+            app_module.resolve_flask_secret_key({
+                'FLASK_ENV': 'production',
+                'FLASK_SECRET_KEY': 'short'
+            })
+        configured = 'secure-production-key-' * 3
+        self.assertEqual(
+            app_module.resolve_flask_secret_key({
+                'FLASK_ENV': 'production',
+                'FLASK_SECRET_KEY': configured
+            }),
+            configured
+        )
+
+    def test_initialization_revokes_only_legacy_shared_demo_accounts(self):
+        with self.app.app_context():
+            legacy = User(
+                email='admin@example.com',
+                username='admin',
+                subscription_plan='PREMIUM'
+            )
+            legacy.set_password('legacy-password-123')
+            ordinary = User(
+                email='customer@example.com',
+                username='customer',
+                subscription_plan='FREE'
+            )
+            ordinary.set_password('customer-password-123')
+            db.session.add_all([legacy, ordinary])
+            db.session.commit()
+            legacy_id = legacy.id
+            ordinary_id = ordinary.id
+            db.session.add(LoginSession(
+                user_id=legacy_id,
+                session_token='legacy-active-session',
+                expires_at=datetime.utcnow() + timedelta(days=1),
+                is_active=True
+            ))
+            db.session.commit()
+
+        app_module.init_db(self.app)
+
+        with self.app.app_context():
+            legacy = db.session.get(User, legacy_id)
+            ordinary = db.session.get(User, ordinary_id)
+            self.assertFalse(legacy.is_active)
+            self.assertTrue(ordinary.is_active)
+            self.assertEqual(
+                LoginSession.query.filter_by(
+                    user_id=legacy_id,
+                    is_active=True
+                ).count(),
+                0
+            )
+
+    def test_secret_key_resolution_rejects_missing_or_short_production_secret(self):
+        self.assertNotEqual(
+            app_module.resolve_flask_secret_key({'FLASK_ENV': 'development'}),
+            app_module.resolve_flask_secret_key({'FLASK_ENV': 'development'})
+        )
+        for secret in ('', 'short'):
+            with self.assertRaises(RuntimeError):
+                app_module.resolve_flask_secret_key({
+                    'FLASK_ENV': 'production',
+                    'FLASK_SECRET_KEY': secret
+                })
+        long_secret = 'x' * 48
+        self.assertEqual(
+            app_module.resolve_flask_secret_key({
+                'FLASK_ENV': 'production',
+                'FLASK_SECRET_KEY': long_secret
+            }),
+            long_secret
+        )
 
     def test_login_success(self):
         """Test login exitoso"""
@@ -220,44 +459,476 @@ class TestSubscription(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 401)
     
     def test_upgrade_subscription_success(self):
-        """Test mejorar plan"""
-        # Login
+        """Paid plans cannot be assigned without provider checkout."""
         with self.app.test_client() as c:
             c.post('/api/auth/login', json={
                 'email': 'test@example.com',
                 'password': 'password123'
             })
-            
-            # Upgrade
             response = c.post('/api/subscription/upgrade', json={
                 'plan': 'PRO'
             })
-            
-            self.assertEqual(response.status_code, 200)
-            data = response.get_json()
-            self.assertTrue(data['success'])
-            self.assertEqual(data['subscription']['plan'], 'PRO')
+            self.assertEqual(response.status_code, 410)
+            self.assertIn('checkout', response.get_json()['error'].lower())
+            with self.app.app_context():
+                user = db.session.get(User, self.user_id)
+                self.assertEqual(user.subscription_plan, 'FREE')
+
+    def test_paypal_checkout_requires_login(self):
+        response = self.app.test_client().post(
+            '/api/subscription/checkout',
+            json={'plan': 'PRO'}
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_paypal_checkout_disabled_until_sandbox_credentials_are_configured(self):
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        with patch.object(app_module.paypal_payments, 'is_configured', return_value=False):
+            response = self.client.post(
+                '/api/subscription/checkout',
+                json={'plan': 'PRO'}
+            )
+
+        self.assertEqual(response.status_code, 503)
+        with self.app.app_context():
+            self.assertEqual(db.session.get(User, self.user_id).subscription_plan, 'FREE')
+            self.assertEqual(PaymentTransaction.query.count(), 0)
+
+    def test_paypal_checkout_creates_pending_transaction_but_not_entitlement(self):
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        provider_response = {
+            'id': 'I-SANDBOX123',
+            'links': [{
+                'rel': 'approve',
+                'href': 'https://www.sandbox.paypal.com/checkoutnow?token=I-SANDBOX123'
+            }]
+        }
+        with patch.object(app_module.paypal_payments, 'is_configured', return_value=True), \
+                patch.object(
+                    app_module.paypal_payments,
+                    'create_subscription',
+                    return_value=provider_response
+                ):
+            response = self.client.post(
+                '/api/subscription/checkout',
+                json={'plan': 'PRO'}
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()['approval_url'], provider_response['links'][0]['href'])
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            transaction = PaymentTransaction.query.one()
+            self.assertEqual(user.subscription_plan, 'FREE')
+            self.assertEqual(transaction.provider, 'paypal')
+            self.assertEqual(transaction.provider_reference, 'I-SANDBOX123')
+            self.assertEqual(transaction.status, 'pending')
+
+    def test_paypal_checkout_rejects_non_paypal_approval_url(self):
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        with patch.object(app_module.paypal_payments, 'is_configured', return_value=True), \
+                patch.object(
+                    app_module.paypal_payments,
+                    'create_subscription',
+                    return_value={
+                        'id': 'I-SANDBOX123',
+                        'links': [{'rel': 'approve', 'href': 'https://evil.example/checkout'}]
+                    }
+                ):
+            response = self.client.post(
+                '/api/subscription/checkout',
+                json={'plan': 'PRO'}
+            )
+
+        self.assertEqual(response.status_code, 502)
+        with self.app.app_context():
+            self.assertEqual(PaymentTransaction.query.count(), 0)
+            self.assertEqual(db.session.get(User, self.user_id).subscription_plan, 'FREE')
+
+    def test_paypal_return_activates_only_a_paid_matching_subscription(self):
+        with self.app.app_context():
+            db.session.add(PaymentTransaction(
+                user_id=self.user_id,
+                provider='paypal',
+                provider_reference='I-PAID',
+                plan='PRO',
+                amount=9.99,
+                currency='USD',
+                status='pending'
+            ))
+            db.session.commit()
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        provider_subscription = {
+            'id': 'I-PAID',
+            'status': 'ACTIVE',
+            'plan_id': 'P-PRO',
+            'custom_id': f'trading-platform:user:{self.user_id}:plan:PRO',
+            'billing_info': {
+                'last_payment': {
+                    'amount': {'value': '9.99', 'currency_code': 'USD'}
+                }
+            }
+        }
+        plan_details = {
+            'id': 'P-PRO',
+            'billing_cycles': [{
+                'tenure_type': 'REGULAR',
+                'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                'pricing_scheme': {
+                    'fixed_price': {'value': '9.99', 'currency_code': 'USD'}
+                }
+            }]
+        }
+        with patch.object(app_module.paypal_payments, 'plan_id', return_value='P-PRO'), \
+                patch.object(
+                    app_module.paypal_payments,
+                    'get_subscription',
+                    return_value=provider_subscription
+                ), patch.object(
+                    app_module.paypal_payments,
+                    'get_plan_details',
+                    return_value=plan_details
+                ):
+            response = self.client.get('/billing/paypal/return?subscription_id=I-PAID')
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers['Location'], '/dashboard?payment=success')
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            transaction = PaymentTransaction.query.filter_by(
+                provider_reference='I-PAID'
+            ).one()
+            self.assertEqual(user.subscription_plan, 'PRO')
+            self.assertEqual(transaction.status, 'active')
+            self.assertTrue(app_module.has_verified_paid_subscription(user))
+            self.assertEqual(BillingHistory.query.count(), 1)
+
+    def test_paypal_return_rejects_unpaid_or_wrong_price_subscription(self):
+        with self.app.app_context():
+            db.session.add(PaymentTransaction(
+                user_id=self.user_id,
+                provider='paypal',
+                provider_reference='I-UNPAID',
+                plan='PRO',
+                amount=9.99,
+                currency='USD',
+                status='pending'
+            ))
+            db.session.commit()
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        provider_subscription = {
+            'id': 'I-UNPAID',
+            'status': 'ACTIVE',
+            'plan_id': 'P-PRO',
+            'custom_id': f'trading-platform:user:{self.user_id}:plan:PRO',
+            'billing_info': {
+                'last_payment': {
+                    'amount': {'value': '0.01', 'currency_code': 'USD'}
+                }
+            }
+        }
+        plan_details = {
+            'id': 'P-PRO',
+            'billing_cycles': [{
+                'tenure_type': 'REGULAR',
+                'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                'pricing_scheme': {
+                    'fixed_price': {'value': '9.99', 'currency_code': 'USD'}
+                }
+            }]
+        }
+        with patch.object(app_module.paypal_payments, 'plan_id', return_value='P-PRO'), \
+                patch.object(
+                    app_module.paypal_payments,
+                    'get_subscription',
+                    return_value=provider_subscription
+                ), patch.object(
+                    app_module.paypal_payments,
+                    'get_plan_details',
+                    return_value=plan_details
+                ):
+            response = self.client.get('/billing/paypal/return?subscription_id=I-UNPAID')
+
+        self.assertEqual(response.headers['Location'], '/dashboard?payment=pending')
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            self.assertEqual(user.subscription_plan, 'FREE')
+            transaction = PaymentTransaction.query.filter_by(
+                provider_reference='I-UNPAID'
+            ).one()
+            self.assertEqual(transaction.status, 'pending')
+            self.assertEqual(BillingHistory.query.count(), 0)
+
+    def test_paypal_webhook_rejects_unverified_event(self):
+        with patch.object(app_module.paypal_payments, 'verify_webhook', return_value=False):
+            response = self.client.post(
+                '/api/payments/paypal/webhook',
+                json={'id': 'WH-FAKE', 'event_type': 'BILLING.SUBSCRIPTION.ACTIVATED'}
+            )
+
+        self.assertEqual(response.status_code, 400)
+        with self.app.app_context():
+            self.assertEqual(PaymentWebhookEvent.query.count(), 0)
+
+    def test_paypal_webhook_activates_a_matching_paid_subscription_once(self):
+        with self.app.app_context():
+            db.session.add(PaymentTransaction(
+                user_id=self.user_id,
+                provider='paypal',
+                provider_reference='I-WEBHOOK',
+                plan='PRO',
+                amount=9.99,
+                currency='USD',
+                status='pending'
+            ))
+            db.session.commit()
+        event = {
+            'id': 'WH-UNIQUE-1',
+            'event_type': 'BILLING.SUBSCRIPTION.ACTIVATED',
+            'resource': {'id': 'I-WEBHOOK'},
+            'create_time': datetime.utcnow().isoformat() + 'Z'
+        }
+        subscription = {
+            'id': 'I-WEBHOOK',
+            'status': 'ACTIVE',
+            'plan_id': 'P-PRO',
+            'custom_id': f'trading-platform:user:{self.user_id}:plan:PRO',
+            'billing_info': {
+                'last_payment': {
+                    'id': 'PAYMENT-1',
+                    'time': datetime.utcnow().isoformat() + 'Z',
+                    'amount': {'value': '9.99', 'currency_code': 'USD'}
+                },
+                'next_billing_time': (
+                    datetime.utcnow() + timedelta(days=30)
+                ).isoformat() + 'Z'
+            }
+        }
+        plan = {
+            'id': 'P-PRO',
+            'billing_cycles': [{
+                'tenure_type': 'REGULAR',
+                'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                'pricing_scheme': {
+                    'fixed_price': {'value': '9.99', 'currency_code': 'USD'}
+                }
+            }]
+        }
+        with patch.object(app_module.paypal_payments, 'verify_webhook', return_value=True), \
+                patch.object(app_module.paypal_payments, 'plan_id', return_value='P-PRO'), \
+                patch.object(app_module.paypal_payments, 'get_subscription', return_value=subscription), \
+                patch.object(app_module.paypal_payments, 'get_plan_details', return_value=plan):
+            first = self.client.post('/api/payments/paypal/webhook', json=event)
+            duplicate = self.client.post('/api/payments/paypal/webhook', json=event)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertTrue(duplicate.get_json()['duplicate'])
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            transaction = PaymentTransaction.query.filter_by(
+                provider_reference='I-WEBHOOK'
+            ).one()
+            self.assertEqual(user.subscription_plan, 'PRO')
+            self.assertEqual(transaction.status, 'active')
+            self.assertEqual(PaymentWebhookEvent.query.count(), 1)
+            self.assertEqual(BillingHistory.query.count(), 1)
+
+    def test_paypal_cancel_calls_provider_then_removes_paid_entitlement(self):
+        self.grant_test_subscription(self.user_id, 'PRO')
+        with self.app.app_context():
+            transaction = PaymentTransaction.query.filter_by(
+                user_id=self.user_id,
+                provider='paypal'
+            ).one()
+            provider_reference = transaction.provider_reference
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        with patch.object(app_module.paypal_payments, 'cancel_subscription') as cancel:
+            response = self.client.post('/api/subscription/cancel')
+
+        self.assertEqual(response.status_code, 200)
+        cancel.assert_called_once_with(
+            provider_reference,
+            'Cancellation requested by subscriber'
+        )
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            transaction = PaymentTransaction.query.filter_by(
+                provider_reference=provider_reference
+            ).one()
+            self.assertEqual(user.subscription_plan, 'FREE')
+            self.assertEqual(transaction.status, 'cancelled')
+
+    def test_paypal_webhook_activates_and_deduplicates_verified_event(self):
+        with self.app.app_context():
+            db.session.add(PaymentTransaction(
+                user_id=self.user_id,
+                provider='paypal',
+                provider_reference='I-WEBHOOK',
+                plan='PRO',
+                amount=9.99,
+                currency='USD',
+                status='pending'
+            ))
+            db.session.commit()
+        event = {
+            'id': 'WH-UNIQUE-1',
+            'event_type': 'BILLING.SUBSCRIPTION.ACTIVATED',
+            'resource': {'id': 'I-WEBHOOK'},
+            'create_time': datetime.utcnow().isoformat() + 'Z'
+        }
+        provider_subscription = {
+            'id': 'I-WEBHOOK',
+            'status': 'ACTIVE',
+            'plan_id': 'P-PRO',
+            'custom_id': f'trading-platform:user:{self.user_id}:plan:PRO',
+            'billing_info': {
+                'last_payment': {
+                    'id': 'PAYMENT-1',
+                    'time': datetime.utcnow().isoformat() + 'Z',
+                    'amount': {'value': '9.99', 'currency_code': 'USD'}
+                }
+            }
+        }
+        plan_details = {
+            'id': 'P-PRO',
+            'billing_cycles': [{
+                'tenure_type': 'REGULAR',
+                'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                'pricing_scheme': {
+                    'fixed_price': {'value': '9.99', 'currency_code': 'USD'}
+                }
+            }]
+        }
+        with patch.object(app_module.paypal_payments, 'verify_webhook', return_value=True), \
+                patch.object(app_module.paypal_payments, 'plan_id', return_value='P-PRO'), \
+                patch.object(
+                    app_module.paypal_payments,
+                    'get_subscription',
+                    return_value=provider_subscription
+                ), patch.object(
+                    app_module.paypal_payments,
+                    'get_plan_details',
+                    return_value=plan_details
+                ):
+            first = self.client.post('/api/payments/paypal/webhook', json=event)
+            second = self.client.post('/api/payments/paypal/webhook', json=event)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()['duplicate'])
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            transaction = PaymentTransaction.query.filter_by(
+                provider_reference='I-WEBHOOK'
+            ).one()
+            self.assertEqual(user.subscription_plan, 'PRO')
+            self.assertEqual(transaction.status, 'active')
+            self.assertEqual(PaymentWebhookEvent.query.count(), 1)
+            self.assertEqual(BillingHistory.query.count(), 1)
+
+    def test_paypal_subscription_cancellation_calls_provider_and_revokes_plan(self):
+        self.grant_test_subscription(self.user_id, 'PRO')
+        with self.app.app_context():
+            transaction = PaymentTransaction.query.filter_by(
+                user_id=self.user_id,
+                provider='paypal'
+            ).one()
+            provider_reference = transaction.provider_reference
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+
+        with patch.object(app_module.paypal_payments, 'cancel_subscription') as cancel:
+            response = self.client.post('/api/subscription/cancel')
+
+        self.assertEqual(response.status_code, 200)
+        cancel.assert_called_once_with(
+            provider_reference,
+            'Cancellation requested by subscriber'
+        )
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            transaction = PaymentTransaction.query.filter_by(
+                provider_reference=provider_reference
+            ).one()
+            self.assertEqual(user.subscription_plan, 'FREE')
+            self.assertEqual(transaction.status, 'cancelled')
+
+    def test_paypal_subscription_cancel_calls_provider_before_revoking_local_access(self):
+        self.grant_test_subscription(self.user_id, 'PRO')
+        with self.app.app_context():
+            transaction = PaymentTransaction.query.filter_by(
+                user_id=self.user_id,
+                provider='paypal'
+            ).one()
+        client = self.app.test_client()
+        client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+        with patch.object(app_module.paypal_payments, 'cancel_subscription') as cancel:
+            response = client.post('/api/subscription/cancel')
+
+        self.assertEqual(response.status_code, 200)
+        cancel.assert_called_once_with(
+            transaction.provider_reference,
+            'Cancellation requested by subscriber'
+        )
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            updated = PaymentTransaction.query.get(transaction.id)
+            self.assertEqual(user.subscription_plan, 'FREE')
+            self.assertEqual(updated.status, 'cancelled')
+
+    def test_legacy_paid_plan_without_provider_payment_has_no_paid_entitlement(self):
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            user.upgrade_subscription('PRO')
+            db.session.commit()
+        self.client.post('/api/auth/login', json={
+            'email': 'test@example.com',
+            'password': 'password123'
+        })
+
+        prediction = self.client.get('/api/advanced-prediction')
+        subscription = self.client.get('/api/subscription/current').get_json()['subscription']
+
+        self.assertEqual(prediction.status_code, 403)
+        self.assertEqual(subscription['plan'], 'FREE')
+        self.assertEqual(subscription['status'], 'payment_required')
 
     def test_renew_and_cancel_subscription(self):
-        """Test renovación y cancelación de suscripción"""
+        """Renewal cannot fabricate payment; FREE account cannot cancel."""
         with self.app.test_client() as c:
             c.post('/api/auth/login', json={
                 'email': 'test@example.com',
                 'password': 'password123'
             })
-            
-            # Upgrade first
-            c.post('/api/subscription/upgrade', json={'plan': 'PRO'})
-            
-            # Renew
             renew_resp = c.post('/api/subscription/renew')
-            self.assertEqual(renew_resp.status_code, 200)
-            self.assertTrue(renew_resp.get_json()['success'])
-            
-            # Cancel
+            self.assertEqual(renew_resp.status_code, 410)
             cancel_resp = c.post('/api/subscription/cancel')
-            self.assertEqual(cancel_resp.status_code, 200)
-            self.assertEqual(cancel_resp.get_json()['subscription']['plan'], 'FREE')
+            self.assertEqual(cancel_resp.status_code, 400)
 
     def test_plan_feature_restrictions(self):
         """Test que las restricciones de funciones según el plan funcionen"""
@@ -272,8 +943,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             self.assertEqual(resp.status_code, 403)
             self.assertTrue(resp.get_json().get('upgrade_required'))
             
-            # Upgrade to PRO - advanced prediction allowed
-            c.post('/api/subscription/upgrade', json={'plan': 'PRO'})
+            self.grant_test_subscription(self.user_id, 'PRO')
             resp_pro = c.get('/api/advanced-prediction')
             self.assertEqual(resp_pro.status_code, 200)
             
@@ -281,8 +951,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             resp_prem = c.get('/api/professional-analysis')
             self.assertEqual(resp_prem.status_code, 403)
             
-            # Upgrade to PREMIUM - professional analysis allowed
-            c.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+            self.grant_test_subscription(self.user_id, 'PREMIUM')
             resp_prem2 = c.get('/api/professional-analysis')
             self.assertEqual(resp_prem2.status_code, 200)
 
@@ -324,10 +993,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
 
     def test_paid_basic_analysis_uses_five_minute_cooldown(self):
         symbol = app_module.TRADING_DATA['symbol']
-        with self.app.app_context():
-            user = db.session.get(User, self.user_id)
-            user.upgrade_subscription('PRO')
-            db.session.commit()
+        self.grant_test_subscription(self.user_id, 'PRO')
 
         cache_key = (self.user_id, symbol, 'PRO')
         app_module._basic_analysis_cache.pop(cache_key, None)
@@ -349,8 +1015,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
                 'password': 'password123'
             })
             self.assertEqual(login.status_code, 200)
-            upgrade = self.client.post('/api/subscription/upgrade', json={'plan': 'PRO'})
-            self.assertEqual(upgrade.status_code, 200)
+            self.grant_test_subscription(self.user_id, 'PRO')
             response = self.client.post('/api/chat', json={'message': 'precio'})
 
         self.assertEqual(response.status_code, 200)
@@ -361,7 +1026,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             'email': 'test@example.com',
             'password': 'password123'
         })
-        self.client.post('/api/subscription/upgrade', json={'plan': 'PRO'})
+        self.grant_test_subscription(self.user_id, 'PRO')
         with patch.object(app_module, 'start_demo_chat_trade_job') as start_job:
             response = self.client.post('/api/chat/command', json={
                 'command': '/trade auto demo XAUUSD'
@@ -375,7 +1040,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             'email': 'test@example.com',
             'password': 'password123'
         })
-        self.client.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+        self.grant_test_subscription(self.user_id, 'PREMIUM')
         with patch.object(
             app_module, 'start_demo_chat_trade_job', return_value='demo-job-123'
         ) as start_job:
@@ -393,7 +1058,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             'email': 'test@example.com',
             'password': 'password123'
         })
-        self.client.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+        self.grant_test_subscription(self.user_id, 'PREMIUM')
         with patch.object(app_module, 'start_demo_chat_trade_job') as start_job:
             response = self.client.post('/api/chat/command', json={
                 'command': '/trade auto demo BTCUSD'
@@ -414,6 +1079,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             other_user.set_password('password123')
             db.session.add(other_user)
             db.session.commit()
+            other_user_id = other_user.id
         job_id = 'private-demo-job'
         with app_module._demo_chat_trade_jobs_lock:
             app_module.DEMO_CHAT_TRADE_JOBS[job_id] = {
@@ -429,7 +1095,8 @@ class TestSubscription(IsolatedDatabaseTestCase):
                 'email': 'test@example.com',
                 'password': 'password123'
             })
-            self.client.post('/api/subscription/upgrade', json={'plan': 'PREMIUM'})
+            self.grant_test_subscription(self.user_id, 'PREMIUM')
+            self.grant_test_subscription(other_user_id, 'PREMIUM')
             owner_response = self.client.get(f'/api/chat/demo-trade/{job_id}')
             other_client = self.app.test_client()
             other_client.post('/api/auth/login', json={
@@ -455,10 +1122,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
         user_id = self.user_id
         symbol = app_module.TRADING_DATA['symbol']
         app_module._professional_analysis_cache.pop((user_id, symbol), None)
-        with self.app.app_context():
-            user = db.session.get(User, user_id)
-            user.upgrade_subscription('PREMIUM')
-            db.session.commit()
+        self.grant_test_subscription(user_id, 'PREMIUM')
 
         with self.client:
             login = self.client.post('/api/auth/login', json={
@@ -491,7 +1155,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             db.session.add(other_user)
             db.session.commit()
             other_user_id = other_user.id
-
+        self.grant_test_subscription(other_user_id, 'PRO')
         app_module.CHAT_HISTORY_BY_USER.pop(self.user_id, None)
         app_module.CHAT_HISTORY_BY_USER.pop(other_user_id, None)
         first_client = self.app.test_client()
@@ -500,7 +1164,7 @@ class TestSubscription(IsolatedDatabaseTestCase):
             'email': 'test@example.com',
             'password': 'password123'
         })
-        first_client.post('/api/subscription/upgrade', json={'plan': 'PRO'})
+        self.grant_test_subscription(self.user_id, 'PRO')
         second_client.post('/api/auth/login', json={
             'email': 'other@example.com',
             'password': 'password123'
@@ -531,6 +1195,7 @@ class TestUserManagement(IsolatedDatabaseTestCase):
             self.user.set_password('oldpassword123')
             db.session.add(self.user)
             db.session.commit()
+            self.user_id = self.user.id
             
     def test_update_profile(self):
         """Test actualizar perfil de usuario"""
@@ -549,16 +1214,84 @@ class TestUserManagement(IsolatedDatabaseTestCase):
             self.assertTrue(resp.get_json()['success'])
 
     def test_forgot_and_reset_password(self):
-        """Test flujo completo de olvido y restablecimiento de contraseña"""
-        forgot_resp = self.client.post('/api/auth/forgot-password', json={'email': 'user@example.com'})
-        self.assertEqual(forgot_resp.status_code, 200)
+        """Recovery codes are delivered out of band and never returned in API JSON."""
+        self.client.post('/api/auth/login', json={
+            'email': 'user@example.com',
+            'password': 'oldpassword123'
+        })
+        with patch.object(app_module, '_password_reset_email_settings', return_value={
+            'host': 'smtp.example.test',
+            'port': 587,
+            'sender': 'no-reply@example.com',
+            'username': 'smtp-user',
+            'password': 'smtp-secret',
+            'use_ssl': False,
+            'use_starttls': True
+        }), patch.object(app_module, '_send_password_reset_email') as send_email:
+            forgot_resp = self.client.post(
+                '/api/auth/forgot-password',
+                json={'email': 'user@example.com'}
+            )
+
+        self.assertEqual(forgot_resp.status_code, 202)
         data = forgot_resp.get_json()
-        token = data.get('reset_token')
-        self.assertIsNotNone(token)
+        self.assertNotIn('reset_token', data)
+        send_email.assert_called_once()
+        token = send_email.call_args.args[1]
+        with self.app.app_context():
+            reset_record = PasswordResetToken.query.one()
+            self.assertNotEqual(reset_record.token, token)
+            self.assertEqual(
+                reset_record.token,
+                app_module._password_reset_token_digest(token)
+            )
         
         reset_resp = self.client.post('/api/auth/reset-password', json={'token': token, 'new_password': 'resetpass123'})
         self.assertEqual(reset_resp.status_code, 200)
         self.assertTrue(reset_resp.get_json()['success'])
+        with self.app.app_context():
+            user = db.session.get(User, self.user_id)
+            self.assertTrue(all(reset_token.is_used for reset_token in user.reset_tokens))
+        self.assertEqual(self.client.get('/api/auth/me').status_code, 401)
+
+    def test_password_recovery_requires_mail_configuration(self):
+        with patch.object(
+            app_module,
+            '_password_reset_email_settings',
+            side_effect=app_module.PasswordResetDeliveryError('SMTP missing')
+        ):
+            response = self.client.post(
+                '/api/auth/forgot-password',
+                json={'email': 'user@example.com'}
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn('reset_token', response.get_json())
+
+    def test_password_recovery_delivery_failure_does_not_expose_account_existence(self):
+        with patch.object(app_module, '_password_reset_email_settings', return_value={
+            'host': 'smtp.example.test',
+            'port': 587,
+            'sender': 'no-reply@example.com',
+            'username': 'smtp-user',
+            'password': 'smtp-secret',
+            'use_ssl': False,
+            'use_starttls': True
+        }), patch.object(
+            app_module,
+            '_send_password_reset_email',
+            side_effect=smtplib.SMTPException('mail server unavailable')
+        ):
+            response = self.client.post(
+                '/api/auth/forgot-password',
+                json={'email': 'user@example.com'}
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn('reset_token', response.get_json())
+        with self.app.app_context():
+            token = PasswordResetToken.query.one()
+            self.assertTrue(token.is_used)
 
 
 class TestSecurity(unittest.TestCase):
@@ -637,7 +1370,7 @@ class TestUserModel(IsolatedDatabaseTestCase):
             db.session.commit()
             
             # Mejorar a PRO
-            user.upgrade_subscription('PRO', 'sub_123')
+            user.upgrade_subscription('PRO')
             
             self.assertEqual(user.subscription_plan, 'PRO')
             self.assertEqual(user.subscription_status, 'active')

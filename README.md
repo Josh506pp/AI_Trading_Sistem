@@ -58,7 +58,23 @@ Asistente de Trading Inteligente es una aplicación Flask de análisis de mercad
 - Dependencias en `requirements.txt`
 - Navegador moderno (Chrome, Firefox, Safari, Edge)
 
+## Despliegue remoto recomendado (Windows VPS)
+
+Para abrir el dashboard desde cualquier equipo sin dejar tu computadora encendida, aloja la app y MetaTrader 5 en un Windows VPS. La app actual usa la API local del terminal MT5; esta primera configuración es de un solo servidor y una sola instancia, no una arquitectura escalable con varios servidores.
+
+Elige Windows Server con al menos 4 vCPU, 8 GB de RAM y 60 GB de disco. Cuando tengas bróker, selecciona una ubicación cercana a su servidor de trading y verifica el ping desde MT5. Mantén el puerto RDP (3389) limitado a tu IP o a una VPN; publica solo HTTPS mediante un proxy inverso como Caddy.
+
+1. Instala Python de 64 bits, Git y MetaTrader 5 en el VPS. Clona el repositorio e instala `requirements.txt`.
+2. Crea un directorio persistente para datos, por ejemplo `C:\\AITrading\\data`, y configura `DATABASE_PATH=C:\\AITrading\\data\\trading_platform.db`. La base SQLite queda en el disco del VPS y no debe guardarse en una carpeta temporal ni dentro de una carpeta que se borre al actualizar la app.
+3. Configura `FLASK_ENV=production` y un `FLASK_SECRET_KEY` aleatorio de al menos 32 caracteres. Configura también SMTP para recuperación de contraseñas. No guardes estas variables en Git ni las compartas en el chat.
+4. Apunta un dominio al VPS y configura Caddy para reenviar ese dominio por HTTPS a `127.0.0.1:8000`. Ejecuta la app con `waitress-serve --listen=127.0.0.1:8000 src.app:app`; mantenla como servicio de Windows para que se reinicie tras fallos o reinicios.
+5. Inicia MT5 en el VPS y valida primero cotizaciones y operaciones en una cuenta demo. Restringe el firewall, activa copias de seguridad de la base de datos y verifica `/login` desde un equipo externo.
+
+Usa una sola instancia del servidor: el estado de las solicitudes automáticas demo se mantiene en memoria y se pierde si el proceso se reinicia. Esta app rechaza cuentas MT5 reales para el envío automático; la automatización real no está habilitada por el despliegue. PayPal permanece en sandbox hasta completar su configuración y la revisión del flujo de producción.
+
 ## Instalación Rápida
+
+Esta instalación es solo para desarrollo y pruebas locales:
 
 ```bash
 # 1. Clonar repositorio
@@ -106,7 +122,21 @@ Solo usa EURUSD/XAUUSD, cuenta demo USD y permisos MT5 activos. Por defecto exig
 
 En el chat PREMIUM del dashboard también se puede solicitar una operación individual con `/trade auto demo XAUUSD` o `/trade auto demo EURUSD`. La solicitud se procesa en segundo plano, informa su estado en el chat y usa los mismos límites/monitor del arnés; el servidor bloquea cuentas reales, posiciones ya abiertas y solicitudes simultáneas. No es un bot recurrente ni garantiza que se abra una operación o se alcance ganancia.
 
-Para validar planes en desarrollo local, los perfiles de prueba son `demo` (FREE), `trader` (PRO) y `admin` (PREMIUM). Sus suscripciones de prueba se reactivan al iniciar la app; esta renovación automática no se aplica con `FLASK_ENV=production`.
+Los usuarios se registran desde `/register`. No hay cuentas ni contraseñas demo compartidas; al iniciar, las cuentas heredadas `admin`, `trader` y `demo` con sus emails de ejemplo se desactivan y sus sesiones se revocan.
+
+#### Pagos PayPal para Costa Rica (sandbox)
+La app puede iniciar suscripciones recurrentes PayPal Checkout en USD, adecuada para probar compradores en Costa Rica. Los planes se activan solo tras verificar con PayPal la suscripción y el último pago; el webhook también verifica su firma en la API de PayPal y deduplica eventos. Los cobros sandbox no son dinero real.
+
+1. Crea una aplicación sandbox y planes mensuales PRO (`USD 9.99`) y PREMIUM (`USD 19.99`) en PayPal Developer.
+2. Registra el webhook HTTPS `POST /api/payments/paypal/webhook` para `BILLING.SUBSCRIPTION.ACTIVATED`, `BILLING.SUBSCRIPTION.CANCELLED`, `BILLING.SUBSCRIPTION.EXPIRED`, `BILLING.SUBSCRIPTION.SUSPENDED` y `PAYMENT.SALE.COMPLETED`.
+3. Copia las variables placeholder de `.env.payments.example` a tu `.env` local (ignorado por Git). Genera también `FLASK_SECRET_KEY` con `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Configura `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `PAYPAL_PRO_PLAN_ID`, `PAYPAL_PREMIUM_PLAN_ID` y `PAYPAL_PUBLIC_BASE_URL` (URL pública HTTPS accesible por el navegador y PayPal).
+4. Configura `FLASK_SECRET_KEY` y SMTP: `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_USERNAME`, `SMTP_PASSWORD`, y opcionalmente `SMTP_USE_SSL`/`SMTP_STARTTLS`.
+5. Si faltan credenciales PayPal, el checkout responde 503 y no concede planes. No se manejan datos de tarjeta en la app; el comprador los ingresa en PayPal.
+
+PayPal mantiene suscripciones y realiza renovaciones recurrentes. La cancelación de la app se envía al proveedor; `POST /api/subscription/upgrade` y `/renew` ya no pueden inventar pagos ni otorgar acceso. El modo de producción queda deshabilitado intencionalmente hasta una revisión separada de operaciones, impuestos y webhook.
+
+#### Seguridad de cuentas
+Configura un `FLASK_SECRET_KEY` aleatorio y SMTP antes de producción. La recuperación de contraseña envía un token de un solo uso por correo; el API no lo devuelve y en la base se guarda su hash. La sesión requiere un token activo en la base y se revoca al cerrar sesión o al cambiar/restablecer contraseña. El SQL de la aplicación usa consultas ORM parametrizadas; no construyas consultas interpolando entrada del usuario.
 
 Los usuarios se registran desde `/register`; las contraseñas se guardan con hash y las consultas de la app usan SQLAlchemy ORM parametrizado. El plan FREE recibe análisis técnico básico cada 15 minutos, sin chat con IA, noticias PRO ni predicciones. PRO habilita chat y predicción avanzada cada cinco minutos; PREMIUM mantiene el análisis profesional cada cinco minutos y la predicción avanzada cada dos minutos.
 

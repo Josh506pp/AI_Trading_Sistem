@@ -26,6 +26,7 @@ trading_system_secure.log
 # Environment files
 .env
 .env.*
+!.env.payments.example
 
 # VS Code
 .vscode/

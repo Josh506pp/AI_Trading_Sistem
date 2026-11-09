@@ -279,14 +279,14 @@ class TestPredictionQuality(unittest.TestCase):
         app_module.invalidate_prediction_cache('CACHE_TEST_OTHER')
 
     def test_free_user_cannot_call_prediction_routes(self):
-        with app_module.app.app_context():
-            free_user = app_module.User.query.filter_by(username='demo').one()
-            user_id = free_user.id
-
-        with patch.dict(app_module.app.config, {'TESTING': True}):
+        free_user = SimpleNamespace(
+            id=987654,
+            subscription_plan='FREE',
+            has_active_subscription=lambda: True
+        )
+        with patch.dict(app_module.app.config, {'TESTING': True}), \
+                patch.object(app_module, 'get_current_user', return_value=free_user):
             with app_module.app.test_client() as client:
-                with client.session_transaction() as state:
-                    state['user_id'] = user_id
                 for endpoint in (
                     '/api/predict',
                     '/api/predict/levels',
@@ -338,6 +338,7 @@ class TestPredictionQuality(unittest.TestCase):
 
         with patch.dict(app_module.app.config, {'TESTING': True}), \
                 patch.object(app_module, 'get_current_user', return_value=premium_user), \
+                patch.object(app_module, 'has_verified_paid_subscription', return_value=True), \
                 patch.object(
                     app_module.prediction_engine,
                     'get_prediction_signal',

@@ -35,9 +35,6 @@ psutil==5.9.5
 gunicorn==21.2.0
 waitress==2.1.2
 
-# Optional: For payment integration
-stripe>=8.0.0
-
 # HTTP integration
 requests==2.31.0
 
