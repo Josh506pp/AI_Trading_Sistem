@@ -30,7 +30,7 @@ Asistente de Trading Inteligente es una aplicación Flask de análisis de mercad
 - Detección de patrones en movimientos
 - Asistente de IA conversacional
 - Alertas inteligentes por volatilidad
-- Pesos adaptativos por modelo, calculados con hasta 240 ventanas walk-forward; el prior da 40% a regresión lineal y 20% a cada otro modelo. Las etiquetas usan exactamente el horizonte solicitado y la precisión solo cuenta señales alineadas
+- Pesos adaptativos por modelo, calculados con hasta 240 ventanas walk-forward; el prior da 40% a regresión lineal y 20% a cada otro modelo. Las etiquetas usan exactamente el horizonte solicitado y solo actualizan pesos cuando ese horizonte ya terminó; la precisión solo cuenta señales alineadas
 - La confianza representa acuerdo de modelos, no probabilidad de ganar; no se ingieren operaciones privadas de traders profesionales
 
 ### Sistema de Suscripciones

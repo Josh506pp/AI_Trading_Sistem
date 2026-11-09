@@ -219,6 +219,33 @@ class TestPredictionQuality(unittest.TestCase):
         self.assertEqual(samples, 20)
         self.assertEqual(accuracy, 0.5)
 
+    def test_adaptive_walk_forward_waits_until_overlapping_horizon_labels_mature(self):
+        prices = [100.0 + (index % 2) for index in range(50)]
+        observed_model_samples = []
+        original_weight_calculator = PredictionEngine._adaptive_model_weights
+
+        def forecast_up(history, _periods):
+            return {'price': history[-1] + 1.0}
+
+        def observe_weights(model_performance):
+            observed_model_samples.append(sum(
+                metrics['samples'] for metrics in model_performance.values()
+            ))
+            return original_weight_calculator(model_performance)
+
+        with patch.object(self.engine, '_ema_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_linear_regression_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_momentum_prediction', side_effect=forecast_up), \
+                patch.object(self.engine, '_volatility_adjusted_prediction', side_effect=forecast_up), \
+                patch.object(
+                    PredictionEngine,
+                    '_adaptive_model_weights',
+                    side_effect=observe_weights
+                ):
+            self.engine._walk_forward_accuracy(prices, periods=3, max_windows=10)
+
+        self.assertEqual(observed_model_samples[:4], [0, 0, 0, 4])
+
     def test_walk_forward_accuracy_excludes_model_vote_conflicts(self):
         prices = [100.0 + (index % 2) for index in range(50)]
 

@@ -234,7 +234,38 @@ class PredictionEngine:
         samples = 0
         adaptive_correct = 0
         adaptive_samples = 0
+        pending_samples = []
+
+        def score_matured_sample(sample):
+            nonlocal correct, samples, adaptive_correct, adaptive_samples
+            actual_change = prices[sample['target_index']] - sample['current']
+            if sample['base_signal_valid']:
+                samples += 1
+                if (sample['base_forecast'] - sample['current']) * actual_change > 0:
+                    correct += 1
+            if sample['adaptive_signal_valid']:
+                adaptive_samples += 1
+                if (sample['adaptive_forecast'] - sample['current']) * actual_change > 0:
+                    adaptive_correct += 1
+            for name, forecast in sample['forecasts'].items():
+                if abs(forecast - sample['current']) < sample['minimum_move']:
+                    continue
+                model_samples[name] += 1
+                if (forecast - sample['current']) * actual_change > 0:
+                    model_correct[name] += 1
+
         for index in range(start, len(prices) - periods + 1):
+            matured_samples = [
+                sample for sample in pending_samples
+                if sample['target_index'] < index
+            ]
+            pending_samples = [
+                sample for sample in pending_samples
+                if sample['target_index'] >= index
+            ]
+            for sample in matured_samples:
+                score_matured_sample(sample)
+
             history = prices[:index]
             forecasts = {
                 'ema': self._ema_prediction(history, periods)['price'],
@@ -258,11 +289,6 @@ class PredictionEngine:
                     (down_votes >= 3 and base_forecast < current)
                 )
             )
-            actual_change = prices[index + periods - 1] - current
-            if base_signal_valid:
-                samples += 1
-                if (base_forecast - current) * actual_change > 0:
-                    correct += 1
             adaptive_weights = self._adaptive_model_weights({
                 name: {
                     'correct': model_correct[name],
@@ -281,16 +307,19 @@ class PredictionEngine:
                     (down_votes >= 3 and adaptive_forecast < current)
                 )
             )
-            if adaptive_signal_valid:
-                adaptive_samples += 1
-                if (adaptive_forecast - current) * actual_change > 0:
-                    adaptive_correct += 1
-            for name, forecast in forecasts.items():
-                if abs(forecast - current) < minimum_move:
-                    continue
-                model_samples[name] += 1
-                if (forecast - current) * actual_change > 0:
-                    model_correct[name] += 1
+            pending_samples.append({
+                'target_index': index + periods - 1,
+                'current': current,
+                'minimum_move': minimum_move,
+                'forecasts': forecasts,
+                'base_forecast': base_forecast,
+                'base_signal_valid': base_signal_valid,
+                'adaptive_forecast': adaptive_forecast,
+                'adaptive_signal_valid': adaptive_signal_valid
+            })
+
+        for sample in pending_samples:
+            score_matured_sample(sample)
 
         self.model_performance = {
             name: {
